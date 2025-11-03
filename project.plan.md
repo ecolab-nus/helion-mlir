@@ -24,17 +24,16 @@ I’ve included: repo layout, exact JSON schema, builder algorithms (with affine
 
 ```
 helion-mlir/
-  partA-helion2json/          # Python package
-    helion2json/
+  helion2json/                # Python package
+    __init__.py
+    cli.py
+    core/
       __init__.py
-      ir_capture.py
-      normalize.py
-      emit_json.py
-      schema.py
+      capture.py
       cli.py
     tests/
-    pyproject.toml
-  partB-json2mlir/            # C++ project
+      test_matmul.py
+  json2mlir/                  # C++ project
     include/helion_mlir/
       JsonLoader.h
       Builder.h
@@ -60,8 +59,8 @@ helion-mlir/
 
 **Dependencies**
 
-* Part A: Python 3.10+, `pydantic` (schema validation), `orjson`, `click`.
-* Part B: LLVM/MLIR (current head or stable branch), `nlohmann/json` (or RapidJSON), `gtest`. If you keep PyTorch ops in MLIR, add **Torch-MLIR** as a dependency to register the `torch` dialect. ([GitHub][3])
+* Helion→JSON exporter (Python): Python 3.10+, `pydantic` (schema validation), `orjson`, `click`.
+* JSON→MLIR lowering (C++): LLVM/MLIR (current head or stable branch), `nlohmann/json` (or RapidJSON), `gtest`. If you keep PyTorch ops in MLIR, add **Torch-MLIR** as a dependency to register the `torch` dialect. ([GitHub][3])
 
 ---
 
