@@ -1,0 +1,76 @@
+{
+  "version": 1,
+  "module": {
+    "name": "helion_module",
+    "funcs": [
+      {
+        "name": "matmul",
+        "args": [
+          {"id": "x", "type": {"tensor": {"shape": ["?", "?"], "elem": "f32"}}},
+          {"id": "y", "type": {"tensor": {"shape": ["?", "?"], "elem": "f32"}}}
+        ],
+        "rets": [
+          {"type": {"tensor": {"shape": ["?", "?"], "elem": "f32"}}}
+        ],
+        "body": [
+          {
+            "op": "hl.alloc",
+            "shape": ["dim(x,0)", "dim(y,1)"],
+            "dtype": "f32",
+            "result": "out"
+          },
+          {
+            "op": "hl.tile.begin",
+            "iters": ["m", "n"],
+            "sizes": [4, 4],
+            "result": ["tile_m", "tile_n"]
+          },
+          {
+            "op": "hl.zeros",
+            "shape": ["size(tile_m)", "size(tile_n)"],
+            "dtype": "f32",
+            "result": "acc"
+          },
+          {
+            "op": "hl.tile.begin",
+            "iters": ["k"],
+            "sizes": [8],
+            "result": ["tile_k"]
+          },
+          {
+            "op": "torch.addmm",
+            "result": "acc",
+            "args": [
+              "acc",
+              {
+                "slice": {
+                  "base": "x",
+                  "offsets": ["tile_m", "tile_k"],
+                  "sizes": ["size(tile_m)", "size(tile_k)"]
+                }
+              },
+              {
+                "slice": {
+                  "base": "y",
+                  "offsets": ["tile_k", "tile_n"],
+                  "sizes": ["size(tile_k)", "size(tile_n)"]
+                }
+              }
+            ],
+            "attrs": {"alpha": 1.0, "beta": 1.0}
+          },
+          {"op": "hl.tile.end"},
+          {
+            "op": "hl.store_slice",
+            "dst": "out",
+            "offsets": ["tile_m", "tile_n"],
+            "sizes": ["size(tile_m)", "size(tile_n)"],
+            "src": "acc"
+          },
+          {"op": "hl.tile.end"},
+          {"op": "hl.return", "values": ["out"]}
+        ]
+      }
+    ]
+  }
+}
