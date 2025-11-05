@@ -12,6 +12,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from typing import Any
 
+import sys
+from pathlib import Path
+
 import torch
 from torch import Tensor
 
@@ -22,6 +25,15 @@ import helion.language as hl
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+# Make sure the repo-local src/ package layout is importable when the example is
+# executed directly.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_SRC_ROOT = _REPO_ROOT / "src"
+if str(_SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SRC_ROOT))
+
+from helion_fx_mlir import generate_plan_stage0_mlir, validate_with_mlir_opt
 
 
 # %%
@@ -154,13 +166,33 @@ def addmm_tritonbench(
     return lambda: addmm_autograd(bias, mat1, mat2)
 
 
+
+
 # %%
 def main() -> None:
     """
     Main function to run autotuning (commented out) and correctness checks.
     """
+    m, k, n = 128, 128, 256
+    x = torch.randn([m, k], device="cpu", dtype=torch.float32)
+    y = torch.randn([k, n], device="cpu", dtype=torch.float32)
+    bound_kernel = matmul.bind((x, y))
+
+    mlir_text = generate_plan_stage0_mlir(
+        bound_kernel,
+        kernel_name="matmul",
+    )
+    print("=== MLIR Dump ===")
+    print(mlir_text)
+
+    result = validate_with_mlir_opt(mlir_text)
+    if result.returncode != 0:
+        print(result.stderr, file=sys.stderr)
+        raise SystemExit("mlir-opt validation failed (see stderr above).")
+    print("mlir-opt validation succeeded.\n")
+
     # autotune(1024, 1024, 1024)
-    check(1024, 1024, 1024)
+    # check(1024, 1024, 1024)
 
 
 # %%

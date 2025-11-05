@@ -1,23 +1,19 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-The workspace covers the two-stage Helion FX pipeline described in `project.plan.md`. Keep Python capture code in `helion2json/core/` and its tests in `helion2json/tests/`. C++ lowering lives in `json2mlir/include/helion_mlir/` for headers, `json2mlir/lib/` for implementations, and `json2mlir/tests/FileCheck/` for golden MLIR fixtures. Place shared JSON samples under `samples/` and keep experimental notebooks or scratch files outside the repo to avoid noise.
+Core design notes live in `project.plan.md`; review the relevant section before adding or modifying lowering logic. Prototype kernels and integration sketches belong in `examples/`, with `examples/helion_matmul.py` showing the expected Helion-to-MLIR workflow. Keep Python package code under a `src/helion_fx_mlir/` tree (create it if missing) so imports remain stable; place auxiliary utilities beside the features they support. Configuration lives at the repo root (`requirements.txt`, `.gitignore`, optional `build.sh` scripts), so update those files whenever dependencies or tooling change.
 
 ## Build, Test, and Development Commands
-- `python -m venv .venv && source .venv/bin/activate` creates the expected local environment; reinstall whenever system Python changes.
-- `pip install -r requirements.txt` pulls PyTorch, Triton, and Helion with the right CUDA/ROCm wheels; add `-e helion2json` when the package metadata lands.
-- `cmake -S json2mlir -B build -G Ninja -DLLVM_DIR=/path/to/llvm` configures MLIR tooling; pass `-DTORCH_MLIR_HOME` when the torch dialect is required.
-- `ninja -C build json2mlir` builds the CLI; `ninja -C build check-json2mlir` runs FileCheck tests; use `pytest helion2json/tests` for the Python suite.
-- `cmake --build build --target format` (once enabled) should gate formatting before commits.
+- `python -m venv .venv && source .venv/bin/activate`: establish an isolated environment aligned with the documented Python ≥3.10 baseline.
+- `python -m pip install -r requirements.txt`: install PyTorch, Helion, Triton, and typed helpers; switch to the CUDA or ROCm extras noted in the file when targeting GPUs.
+- `python examples/helion_matmul.py`: execute the reference kernel end-to-end to sanity-check FX capture and autotuning hooks.
+- `pytest -q`: run the test suite; add `-k name` to scope runs while iterating.
 
 ## Coding Style & Naming Conventions
-Python follows PEP 8 with 4-space indents, type hints, and `snake_case` symbols; run `python -m black --target-version py310` and `python -m ruff check` prior to review. C++ mirrors the LLVM/MLIR style guide: 2-space indents, `UpperCamelCase` for types, `lower_case` for functions, and header include guards using `HELION_MLIR_`. Keep MLIR textual IR readable with consistent indenting and comments only for non-obvious semantics.
+Follow PEP 8 with four-space indentation and type hints for public helpers. Modules, functions, and variables use `snake_case`; classes use `CamelCase`; constants stay upper snake. Prefer explicit imports grouped as stdlib, third-party, local. Structure kernels and lowerings so that each helper handles one IR concern; add short docstrings explaining any MLIR construction strategy. Use f-strings for formatting, and keep lines ≤100 characters unless MLIR text needs more room.
 
 ## Testing Guidelines
-Add `pytest` cases alongside fixtures in `helion2json/tests/` and keep names `test_<feature>.py`. For lowering, extend the FileCheck corpus and drive them through `ninja -C build check-json2mlir`; complex flows can use `llvm-lit` when available. Include JSON samples that exercise edge tiles, dynamic shapes, and error paths. Aim for fail-fast checks and document new diagnostics in the expected MLIR files.
+Use `pytest` for all new behavior. Mirror source layout under a `tests/` package and name files `test_<feature>.py`. Exercise both positive and failure paths, and rely on parameterized cases to cover shape/dtype combinations. For graph-emission code, assert on emitted MLIR strings or structural helpers rather than string-matching entire modules, keeping tests resilient. Ensure new tests run quickly so they can be executed alongside the matmul example.
 
 ## Commit & Pull Request Guidelines
-Use short, imperative commit subjects (e.g., `Add edge-tile clamp for matmul`) with optional bullet bodies explaining rationale and testing. Scope each PR to a logical slice, reference planning notes or GitHub issues, and show before/after MLIR snippets or CLI output when behavior changes. Confirm CI or local `pytest`/`ninja check-json2mlir` runs before requesting review.
-
-## Security & Configuration Tips
-Avoid committing real customer kernels or credentials; anonymize JSON before sharing. Pin the LLVM/MLIR build in PR descriptions so reviewers stay aligned. When testing GPU wheels, note the CUDA or ROCm index used so others can reproduce the environment.
+Write concise, present-tense commit messages (`lowering: add affine.emit helper`) roughly following the existing lower-case, action-first style. Each pull request should summarize the change, call out any dependencies (e.g., new requirements), and link to the relevant checklist item in `project.plan.md`. Include before/after evidence when altering generated MLIR, and highlight any follow-up tasks so reviewers can plan incremental landings. Request review once `pytest` and the matmul example finish cleanly.
