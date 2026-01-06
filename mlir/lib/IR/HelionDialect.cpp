@@ -14,7 +14,12 @@ using namespace helion;
 
 void HelionDialect::initialize() {
   addOperations<
-#define GET_OP_LIST
-#include "HelionOps.h.inc"
+      AllocLikeOp,
+      AnnotateTensorOp,
+      CallTorchOp,
+      LoadTileDynamicOp,
+      PhiOp,
+      StoreTileDynamicOp,
+      ZeroTileOp
       >();
 }
