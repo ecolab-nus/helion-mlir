@@ -11,16 +11,23 @@ from __future__ import annotations
 import math
 import subprocess
 from pathlib import Path
-from typing import Iterable, Sequence, TYPE_CHECKING
+from typing import Iterable, Sequence, TYPE_CHECKING, Any
 
 import torch
 import helion.language.memory_ops as hl_memory_ops
 import helion.language._tracing_ops as hl_tracing_ops
 from torch.ops import aten
 
+# Import BlockSizeInfo types for symbolic size detection
+try:
+    from helion._compiler.compile_environment import AutoSize
+except ImportError:
+    AutoSize = None  # type: ignore[misc,assignment]
+
 if TYPE_CHECKING:
     from helion._compiler.device_ir import DeviceIR
     from helion._compiler.device_ir import GraphInfo
+    from helion._compiler.compile_environment import BlockSizeInfo
     from helion.runtime.kernel import BoundKernel
     from torch import Tensor
 
@@ -60,12 +67,37 @@ class _MLIRBuilder:
         return "\n".join(self._lines) + "\n"
 
 
+def _is_concrete_size(size: Any) -> bool:
+    """Check if a block size is a concrete integer value.
+    
+    Returns True for int, False for SymInt, AutoSize, or None.
+    """
+    if size is None:
+        return False
+    if AutoSize is not None and isinstance(size, AutoSize):
+        return False
+    # Check for torch.SymInt - it has a special type
+    if hasattr(torch, 'SymInt') and isinstance(size, torch.SymInt):
+        return False
+    # Also check for sympy expressions that may appear
+    try:
+        int(size)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
 def generate_plan_stage0_mlir(
     bound_kernel: "BoundKernel",
     *,
     kernel_name: str = "helion_matmul_plan_stage0",
 ) -> str:
-    """Generate the stage-0 MLIR skeleton using real Helion metadata."""
+    """Generate the stage-0 MLIR skeleton using real Helion metadata.
+    
+    Tile sizes are handled as follows:
+    - Concrete int values: emitted as MLIR constants
+    - Symbolic values (SymInt, AutoSize, None): emitted as function arguments
+    """
 
     fake_args = bound_kernel.fake_args
     if len(fake_args) < 2:
@@ -79,13 +111,30 @@ def generate_plan_stage0_mlir(
         raise ValueError("device_ir.grid_block_ids is empty; nothing to lower.")
     parallel_block_ids = list(grid_block_groups[0])
 
+    # Collect symbolic tile size arguments
+    symbolic_tile_args: list[dict[str, object]] = []
+    
     outer_loops: list[dict[str, object]] = []
     for block_id in parallel_block_ids:
         info = block_sizes[block_id]
         block_name = _first_debug_name(info.debug_names, fallback=f"block_{block_id}")
         total_extent = _resolve_extent(block_name, lhs, rhs)
-        tile_size = int(info.size)
-        trip_count = max(1, math.ceil(total_extent / tile_size))
+        
+        if _is_concrete_size(info.size):
+            tile_size = int(info.size)
+            trip_count = max(1, math.ceil(total_extent / tile_size))
+            is_symbolic = False
+        else:
+            # Symbolic tile size - will be a function argument
+            tile_size = None  # Will be resolved at runtime
+            trip_count = None  # Will be computed dynamically
+            is_symbolic = True
+            symbolic_tile_args.append({
+                "block_id": block_id,
+                "name": block_name,
+                "arg_name": f"{block_name}_size",
+            })
+        
         outer_loops.append(
             {
                 "block_id": block_id,
@@ -93,6 +142,7 @@ def generate_plan_stage0_mlir(
                 "tile_size": tile_size,
                 "trip_count": trip_count,
                 "total_extent": total_extent,
+                "is_symbolic": is_symbolic,
             }
         )
 
@@ -109,8 +159,23 @@ def generate_plan_stage0_mlir(
         info = block_sizes[block_id]
         block_name = _first_debug_name(info.debug_names, fallback=f"block_{block_id}")
         total_extent = _resolve_extent(block_name, lhs, rhs)
-        tile_size = int(info.size)
-        trip_count = max(1, math.ceil(total_extent / tile_size))
+        
+        if _is_concrete_size(info.size):
+            tile_size = int(info.size)
+            trip_count = max(1, math.ceil(total_extent / tile_size))
+            is_symbolic = False
+        else:
+            tile_size = None
+            trip_count = None
+            is_symbolic = True
+            # Check if not already added from outer loops
+            if not any(arg["name"] == block_name for arg in symbolic_tile_args):
+                symbolic_tile_args.append({
+                    "block_id": block_id,
+                    "name": block_name,
+                    "arg_name": f"{block_name}_size",
+                })
+        
         reduction_loops.append(
             {
                 "block_id": block_id,
@@ -118,6 +183,7 @@ def generate_plan_stage0_mlir(
                 "tile_size": tile_size,
                 "trip_count": trip_count,
                 "total_extent": total_extent,
+                "is_symbolic": is_symbolic,
             }
         )
 
@@ -126,18 +192,36 @@ def generate_plan_stage0_mlir(
     full_shape = [_as_optional_int(lhs.size(0)), _as_optional_int(rhs.size(1))]
     full_shape_attr = _format_shape_attr(full_shape)
 
-    tile_shape = [_as_optional_int(outer_loops[0]["tile_size"])]
-    if len(outer_loops) > 1:
-        tile_shape.append(_as_optional_int(outer_loops[1]["tile_size"]))
+    # Tile shape may include symbolic values - use -1 for symbolic
+    tile_shape = []
+    for loop in outer_loops[:2]:
+        if loop["is_symbolic"]:
+            tile_shape.append(None)  # -1 in MLIR attr
+        else:
+            tile_shape.append(_as_optional_int(loop["tile_size"]))
     tile_shape_attr = _format_shape_attr(tile_shape)
 
     builder = _MLIRBuilder()
     builder.emit("module {")
     builder.push()
+    
+    # Build function signature with tensor args + symbolic tile size args
+    func_args = [f"%arg0: {func_tensor_type}", f"%arg1: {func_tensor_type}"]
+    symbolic_arg_ssa: dict[str, str] = {}  # name -> SSA value
+    for idx, sym_arg in enumerate(symbolic_tile_args):
+        arg_name = f"%{sym_arg['arg_name']}"
+        func_args.append(f"{arg_name}: index")
+        symbolic_arg_ssa[sym_arg["name"]] = arg_name
+    
+    func_args_str = ", ".join(func_args)
     builder.emit(
-        f"func.func @{kernel_name}(%arg0: {func_tensor_type}, %arg1: {func_tensor_type}) -> {func_tensor_type} {{"
+        f"func.func @{kernel_name}({func_args_str}) -> {func_tensor_type} {{"
     )
     builder.push()
+    
+    # Add comments for symbolic tile size arguments
+    for sym_arg in symbolic_tile_args:
+        builder.emit(f"// Symbolic tile size argument: {sym_arg['arg_name']} (block_id={sym_arg['block_id']})")
 
     out_value = builder.fresh("out")
     alloc_attrs = _format_attr_dict({"shape": full_shape_attr})
@@ -171,6 +255,13 @@ def generate_plan_stage0_mlir(
     zero_bounds = ", ".join("0" for _ in outer_loops)
     upper_bounds = ", ".join(str(loop["trip_count"]) for loop in outer_loops)
     steps = ", ".join("1" for _ in outer_loops)
+    
+    # Check if we have any symbolic loops - if so, we need to use SCF dialect
+    # instead of affine dialect since affine requires static bounds
+    has_symbolic_loops = (
+        any(loop.get("is_symbolic", False) for loop in outer_loops) or
+        any(loop.get("is_symbolic", False) for loop in reduction_loops)
+    )
 
     has_tile_b = any(loop["name"] == "tile_b" for loop in outer_loops)
     dims_map = {
@@ -189,20 +280,48 @@ def generate_plan_stage0_mlir(
 
     for loop in outer_loops:
         loop_dim = dims_map.get(loop["name"])
-        if loop_dim is not None:
-            tile_const = builder.fresh(f"{loop['name']}_tile")
+        loop_name = loop["name"]
+        is_symbolic = loop.get("is_symbolic", False)
+        
+        if is_symbolic:
+            # Use the symbolic argument as the tile size
+            tile_ssa = symbolic_arg_ssa.get(loop_name)
+            if tile_ssa is None:
+                raise ValueError(f"Missing symbolic argument for loop {loop_name}")
+            loop["tile_const"] = tile_ssa
+            if loop_dim is not None:
+                # Use affine.apply with ceildiv so the result is a valid affine symbol
+                trip_count_ssa = builder.fresh(f"{loop_name}_tiles")
+                builder.emit(
+                    f"{trip_count_ssa} = affine.apply affine_map<()[s0, s1] -> (s0 ceildiv s1)>()[{loop_dim}, {tile_ssa}]"
+                )
+                loop["trip_count_ssa"] = trip_count_ssa
+            else:
+                # Fallback - should not happen for well-formed inputs
+                loop["trip_count_ssa"] = tile_ssa
+            builder.emit(
+                f"// block_id={loop['block_id']} {loop_name} size=SYMBOLIC extent={loop['total_extent']} tiles=dynamic"
+            )
+        elif loop_dim is not None:
+            tile_const = builder.fresh(f"{loop_name}_tile")
             builder.emit(f"{tile_const} = arith.constant {loop['tile_size']} : index")
             loop["tile_const"] = tile_const
-            trip_count_ssa = builder.fresh(f"{loop['name']}_tiles")
+            # Use affine.apply with ceildiv so the result is a valid affine symbol
+            trip_count_ssa = builder.fresh(f"{loop_name}_tiles")
             builder.emit(
-                f"{trip_count_ssa} = arith.ceildivsi {loop_dim}, {tile_const} : index"
+                f"{trip_count_ssa} = affine.apply affine_map<()[s0, s1] -> (s0 ceildiv s1)>()[{loop_dim}, {tile_const}]"
             )
             loop["trip_count_ssa"] = trip_count_ssa
+            builder.emit(
+                f"// block_id={loop['block_id']} {loop_name} size={loop['tile_size']} extent={loop['total_extent']} tiles={loop['trip_count']}"
+            )
         else:
             loop["trip_count_ssa"] = str(loop["trip_count"])
-        builder.emit(
-            f"// block_id={loop['block_id']} {loop['name']} size={loop['tile_size']} extent={loop['total_extent']} tiles={loop['trip_count']}"
-        )
+            builder.emit(
+                f"// block_id={loop['block_id']} {loop_name} size={loop['tile_size']} extent={loop['total_extent']} tiles={loop['trip_count']}"
+            )
+    # Emit the outer parallel loop using affine.parallel
+    # affine.parallel can accept symbol operands for bounds - dynamic values are passed as symbols
     builder.emit(
         f"affine.parallel ({', '.join(iv_names)}) = ({zero_bounds}) to ({', '.join(str(loop.get('trip_count_ssa', loop['trip_count'])) for loop in outer_loops)}) step ({steps}) {{"
     )
@@ -218,11 +337,18 @@ def generate_plan_stage0_mlir(
     for idx, loop in enumerate(outer_loops):
         loop_dim = dims_map.get(loop["name"])
         tile_const = loop.get("tile_const")
+        is_symbolic = loop.get("is_symbolic", False)
         if loop_dim is not None and tile_const is not None:
             iv_name = iv_names[idx]
-            actual = _emit_dynamic_tile_size(
-                builder, iv_name, loop_dim, loop["tile_size"], loop["name"]
-            )
+            if is_symbolic:
+                # For symbolic tile sizes, use the symbolic SSA value directly
+                actual = _emit_dynamic_tile_size_symbolic(
+                    builder, iv_name, loop_dim, tile_const, loop["name"]
+                )
+            else:
+                actual = _emit_dynamic_tile_size(
+                    builder, iv_name, loop_dim, loop["tile_size"], loop["name"]
+                )
             outer_tile_sizes[loop["name"]] = actual
         elif tile_const is not None:
             outer_tile_sizes[loop["name"]] = tile_const
@@ -233,26 +359,55 @@ def generate_plan_stage0_mlir(
     root_fx_info = _extract_root_fx_info(root_graph)
 
     for loop in reduction_loops:
-        builder.emit(
-            f"// block_id={loop['block_id']} {loop['name']} size={loop['tile_size']} extent={loop['total_extent']} tiles={loop['trip_count']}"
-        )
-        reduction_iv = f"%{loop['name']}_iv"
-        loop_result = builder.fresh(f"{loop['name']}_acc")
-        loop_map[loop["name"]] = loop
-        loop_dim = dims_map.get(loop["name"])
-        trip_bound = str(loop["trip_count"])
-        if loop_dim is not None:
-            tile_const = builder.fresh(f"{loop['name']}_tile")
+        loop_name = loop["name"]
+        is_symbolic = loop.get("is_symbolic", False)
+        if is_symbolic:
+            builder.emit(
+                f"// block_id={loop['block_id']} {loop_name} size=SYMBOLIC extent={loop['total_extent']} tiles=dynamic"
+            )
+        else:
+            builder.emit(
+                f"// block_id={loop['block_id']} {loop_name} size={loop['tile_size']} extent={loop['total_extent']} tiles={loop['trip_count']}"
+            )
+        reduction_iv = f"%{loop_name}_iv"
+        loop_result = builder.fresh(f"{loop_name}_acc")
+        loop_map[loop_name] = loop
+        loop_dim = dims_map.get(loop_name)
+        
+        if is_symbolic:
+            # Use the symbolic argument as the tile size
+            tile_ssa = symbolic_arg_ssa.get(loop_name)
+            if tile_ssa is None:
+                raise ValueError(f"Missing symbolic argument for reduction loop {loop_name}")
+            loop["tile_const"] = tile_ssa
+            if loop_dim is not None:
+                # Use affine.apply with ceildiv so the result is a valid affine symbol
+                trip_count_ssa = builder.fresh(f"{loop_name}_tiles")
+                builder.emit(
+                    f"{trip_count_ssa} = affine.apply affine_map<()[s0, s1] -> (s0 ceildiv s1)>()[{loop_dim}, {tile_ssa}]"
+                )
+                loop["trip_count_ssa"] = trip_count_ssa
+                trip_bound = trip_count_ssa
+            else:
+                loop["trip_count_ssa"] = tile_ssa
+                trip_bound = tile_ssa
+        elif loop_dim is not None:
+            tile_const = builder.fresh(f"{loop_name}_tile")
             builder.emit(f"{tile_const} = arith.constant {loop['tile_size']} : index")
             loop["tile_const"] = tile_const
-            trip_count_ssa = builder.fresh(f"{loop['name']}_tiles")
+            # Use affine.apply with ceildiv so the result is a valid affine symbol
+            trip_count_ssa = builder.fresh(f"{loop_name}_tiles")
             builder.emit(
-                f"{trip_count_ssa} = arith.ceildivsi {loop_dim}, {tile_const} : index"
+                f"{trip_count_ssa} = affine.apply affine_map<()[s0, s1] -> (s0 ceildiv s1)>()[{loop_dim}, {tile_const}]"
             )
             loop["trip_count_ssa"] = trip_count_ssa
             trip_bound = trip_count_ssa
         else:
             loop["trip_count_ssa"] = str(loop["trip_count"])
+            trip_bound = str(loop["trip_count"])
+        
+        # Emit reduction loop using affine.for
+        # affine.for can accept symbol operands for bounds - dynamic values are passed as symbols
         builder.emit(
             f"{loop_result} = affine.for {reduction_iv} = 0 to {trip_bound} "
             f"iter_args(%acc_iter = {current_acc}) -> ({func_tensor_type}) {{"
@@ -261,9 +416,14 @@ def generate_plan_stage0_mlir(
 
         tile_k_size = loop.get("tile_const")
         if loop_dim is not None and loop.get("tile_const") is not None:
-            tile_k_size = _emit_dynamic_tile_size(
-                builder, reduction_iv, loop_dim, loop["tile_size"], loop["name"]
-            )
+            if is_symbolic:
+                tile_k_size = _emit_dynamic_tile_size_symbolic(
+                    builder, reduction_iv, loop_dim, loop["tile_const"], loop_name
+                )
+            else:
+                tile_k_size = _emit_dynamic_tile_size(
+                    builder, reduction_iv, loop_dim, loop["tile_size"], loop_name
+                )
 
         lhs_tile_m_size = _choose_tile_size(builder, outer_tile_sizes, loop_map, "tile_m")
         lhs_tile_k_size = tile_k_size or loop.get("tile_const") or str(loop["tile_size"])
@@ -347,6 +507,7 @@ def generate_plan_stage0_mlir(
         f": ({func_tensor_type}, {func_tensor_type}, index, index) -> ()"
     )
 
+    # Terminate the parallel loop with affine.yield
     builder.emit("affine.yield")
     builder.pop()
     builder.emit("}")
@@ -518,6 +679,31 @@ def _emit_dynamic_tile_size(
     return size
 
 
+def _emit_dynamic_tile_size_symbolic(
+    builder: _MLIRBuilder,
+    iv: str,
+    dim: str,
+    tile_size_ssa: str,
+    hint: str,
+) -> str:
+    """Emit a dynamic tile size computation for symbolic (SSA) tile sizes.
+    
+    Uses affine.min with the tile size as an affine symbol (s1).
+    The affine_map is: (d0)[s0, s1] -> (s1, s0 - d0 * s1)
+    where d0 is the loop IV, s0 is the dimension, and s1 is the tile size.
+    
+    The computation is: min(tile_size, dim - iv * tile_size)
+    """
+    size = builder.fresh(f"{hint}_size")
+    # s0 = dim, s1 = tile_size
+    # min(s1, s0 - d0 * s1)
+    map_str = "affine_map<(d0)[s0, s1] -> (s1, s0 - d0 * s1)>"
+    builder.emit(
+        f"{size} = affine.min {map_str}({iv})[{dim}, {tile_size_ssa}]"
+    )
+    return size
+
+
 def _choose_tile_size(
     builder: _MLIRBuilder,
     dynamic_sizes: dict[str, str],
@@ -530,9 +716,14 @@ def _choose_tile_size(
     if fallback_loop:
         if "tile_const" in fallback_loop:
             return str(fallback_loop["tile_const"])
-        const = _emit_index_constant(builder, int(fallback_loop.get("tile_size", 0)))
-        fallback_loop["tile_const"] = const
-        return const
+        # For symbolic tile sizes, tile_size may be None - use tile_const if available
+        tile_size = fallback_loop.get("tile_size")
+        if tile_size is not None:
+            const = _emit_index_constant(builder, int(tile_size))
+            fallback_loop["tile_const"] = const
+            return const
+        # If tile_size is None (symbolic), we should already have tile_const set
+        # This is a fallback that shouldn't normally be hit
     return _emit_index_constant(builder, 0)
 
 

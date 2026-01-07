@@ -38,8 +38,8 @@ from helion_fx_mlir import generate_plan_stage0_mlir, validate_with_helion_opt
 
 # %%
 @helion.kernel(
-    # static_shapes=True gives a performance boost for matmuls
-    static_shapes=True,
+    # static_shapes=False gives a performance boost for matmuls
+    static_shapes=False,
     # Disable autotung over unrolling/range_num_stages
     # tl.dot is pipelined with num_stages
     autotune_config_overrides={
@@ -185,11 +185,13 @@ def main() -> None:
     print("=== MLIR Dump ===")
     print(mlir_text)
 
-    result = validate_with_helion_opt(mlir_text)
+    result = validate_with_helion_opt(
+        mlir_text, opt_path="/mnt/fast/llvm-mlir/bin/mlir-opt"
+    )
     if result.returncode != 0:
         print(result.stderr, file=sys.stderr)
-        raise SystemExit("helion-opt validation failed (see stderr above).")
-    print("helion-opt validation succeeded.\n")
+        raise SystemExit("mlir-opt validation failed (see stderr above).")
+    print("mlir-opt validation succeeded.\n")
 
     # autotune(1024, 1024, 1024)
     # check(1024, 1024, 1024)
