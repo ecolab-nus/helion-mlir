@@ -77,15 +77,39 @@ class MLIRBuilder:
     # Module and function emission
     # -------------------------------------------------------------------------
 
-    def emit_module_start(self) -> None:
-        """Emit the start of an MLIR module."""
-        self.emit("module {")
+    def emit_module_start(self, attrs: dict[str, tuple[int, str]] | None = None) -> None:
+        """Emit the start of an MLIR module.
+        
+        Args:
+            attrs: Optional dict of module attributes, mapping name to (value, type).
+                   Example: {"helion.tile_m": (64, "index")}
+        """
+        if attrs:
+            attr_strs = [f"{name} = {value} : {typ}" for name, (value, typ) in attrs.items()]
+            self.emit(f"module attributes {{{', '.join(attr_strs)}}} {{")
+        else:
+            self.emit("module {")
         self.push()
 
     def emit_module_end(self) -> None:
         """Emit the end of an MLIR module."""
         self.pop()
         self.emit("}")
+
+    def emit_get_module_attribute(self, attr_name: str, result_hint: str = "attr") -> str:
+        """Emit a helion.get_module_attribute operation.
+        
+        Args:
+            attr_name: The attribute name to retrieve (e.g., "helion.tile_m")
+            result_hint: Hint for the result SSA name
+            
+        Returns:
+            The result SSA value name.
+        """
+        result = self.fresh(result_hint)
+        # Use generic format for compatibility with mlir-opt -allow-unregistered-dialect
+        self.emit(f'{result} = "loom.get_module_attribute"() {{attr_name = "{attr_name}"}} : () -> index')
+        return result
 
     def emit_func_start(
         self,

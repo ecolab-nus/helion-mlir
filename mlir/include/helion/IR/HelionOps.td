@@ -151,4 +151,19 @@ def Helion_StoreTileDynamicOp : Helion_Op<"store_tile_dynamic"> {
   let results = (outs);
 }
 
+//===----------------------------------------------------------------------===//
+// helion.get_module_attribute
+//===----------------------------------------------------------------------===//
+
+def Helion_GetModuleAttributeOp : Helion_Op<"get_module_attribute", [Pure]> {
+  let summary = "get a module attribute value";
+  let description = [{
+    The `helion.get_module_attribute` op retrieves a named attribute from the
+    parent module and returns it as an SSA value.  This is used to access
+    compile-time parameters (e.g., tile sizes) stored as module attributes.
+  }];
+  let arguments = (ins StrAttr:$attr_name);
+  let results = (outs Index:$result);
+}
+
 #endif // HELION_IR_HELIONOPS_TD

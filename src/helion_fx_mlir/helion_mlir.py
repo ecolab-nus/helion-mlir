@@ -94,16 +94,13 @@ def generate_plan_stage0_mlir(
     full_shape = [as_optional_int(lhs.size(0)), as_optional_int(rhs.size(1))]
     full_shape_attr = format_shape_attr(full_shape)
     
-    # Emit module start
-    builder.emit_module_start()
+    # Emit module start with tile size attributes
+    module_attrs = ctx.get_module_attributes()
+    builder.emit_module_start(module_attrs)
     
-    # Build function signature from kernel arguments + symbolic tile size args
+    # Build function signature from kernel arguments only (no tile size args)
     func_args = ctx.get_func_signature_args()
     symbolic_tile_args = ctx.get_symbolic_tile_args()
-    
-    # Register symbolic argument SSA names
-    for sym_arg in symbolic_tile_args:
-        ctx.symbolic_arg_ssa[sym_arg["name"]] = f"%{sym_arg['arg_name']}"
     
     # Determine result type (use first tensor arg's type as template)
     tensor_args = ctx.get_tensor_args()
@@ -112,9 +109,13 @@ def generate_plan_stage0_mlir(
     # Emit function start
     builder.emit_func_start(kernel_name, func_args, result_type)
     
-    # Add comments for symbolic tile size arguments
+    # Emit get_module_attribute ops for each symbolic tile size
     for sym_arg in symbolic_tile_args:
-        builder.emit_comment(f"Symbolic tile size argument: {sym_arg['arg_name']} (block_id={sym_arg['block_id']})")
+        loop_name = sym_arg["name"]
+        attr_name = f"loom.{loop_name}"
+        ssa = builder.emit_get_module_attribute(attr_name, f"{loop_name}_size")
+        ctx.symbolic_arg_ssa[loop_name] = ssa
+        builder.emit_comment(f"Tile size from module attribute: {attr_name} (block_id={sym_arg['block_id']})")
     
     # Emit output allocation (using first tensor arg as template)
     lhs_ssa = ctx.get_lhs_tensor_ssa()

@@ -191,19 +191,14 @@ class LoweringContext:
     def get_func_signature_args(self) -> list[tuple[str, str]]:
         """Get function signature arguments as (ssa_name, mlir_type) tuples.
         
-        This returns all kernel arguments followed by symbolic tile size arguments.
+        Returns only kernel arguments. Symbolic tile sizes are now module attributes.
         """
         args = []
         
-        # Add kernel arguments
+        # Add kernel arguments only
         for arg in self.kernel_args:
             if arg.ssa_name and arg.mlir_type:
                 args.append((arg.ssa_name, arg.mlir_type))
-        
-        # Add symbolic tile size arguments
-        for sym_arg in self.get_symbolic_tile_args():
-            arg_name = f"%{sym_arg['arg_name']}"
-            args.append((arg_name, "index"))
         
         return args
     
@@ -333,6 +328,25 @@ class LoweringContext:
     def get_symbolic_tile_args(self) -> list[dict[str, object]]:
         """Get the list of symbolic tile size arguments."""
         return getattr(self, "_symbolic_tile_args", [])
+    
+    def get_module_attributes(self) -> dict[str, tuple[int, str]]:
+        """Get tile sizes as module attributes.
+        
+        Returns a dict mapping attribute name to (value, type) for module attributes.
+        Uses a default value (64) for symbolic tile sizes.
+        """
+        attrs = {}
+        all_loops = self.outer_loops + self.reduction_loops
+        
+        for loop in all_loops:
+            attr_name = f"loom.{loop.name}"
+            if loop.is_symbolic:
+                # Use a placeholder value for symbolic sizes
+                attrs[attr_name] = (64, "index")
+            elif loop.tile_size is not None:
+                attrs[attr_name] = (loop.tile_size, "index")
+        
+        return attrs
     
     def get_loop_map(self) -> dict[str, LoopInfo]:
         """Get a mapping from loop name to LoopInfo."""
