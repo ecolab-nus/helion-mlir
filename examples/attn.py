@@ -63,6 +63,13 @@ def main() -> None:
     k = torch.randn([2, 4, 8])
     v = torch.randn([2, 4, 8])
     bound = attention.bind((q, k, v))
+
+    print("=== Device IR ===")
+    for i, g in enumerate(bound.host_function.device_ir.graphs):
+        print(f"Graph {i}: {type(g).__name__}")
+        g.graph.print_tabular()
+    print("\n")
+
     mlir_text = generate_plan_stage0_mlir(bound, kernel_name="attention")
     print("=== MLIR Dump ===")
     print(mlir_text)

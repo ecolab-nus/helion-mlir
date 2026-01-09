@@ -138,6 +138,12 @@ def main() -> None:
     y = torch.randn([k, n], device="cpu", dtype=torch.float32)
     bound_kernel = matmul.bind((x, y))
 
+    print("=== Device IR ===")
+    for i, g in enumerate(bound_kernel.host_function.device_ir.graphs):
+        print(f"Graph {i}: {type(g).__name__}")
+        g.graph.print_tabular()
+    print("\n")
+
     mlir_text = generate_plan_stage0_mlir(
         bound_kernel,
         kernel_name="matmul",

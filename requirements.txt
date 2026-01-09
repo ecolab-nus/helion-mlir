@@ -26,3 +26,4 @@ helion ; sys_platform == "linux"
 pydantic>=1.10,<2
 packaging
 pytest
+tabulate
