@@ -40,6 +40,7 @@ from .lowering_context import (
     LoweringContext,
     LoopInfo,
     KernelArgInfo,
+    LoadInfo,
     first_debug_name,
     resolve_extent,
     collect_reduction_block_ids,
@@ -88,11 +89,12 @@ def generate_plan_stage0_mlir(
     
     # Get tensor arguments
     fake_args = bound_kernel.fake_args
-    lhs, rhs, *_ = fake_args
+    tensor_args = ctx.get_tensor_args()
     
-    # Compute full output shape
-    full_shape = [as_optional_int(lhs.size(0)), as_optional_int(rhs.size(1))]
-    full_shape_attr = format_shape_attr(full_shape)
+    # Compute output shape from loop extents or first tensor shape
+    output_shape = _derive_output_shape(ctx, fake_args, tensor_args)
+    ctx.output_shape = output_shape
+    full_shape_attr = format_shape_attr(output_shape)
     
     # Emit module start with tile size attributes
     module_attrs = ctx.get_module_attributes()
@@ -102,8 +104,8 @@ def generate_plan_stage0_mlir(
     func_args = ctx.get_func_signature_args()
     symbolic_tile_args = ctx.get_symbolic_tile_args()
     
-    # Determine result type with concrete output shape [M, N]
-    result_type = format_tensor_type([ctx.m_extent, ctx.n_extent], ctx.element_type)
+    # Determine result type from output shape
+    result_type = format_tensor_type(output_shape, ctx.element_type)
     
     # Emit function start
     builder.emit_func_start(kernel_name, func_args, result_type)
@@ -119,7 +121,7 @@ def generate_plan_stage0_mlir(
             return "k"
         elif name in {"tile_b", "b"}:
             return "b"
-        return name.lower()
+        return name.replace("tile_", "")
     
     for sym_arg in symbolic_tile_args:
         loop_name = sym_arg["name"]
@@ -130,15 +132,14 @@ def generate_plan_stage0_mlir(
         builder.emit_comment(f"Block size from module attribute: {attr_name} (block_id={sym_arg['block_id']})")
     
     # Emit output allocation (using first tensor arg as template)
-    lhs_ssa = ctx.get_lhs_tensor_ssa()
-    lhs_type = ctx.get_lhs_tensor_type()
+    first_tensor_ssa = ctx.get_tensor_arg_ssa(0) if tensor_args else "%arg0"
+    first_tensor_type = tensor_args[0].mlir_type if tensor_args else ctx.tensor_type
     
     ctx.out_value = builder.fresh("out")
-    # Output tensor has shape [M, N] 
-    output_type = format_tensor_type([ctx.m_extent, ctx.n_extent], ctx.element_type)
+    output_type = format_tensor_type(output_shape, ctx.element_type)
     alloc_attrs = format_attr_dict({"shape": full_shape_attr})
     builder.emit(
-        f'{ctx.out_value} = "helion.alloc_like"({lhs_ssa}){alloc_attrs} : ({lhs_type}) -> {output_type}'
+        f'{ctx.out_value} = "helion.alloc_like"({first_tensor_ssa}){alloc_attrs} : ({first_tensor_type}) -> {output_type}'
     )
     
     # Emit accumulator initialization
@@ -161,13 +162,55 @@ def generate_plan_stage0_mlir(
     # Emit outer parallel loop
     _emit_parallel_loop_structure(ctx, bound_kernel)
     
-    # Emit function end and return (output has shape [M, N])
-    output_type = format_tensor_type([ctx.m_extent, ctx.n_extent], ctx.element_type)
+    # Emit function end and return
     builder.emit(f"return {ctx.out_value} : {output_type}")
     builder.emit_func_end()
     builder.emit_module_end()
     
     return builder.build()
+
+
+def _derive_output_shape(
+    ctx: LoweringContext,
+    fake_args: tuple,
+    tensor_args: list[KernelArgInfo],
+) -> list[int | None]:
+    """Derive the output shape from tensor shapes or loop extents.
+    
+    Strategy:
+    1. For matmul pattern (2 outer loops, no tile_b): use loop extents [M, N]
+    2. For higher-dimensional kernels or when tile_b present: use first input's shape
+    """
+    import torch
+    
+    # Check for matmul pattern: no tile_b and exactly 2 outer loops (tile_m, tile_n)
+    loop_names = {loop.name for loop in ctx.outer_loops}
+    has_batch_dim = "tile_b" in loop_names
+    
+    # For matmul pattern (tile_m, tile_n only), use loop extents
+    if not has_batch_dim and len(ctx.outer_loops) == 2:
+        m_extent = ctx.loop_extents.get("tile_m")
+        n_extent = ctx.loop_extents.get("tile_n")
+        if m_extent is not None and n_extent is not None:
+            return [m_extent, n_extent]
+    
+    # For other patterns (e.g., attention with tile_b, tile_m), 
+    # use the first input tensor's shape as output shape
+    if tensor_args and tensor_args[0].index < len(fake_args):
+        tensor = fake_args[tensor_args[0].index]
+        if hasattr(tensor, 'shape'):
+            return [int(s) if not isinstance(s, torch.SymInt) else None 
+                    for s in tensor.shape]
+    
+    # Fallback: use loop extents
+    output_dims: list[int | None] = []
+    for loop in ctx.outer_loops:
+        if loop.total_extent is not None:
+            output_dims.append(loop.total_extent)
+    if len(output_dims) >= 2:
+        return output_dims
+    
+    return [None, None]
 
 
 def _emit_dimension_queries(ctx: LoweringContext) -> None:
@@ -322,6 +365,9 @@ def _emit_parallel_loop_structure(ctx: LoweringContext, bound_kernel: "BoundKern
     # Extract FX names from the device IR graphs
     _extract_fx_metadata(ctx, bound_kernel)
     
+    # Emit placeholder SSA values for intermediate tensors
+    _emit_intermediate_tensors(ctx, bound_kernel)
+    
     # Emit reduction loops and body
     ctx.current_acc = ctx.acc_seed
     _emit_reduction_loops(ctx)
@@ -362,10 +408,54 @@ def _extract_fx_metadata(ctx: LoweringContext, bound_kernel: "BoundKernel") -> N
     device_ir = bound_kernel.host_function.device_ir
     
     for_graph = _first_graph_with_block_ids(device_ir)
-    ctx.fx_names = _extract_fx_names(for_graph) if for_graph is not None else {}
+    if for_graph is not None:
+        load_infos, other_names = _extract_load_infos(for_graph, ctx.kernel_args)
+        ctx.load_infos = load_infos
+        ctx.fx_names = other_names
+    else:
+        ctx.load_infos = []
+        ctx.fx_names = {}
     
     root_graph = _first_root_graph(device_ir)
     ctx.root_fx_info = _extract_root_fx_info(root_graph)
+
+
+def _emit_intermediate_tensors(ctx: LoweringContext, bound_kernel: "BoundKernel") -> None:
+    """Emit placeholder SSA values for intermediate tensors.
+    
+    This handles tensors created via reshape/transpose/view that are 
+    referenced in load operations but are not function arguments.
+    """
+    builder = ctx.builder
+    
+    # Collect all tensor names that are function arguments
+    arg_names = {arg.name for arg in ctx.kernel_args if arg.is_tensor}
+    
+    # Find load infos that reference non-argument tensors
+    for load_info in ctx.load_infos:
+        source_name = load_info.source_tensor_name
+        
+        # Skip if this is already a function argument
+        if source_name in arg_names:
+            continue
+        
+        # Skip if we've already emitted this tensor
+        if f"%{source_name}" in ctx.fx_value_map.values():
+            continue
+        
+        # Emit a placeholder tensor operation for this intermediate tensor
+        # In a future version, we could trace back to the actual operations
+        ssa = builder.fresh(source_name)
+        placeholder_attrs = format_attr_dict({
+            "tensor_name": format_string_attr(source_name),
+            "note": format_string_attr("intermediate tensor placeholder"),
+        })
+        builder.emit(
+            f'{ssa} = "helion.intermediate_tensor"(){placeholder_attrs} : () -> {ctx.tensor_type}'
+        )
+        
+        # Store the SSA value for use in loads
+        ctx.fx_value_map[source_name] = ssa
 
 
 def _emit_reduction_loops(ctx: LoweringContext) -> None:
@@ -407,14 +497,29 @@ def _emit_reduction_loops(ctx: LoweringContext) -> None:
         # Compute tile sizes for this iteration
         tile_k_size = _compute_reduction_tile_size(ctx, loop, loop_dim)
         
-        # Emit LHS load
-        lhs_tile = _emit_lhs_load(ctx, outer_iv_m, reduction_iv, tile_k_size)
+        # Build IV map for loads
+        loop_ivs = {
+            "tile_m": outer_iv_m,
+            "tile_n": outer_iv_n,
+            "tile_k": reduction_iv,
+        }
         
-        # Emit RHS load
-        rhs_tile = _emit_rhs_load(ctx, reduction_iv, outer_iv_n, tile_k_size)
+        # Emit all loads dynamically
+        emitted_loads: list[str] = []
+        for load_info in ctx.load_infos:
+            load_ssa = _emit_load(ctx, load_info, loop_ivs, tile_k_size)
+            emitted_loads.append(load_ssa)
+            load_info.ssa_name = load_ssa
         
-        # Emit computation (addmm)
-        acc_next = _emit_addmm(ctx, lhs_tile, rhs_tile)
+        # Emit computation (addmm) - use first two loads for now
+        # TODO: Generalize for other computation patterns
+        if len(emitted_loads) >= 2:
+            acc_next = _emit_addmm(ctx, emitted_loads[0], emitted_loads[1])
+        elif len(emitted_loads) == 1:
+            # Single load case - just pass through
+            acc_next = emitted_loads[0]
+        else:
+            acc_next = "%acc_iter"
         
         # Emit yield
         builder.emit(f"affine.yield {acc_next} : {ctx.tensor_type}")
@@ -496,70 +601,136 @@ def _compute_reduction_tile_size(
     return loop.tile_const or str(loop.tile_size)
 
 
-def _emit_lhs_load(
-    ctx: LoweringContext, outer_iv_m: str, reduction_iv: str, tile_k_size: str
+def _emit_load(
+    ctx: LoweringContext,
+    load_info: LoadInfo,
+    loop_ivs: dict[str, str],
+    reduction_tile_size: str,
 ) -> str:
-    """Emit LHS tile load operation."""
+    """Emit a tile load operation for any input tensor.
+    
+    This generalizes the previous _emit_lhs_load and _emit_rhs_load functions
+    to handle any number of input tensors by extracting info from LoadInfo.
+    
+    Args:
+        ctx: Lowering context
+        load_info: Information about this load extracted from FX graph
+        loop_ivs: Map from loop name to IV SSA value (e.g., {"tile_m": "%tile_m_iv"})
+        reduction_tile_size: SSA value for the reduction tile size (tile_k)
+    
+    Returns:
+        SSA name of the loaded tile
+    """
     builder = ctx.builder
     loop_map = ctx.get_loop_map()
     
-    # Get LHS tensor info
-    lhs_ssa = ctx.get_lhs_tensor_ssa()
-    lhs_type = ctx.get_lhs_tensor_type()
+    # Get tensor info from kernel args
+    tensor_arg = _get_tensor_arg_for_load(ctx, load_info)
     
-    lhs_tile_m_size = _choose_tile_size(builder, ctx.outer_tile_sizes, loop_map, "tile_m")
-    lhs_tile = builder.fresh("lhs")
+    # Determine tensor SSA - check fx_value_map for intermediate tensors first
+    if tensor_arg:
+        tensor_ssa = tensor_arg.ssa_name
+        tensor_type = tensor_arg.mlir_type
+    elif load_info.source_tensor_name in ctx.fx_value_map:
+        tensor_ssa = ctx.fx_value_map[load_info.source_tensor_name]
+        tensor_type = ctx.tensor_type
+    else:
+        tensor_ssa = f"%{load_info.source_tensor_name}"
+        tensor_type = ctx.tensor_type
     
-    lhs_indices = format_indices_attr([outer_iv_m, reduction_iv])
-    lhs_meta = format_dynamic_tensor_meta(lhs_tile_m_size, tile_k_size, ctx.element_type)
-    lhs_fx_attr = ctx.fx_names.get("lhs_load")
+    # Determine tile dimensions based on source tensor
+    # For matmul pattern: LHS is [M, K], RHS is [K, N]
+    tile_dims = _infer_tile_dims_for_load(ctx, load_info, tensor_arg)
     
-    lhs_attrs = format_attr_dict({
-        "tile": lhs_indices,
+    # Get tile sizes for each dimension
+    tile_sizes: list[str] = []
+    indices: list[str] = []
+    for dim_name in tile_dims:
+        if dim_name == "tile_k":
+            tile_sizes.append(reduction_tile_size)
+            indices.append(loop_ivs.get("tile_k", "%tile_k_iv"))
+        else:
+            tile_size = _choose_tile_size(builder, ctx.outer_tile_sizes, loop_map, dim_name)
+            tile_sizes.append(tile_size)
+            indices.append(loop_ivs.get(dim_name, f"%{dim_name}_iv"))
+    
+    # Ensure we have exactly 2 dimensions for 2D tensors
+    while len(tile_sizes) < 2:
+        tile_sizes.append(reduction_tile_size)
+        indices.append(loop_ivs.get("tile_k", "%tile_k_iv"))
+    
+    # Create fresh SSA name for the load result
+    load_result = builder.fresh(load_info.source_tensor_name)
+    
+    # Format attributes
+    indices_attr = format_indices_attr(indices[:2])
+    tensor_meta = format_dynamic_tensor_meta(tile_sizes[0], tile_sizes[1], ctx.element_type)
+    
+    attrs = format_attr_dict({
+        "tile": indices_attr,
         "sizes": ctx.tile_shape_attr,
-        "tensor_meta": lhs_meta,
-        "fx_node": format_string_attr(lhs_fx_attr) if lhs_fx_attr else None,
+        "tensor_meta": tensor_meta,
+        "fx_node": format_string_attr(load_info.fx_node_name) if load_info.fx_node_name else None,
     })
     
     builder.emit(
-        f'{lhs_tile} = "helion.load_tile_dynamic"({lhs_ssa}, {lhs_tile_m_size}, {tile_k_size}){lhs_attrs} '
-        f": ({lhs_type}, index, index) -> {ctx.tensor_type}"
+        f'{load_result} = "helion.load_tile_dynamic"({tensor_ssa}, {tile_sizes[0]}, {tile_sizes[1]}){attrs} '
+        f": ({tensor_type}, index, index) -> {ctx.tensor_type}"
     )
     
-    return lhs_tile
+    return load_result
 
 
-def _emit_rhs_load(
-    ctx: LoweringContext, reduction_iv: str, outer_iv_n: str, tile_k_size: str
-) -> str:
-    """Emit RHS tile load operation."""
-    builder = ctx.builder
-    loop_map = ctx.get_loop_map()
+def _get_tensor_arg_for_load(
+    ctx: LoweringContext, load_info: LoadInfo
+) -> KernelArgInfo | None:
+    """Get the kernel argument corresponding to a load's source tensor."""
+    # First try by index if available
+    if load_info.source_tensor_arg_idx is not None:
+        tensor_args = ctx.get_tensor_args()
+        if load_info.source_tensor_arg_idx < len(tensor_args):
+            return tensor_args[load_info.source_tensor_arg_idx]
     
-    # Get RHS tensor info
-    rhs_ssa = ctx.get_rhs_tensor_ssa()
-    rhs_type = ctx.get_rhs_tensor_type()
+    # Fall back to matching by name
+    return ctx.get_tensor_arg_by_name(load_info.source_tensor_name)
+
+
+def _infer_tile_dims_for_load(
+    ctx: LoweringContext,
+    load_info: LoadInfo,
+    tensor_arg: KernelArgInfo | None,
+) -> list[str]:
+    """Infer the tile dimension names for a load operation.
     
-    rhs_tile_n_size = _choose_tile_size(builder, ctx.outer_tile_sizes, loop_map, "tile_n")
-    rhs_tile = builder.fresh("rhs")
+    This determines which loop dimensions correspond to which tensor dimensions.
+    For matmul: LHS[M,K] -> [tile_m, tile_k], RHS[K,N] -> [tile_k, tile_n]
+    """
+    # If the LoadInfo already has explicit tile_dim_names, use them
+    if load_info.tile_dim_names:
+        return load_info.tile_dim_names
     
-    rhs_indices = format_indices_attr([reduction_iv, outer_iv_n])
-    rhs_meta = format_dynamic_tensor_meta(tile_k_size, rhs_tile_n_size, ctx.element_type)
-    rhs_fx_attr = ctx.fx_names.get("rhs_load")
+    # Infer based on tensor position in kernel args
+    # For typical matmul: first tensor is LHS [M,K], second is RHS [K,N]
+    tensor_args = ctx.get_tensor_args()
     
-    rhs_attrs = format_attr_dict({
-        "tile": rhs_indices,
-        "sizes": ctx.tile_shape_attr,
-        "tensor_meta": rhs_meta,
-        "fx_node": format_string_attr(rhs_fx_attr) if rhs_fx_attr else None,
-    })
+    if tensor_arg is None:
+        # Fallback to order-based inference
+        return ["tile_m", "tile_k"]
     
-    builder.emit(
-        f'{rhs_tile} = "helion.load_tile_dynamic"({rhs_ssa}, {tile_k_size}, {rhs_tile_n_size}){rhs_attrs} '
-        f": ({rhs_type}, index, index) -> {ctx.tensor_type}"
-    )
+    try:
+        idx = tensor_args.index(tensor_arg)
+    except ValueError:
+        return ["tile_m", "tile_k"]
     
-    return rhs_tile
+    if idx == 0:
+        # First tensor: LHS pattern [M, K]
+        return ["tile_m", "tile_k"]
+    elif idx == 1:
+        # Second tensor: RHS pattern [K, N]
+        return ["tile_k", "tile_n"]
+    else:
+        # Additional tensors: default to [M, K] pattern
+        return ["tile_m", "tile_k"]
 
 
 def _emit_addmm(ctx: LoweringContext, lhs_tile: str, rhs_tile: str) -> str:
@@ -606,9 +777,15 @@ def _emit_store_tile(ctx: LoweringContext) -> None:
     outer_iv_m = outer_ivs[0] if outer_ivs else "%tile_m_iv"
     outer_iv_n = outer_ivs[1] if len(outer_ivs) > 1 else "%tile_n_iv"
     
-    store_tile_m_size = _choose_tile_size(builder, ctx.outer_tile_sizes, loop_map, "tile_m")
-    store_tile_n_size = _choose_tile_size(builder, ctx.outer_tile_sizes, loop_map, "tile_n")
-    store_meta = format_dynamic_tensor_meta(store_tile_m_size, store_tile_n_size, ctx.element_type)
+    # Get tile sizes for the first two outer loops (may be tile_b, tile_m, etc.)
+    first_loop = ctx.outer_loops[0] if ctx.outer_loops else None
+    second_loop = ctx.outer_loops[1] if len(ctx.outer_loops) > 1 else None
+    
+    store_tile_1 = _choose_tile_size(builder, ctx.outer_tile_sizes, loop_map, 
+                                      first_loop.name if first_loop else "tile_m")
+    store_tile_2 = _choose_tile_size(builder, ctx.outer_tile_sizes, loop_map, 
+                                      second_loop.name if second_loop else "tile_n")
+    store_meta = format_dynamic_tensor_meta(store_tile_1, store_tile_2, ctx.element_type)
     
     store_attrs = format_attr_dict({
         "tile": format_indices_attr([outer_iv_m, outer_iv_n]),
@@ -618,11 +795,11 @@ def _emit_store_tile(ctx: LoweringContext) -> None:
             if ctx.root_fx_info.get("store") else None,
     })
     
-    # Output tensor has shape [M, N]
-    output_type = format_tensor_type([ctx.m_extent, ctx.n_extent], ctx.element_type)
+    # Use stored output_shape for consistent tensor type
+    output_type = format_tensor_type(ctx.output_shape, ctx.element_type)
     
     builder.emit(
-        f'"helion.store_tile_dynamic"({ctx.out_value}, {ctx.current_acc}, {store_tile_m_size}, {store_tile_n_size}){store_attrs} '
+        f'"helion.store_tile_dynamic"({ctx.out_value}, {ctx.current_acc}, {store_tile_1}, {store_tile_2}){store_attrs} '
         f": ({output_type}, {ctx.tensor_type}, index, index) -> ()"
     )
 
@@ -635,16 +812,28 @@ def _emit_store_tile(ctx: LoweringContext) -> None:
 def _emit_dynamic_tile_size(
     builder: MLIRBuilder,
     iv: str,
-    dim: str,
+    dim: str | int,
     tile_size: int,
     hint: str,
 ) -> str:
-    """Emit a dynamic tile size computation for concrete tile sizes."""
-    return builder.emit_affine_min(
-        f"(d0)[s0] -> ({tile_size}, s0 - d0 * {tile_size})",
-        [iv],
-        [dim],
-    )
+    """Emit a dynamic tile size computation for concrete tile sizes.
+    
+    If dim is an integer, it is inlined directly into the affine expression.
+    If dim is a string SSA value, it is passed as a symbol.
+    """
+    if isinstance(dim, int):
+        # Inline the integer dimension directly
+        return builder.emit_affine_min(
+            f"(d0) -> ({tile_size}, {dim} - d0 * {tile_size})",
+            [iv],
+            [],  # No symbols needed when dim is inlined
+        )
+    else:
+        return builder.emit_affine_min(
+            f"(d0)[s0] -> ({tile_size}, s0 - d0 * {tile_size})",
+            [iv],
+            [dim],
+        )
 
 
 def _emit_dynamic_tile_size_symbolic(
@@ -712,24 +901,137 @@ def _first_root_graph(device_ir: "DeviceIR") -> "GraphInfo | None":
     return None
 
 
-def _extract_fx_names(graph_info: "GraphInfo | None") -> dict[str, str]:
-    """Extract FX node names for loads and addmm from a graph."""
-    if graph_info is None:
-        return {}
+def _extract_load_infos(
+    graph_info: "GraphInfo | None",
+    kernel_args: list[KernelArgInfo],
+) -> tuple[list[LoadInfo], dict[str, str]]:
+    """Extract load operation information and other FX names from a graph.
     
-    names: dict[str, str] = {}
-    load_seen = 0
+    Returns:
+        A tuple of (list of LoadInfo, dict of other FX names like addmm).
+    """
+    if graph_info is None:
+        return [], {}
+    
+    load_infos: list[LoadInfo] = []
+    other_names: dict[str, str] = {}
+    
+    # Build a map from tensor name to kernel arg index
+    tensor_name_to_idx: dict[str, int] = {}
+    for arg in kernel_args:
+        if arg.is_tensor:
+            tensor_name_to_idx[arg.name] = arg.index
     
     for node in graph_info.graph.nodes:
         if node.op == "call_function":
             if node.target is hl_memory_ops.load:
-                key = "lhs_load" if load_seen == 0 else "rhs_load"
-                names[key] = node.name
-                load_seen += 1
+                # Extract source tensor from first argument
+                tensor_arg = node.args[0] if node.args else None
+                source_name = _get_source_tensor_name(tensor_arg)
+                
+                # Match to kernel argument
+                arg_idx = tensor_name_to_idx.get(source_name)
+                
+                # Extract tile dimension names from args[1] if present
+                tile_dim_names = _parse_tile_indices(node.args[1] if len(node.args) > 1 else None)
+                
+                load_infos.append(LoadInfo(
+                    fx_node_name=node.name,
+                    source_tensor_name=source_name,
+                    source_tensor_arg_idx=arg_idx,
+                    tile_dim_names=tile_dim_names,
+                ))
             elif node.target is aten.addmm.default:
-                names["addmm"] = node.name
+                other_names["addmm"] = node.name
     
-    return names
+    return load_infos, other_names
+
+
+def _parse_tile_indices(indices_arg: object) -> list[str]:
+    """Parse tile index expression to extract dimension names.
+    
+    The indices_arg is typically a string like "[sym_size_int, block_size_2]"
+    or a list of FX nodes representing tile dimensions.
+    
+    Returns list of dimension names like ["tile_m", "tile_k"].
+    """
+    import torch.fx
+    import re
+    
+    if indices_arg is None:
+        return []
+    
+    # If it's a list of FX nodes, extract their names
+    if isinstance(indices_arg, (list, tuple)):
+        names = []
+        for item in indices_arg:
+            if isinstance(item, torch.fx.Node):
+                # Convert node name to tile dimension name
+                name = _symnode_to_tile_dim(item.name)
+                names.append(name)
+            elif hasattr(item, 'name'):
+                names.append(_symnode_to_tile_dim(item.name))
+        return names
+    
+    # If it's a string, try to parse it
+    if isinstance(indices_arg, str):
+        # Extract names from "[name1, name2]" format
+        # Or "TileIndex([name1, name2])" format
+        match = re.search(r'\[([^\]]+)\]', indices_arg)
+        if match:
+            inner = match.group(1)
+            parts = [p.strip() for p in inner.split(',')]
+            return [_symnode_to_tile_dim(p) for p in parts if p]
+    
+    return []
+
+
+def _symnode_to_tile_dim(name: str) -> str:
+    """Convert a SymNode name to a tile dimension name.
+    
+    E.g., "sym_size_int" -> "tile_m", "block_size_2" -> "tile_k"
+    Or preserve known names like "tile_m", "tile_n", "tile_k".
+    """
+    # Already a tile name
+    if name.startswith("tile_"):
+        return name
+    
+    # Common SymNode patterns from Helion
+    # sym_size_int typically refers to first dim (M), sym_size_int_1 to second (N)
+    if "block_size" in name or "sym_size" in name:
+        # Extract the index if present
+        import re
+        match = re.search(r'(\d+)$', name)
+        if match:
+            idx = int(match.group(1))
+            # Map block_size indices to tile names
+            # block_size_0 -> tile_m, block_size_1 -> tile_n, block_size_2 -> tile_k
+            dim_map = {0: "tile_m", 1: "tile_n", 2: "tile_k", 3: "tile_b"}
+            return dim_map.get(idx, f"tile_{idx}")
+        else:
+            # No index, assume first dimension
+            return "tile_m"
+    
+    # Fallback: just prefix with tile_
+    return f"tile_{name}"
+
+
+def _get_source_tensor_name(tensor_arg: object) -> str:
+    """Extract the source tensor name from an FX node argument.
+    
+    The tensor argument in a load node is typically a node representing
+    the _host_tensor('name') call, so we extract the name from it.
+    """
+    import torch.fx
+    
+    if tensor_arg is None:
+        return "unknown"
+    
+    if isinstance(tensor_arg, torch.fx.Node):
+        # The node name itself is often the tensor name (e.g., "x", "y")
+        return tensor_arg.name
+    
+    return str(tensor_arg)
 
 
 def _extract_root_fx_info(graph_info: "GraphInfo | None") -> dict[str, str]:

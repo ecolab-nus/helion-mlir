@@ -35,22 +35,65 @@ func.func @matmul(%arg0: tensor<?x?xf32>, %arg1: tensor<?x?xf32>,
                   %tile_m_size: index, %tile_n_size: index, %tile_k_size: index) -> tensor<?x?xf32>
 ```
 
+## FX Graph Structure
+
+Helion compiles kernels into an FX-based Device IR containing multiple graphs:
+
+| Graph Type | Purpose | `block_ids` |
+|------------|---------|-------------|
+| `ForLoopGraphInfo` | Innermost loop body (reduction loops) | `[2]` (e.g., tile_k) |
+| `RootGraphInfo` | Outer parallel structure and control flow | `None` |
+
+### FX Node Types
+
+FX nodes represent operations in the Helion kernel. Each node has:
+- `op`: Operation type (`call_function`, `placeholder`, `output`)
+- `name`: SSA-style name used in MLIR (`fx_node` attribute)
+- `target`: The Python function being called
+- `args`: Arguments (often other FX nodes)
+
+**Key FX targets and their meaning:**
+
+| FX Target | Description | Example Node Name |
+|-----------|-------------|-------------------|
+| `helion.language.memory_ops.load` | Tile load from tensor | `load`, `load_1` |
+| `helion.language.memory_ops.store` | Tile store to tensor | `store` |
+| `helion.language._tracing_ops._host_tensor` | Reference to kernel argument tensor | `x`, `y`, `out` |
+| `helion.language._tracing_ops._phi` | Loop-carried value (reduction) | `_phi` |
+| `aten.addmm.default` | Matrix multiply-add | `acc` |
+| `helion.language._tracing_ops._for_loop` | Reduction loop marker | `_for_loop` |
+
 ## Loop & Tensor Mapping
 
-| Helion construct | Lowered form | Notes |
-| ---------------- | ------------ | ----- |
-| `hl.tile(...)` outer blocks | `affine.parallel` | Trip counts computed via `affine.apply` with ceildiv expression. Symbolic tile sizes passed as affine symbols. |
-| Nested `hl.tile` / `for` blocks | `affine.for` | Each additional block id becomes its own loop with symbolic affine bounds. |
-| Loop-carried values (`_phi` FX nodes) | `helion.phi` | Captures the carried tensor and FX node name for later legalization. |
+| Helion construct | FX representation | MLIR lowering | Notes |
+| ---------------- | ----------------- | ------------- | ----- |
+| `hl.tile(...)` outer blocks | `_for_loop` in RootGraph | `affine.parallel` | Trip counts via `affine.apply` with ceildiv |
+| Nested `hl.tile` / reduction | ForLoopGraphInfo with `block_ids` | `affine.for` with `iter_args` | Each block_id becomes a loop |
+| Loop-carried values | `_phi` FX nodes | `helion.phi` | Captures initial and final values |
+| Tensor arguments | `_host_tensor('name')` | Function args: `%name: tensor<...>` | Preserves original parameter names |
 
 ## Tensor Loads & Stores
 
-| Helion op | Lowered placeholder | Details |
-| --------- | ------------------- | ------- |
-| `helion.language.memory_ops.load` | `helion.load_tile_dynamic` | Accepts SSA tile sizes (`index` operands), records static `sizes = [...]` and carries a string `tensor_meta` + `fx_node` for provenance. |
-| `helion.language.memory_ops.store` | `helion.store_tile_dynamic` | Writes back using the same dynamic size operands and `fx_node` metadata. |
-| `hl.zeros`, `hl.full` | `helion.zero_tile`, `helion.alloc_like` | Simplified allocators that model buffer creation without committing to a dialect yet. |
-| `torch.addmm`, `torch.baddbmm`, etc. | `helion.call_torch` | Keeps the math as an opaque op with `fn_name = "aten.*"`; future work will legalize these into Torch or Linalg dialects. |
+| Helion op | FX Target | MLIR Op | FX → MLIR Mapping |
+| --------- | --------- | ------- | ----------------- |
+| `x[tile_m, tile_k]` | `memory_ops.load` | `helion.load_tile_dynamic` | `load.args[0]` → source tensor SSA |
+| `out[tile_m, tile_n] = val` | `memory_ops.store` | `helion.store_tile_dynamic` | `store.args[0]` → target tensor SSA |
+| `hl.zeros([...])` | `full` | `helion.zero_tile` | Creates accumulator tile |
+| `torch.addmm(acc, lhs, rhs)` | `aten.addmm.default` | `helion.call_torch` | `fn_name = "aten.addmm"` |
+
+### Load Node Structure
+
+Each `load` FX node contains:
+```
+load.args[0] = source tensor node (e.g., "x" from _host_tensor('x'))
+load.args[1] = tile indices as string (e.g., "[tile_m, tile_k]")
+load.name    = unique name (e.g., "load", "load_1")
+```
+
+The MLIR emitter extracts the source tensor name to:
+1. Look up the corresponding kernel argument SSA (`%x`, `%y`)
+2. Infer tile dimensions based on tensor position (LHS: `[M,K]`, RHS: `[K,N]`)
+3. Preserve the FX node name via `fx_node` attribute
 
 Each operation retains the originating FX node name (`fx_node = "load"`, `"store"`, …) so downstream passes can reconcile the MLIR with the original Helion FX graph.
 
