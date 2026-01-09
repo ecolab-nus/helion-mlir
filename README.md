@@ -52,6 +52,67 @@ FX nodes represent operations in the Helion kernel. Each node has:
 - `target`: The Python function being called
 - `args`: Arguments (often other FX nodes)
 
+### Device IR Structure
+
+Helion transforms the Python kernel into two FX graphs. Here is how the original `matmul` kernel maps to the Device IR:
+
+**Original Python Kernel:**
+```python
+@helion.kernel
+def matmul(x: torch.Tensor, y: torch.Tensor, out: torch.Tensor) -> None:
+    # Root Graph Logic
+    for tile_m, tile_n in hl.tile([x.size(0), y.size(1)]):
+        # acc initialization
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        
+        # Inner Loop (ForLoopGraphInfo)
+        for tile_k in hl.tile(x.size(1)):
+            x_tile = x[tile_m, tile_k]  # load
+            y_tile = y[tile_k, tile_n]  # load_1
+            acc = torch.addmm(acc, x_tile, y_tile)  # acc
+            
+        # Store result
+        out[tile_m, tile_n] = acc  # store
+```
+
+**1. Inner Loop Graph (`ForLoopGraphInfo`)**:
+Represents the body of the `tile_k` loop.
+```
+Graph 0: ForLoopGraphInfo
+opcode         name            target                                     args
+-------------  --------------  -----------------------------------------  -------------------------------
+...
+call_function  x               <function _host_tensor ...>                ('x',)
+call_function  load            <function load ...>                        (x, [..., block_size_2], ...)
+call_function  y               <function _host_tensor ...>                ('y',)
+call_function  load_1          <function load ...>                        (y, [block_size_2, ...], ...)
+call_function  acc             aten.addmm.default                         (_new_var, load, load_1)
+output         output          output                                     ([acc],)
+```
+- `x`/`y` (`_host_tensor`): References to the input tensors `x` and `y`.
+- `load`/`load_1`: Corresponds to `x[tile_m, tile_k]` and `y[tile_k, tile_n]`.
+- `acc` (`aten.addmm`): Corresponds to `torch.addmm(acc, x_tile, y_tile)`.
+- `output`: Returns the updated `acc` for the next iteration.
+
+**2. Root Graph (`RootGraphInfo`)**:
+Represents the outer loops `tile_m, tile_n` and the reduction accumulation logic.
+```
+Graph 1: RootGraphInfo
+opcode         name          target                                     args
+-------------  ------------  -----------------------------------------  -------------------------------
+call_function  acc           <function full ...>                        (..., 0.0, ...)
+call_function  _for_loop     <function _for_loop ...>                   (0, [0], [x_size1], [acc])
+call_function  getitem       <built-in function getitem>                (_for_loop, 0)
+call_function  _phi          <function _phi ...>                        (acc, getitem)
+call_function  out           <function _host_tensor ...>                ('out',)
+call_function  store         <function store ...>                       (out, ..., _phi, None)
+```
+- `acc` (`full`): Corresponds to `hl.zeros(...)`.
+- `_for_loop`: Executes the inner loop over `tile_k`.
+- `_phi`: Represents the final value of `acc` after the loop finishes (The Reduction).
+- `out` (`_host_tensor`): Reference to the `out` argument.
+- `store`: Corresponds to `out[tile_m, tile_n] = acc`.
+
 **Key FX targets and their meaning:**
 
 | FX Target | Description | Example Node Name |
