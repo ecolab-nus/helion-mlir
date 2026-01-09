@@ -38,7 +38,6 @@ from helion_fx_mlir import generate_plan_stage0_mlir, validate_with_helion_opt
 
 # %%
 @helion.kernel(
-    # static_shapes=False gives a performance boost for matmuls
     static_shapes=False,
     # Disable autotung over unrolling/range_num_stages
     # tl.dot is pipelined with num_stages
