@@ -29,40 +29,67 @@ class HostTensorLowering(MLIRLowering):
     """Lowering for _host_tensor -> tensor annotation.
     
     Host tensors are tensors that originate from the host and are passed
-    to the kernel as arguments. This lowering maps them to function
-    arguments and optionally emits annotation operations.
+    to the kernel as arguments, or intermediate tensors derived from them.
+    This lowering maps them to function arguments or emits reference ops.
     """
     
     def emit(self, ctx: "LoweringContext", node: "torch.fx.Node") -> str | None:
-        """Map a host tensor to a function argument.
+        """Map a host tensor to a function argument or emit a reference.
         
         The _host_tensor op carries a debug name that indicates which
-        argument it corresponds to.
+        tensor it corresponds to.
         """
         builder = ctx.builder
         
         # Get the debug name from the argument
-        debug_name = node.args[0] if node.args else ""
+        debug_name = str(node.args[0]) if node.args else ""
         
-        # Emit a comment for documentation
-        builder.emit_comment(f"host_tensor: {node.name} <- {debug_name}")
+        # First, try to find a matching kernel argument by name
+        tensor_arg = ctx.get_tensor_arg_by_name(debug_name)
+        if tensor_arg and tensor_arg.ssa_name:
+            ssa_value = tensor_arg.ssa_name
+            ctx.fx_value_map[node.name] = ssa_value
+            return ssa_value
         
-        # Map to an appropriate function argument
-        # The actual argument mapping depends on the tensor's role
-        if "x" in str(debug_name).lower() or "lhs" in str(debug_name).lower():
-            ssa_value = "%arg0"
-        elif "y" in str(debug_name).lower() or "rhs" in str(debug_name).lower():
-            ssa_value = "%arg1"
-        elif "out" in str(debug_name).lower() or "result" in str(debug_name).lower():
+        # Check if this is an output tensor reference
+        if "out" in debug_name.lower() or "result" in debug_name.lower():
             ssa_value = ctx.out_value or "%out0"
-        else:
-            # Default mapping based on node name
-            ssa_value = f"%{node.name}"
+            ctx.fx_value_map[node.name] = ssa_value
+            return ssa_value
         
-        # Store the mapping
+        # For intermediate/derived tensors (e.g., k_view, q_view),
+        # emit a helion.host_ref operation that references the tensor by name
+        # This allows the MLIR to track which host tensor is being accessed
+        ssa_value = builder.fresh(debug_name.replace(".", "_").replace("-", "_"))
+        
+        # Get tensor type from node metadata if available
+        tensor_type = self._get_tensor_type_from_node(ctx, node)
+        
+        attrs = format_attr_dict({
+            "name": format_string_attr(debug_name),
+            "fx_node": format_string_attr(node.name),
+        })
+        
+        builder.emit(
+            f'{ssa_value} = "helion.host_ref"(){attrs} : () -> {tensor_type}'
+        )
+        
         ctx.fx_value_map[node.name] = ssa_value
-        
         return ssa_value
+    
+    def _get_tensor_type_from_node(self, ctx: "LoweringContext", node: "torch.fx.Node") -> str:
+        """Get MLIR tensor type from FX node metadata."""
+        import torch
+        from ..mlir_builder import format_tensor_type, torch_dtype_to_mlir_element_type
+        
+        val = node.meta.get("val")
+        if isinstance(val, torch.Tensor):
+            shape = [int(s) if not isinstance(s, torch.SymInt) else None for s in val.shape]
+            element_type = torch_dtype_to_mlir_element_type(val.dtype)
+            return format_tensor_type(shape, element_type)
+        
+        # Fallback to default tensor type
+        return ctx.tensor_type
 
 
 @register_lowering(hl_tracing_ops._get_symnode)

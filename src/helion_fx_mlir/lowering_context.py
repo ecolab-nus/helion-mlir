@@ -142,6 +142,15 @@ class LoweringContext:
     # Output tensor shape (inferred from outer loops or store target)
     output_shape: list[int | None] = field(default_factory=list)
     
+    # Symbol table for _get_symnode values (name -> SSA value)
+    symbols: dict[str, str] = field(default_factory=dict)
+    
+    # Map from FX node name to MLIR SSA value (for IRVisitor)
+    node_ssa_values: dict[str, str] = field(default_factory=dict)
+    
+    # Host tensor name to function argument mapping (tensor name -> SSA)
+    host_tensors: dict[str, str] = field(default_factory=dict)
+    
     # Concrete dimension extents by loop name (generalized from m/n/k)
     # Backward compat properties derive from this
     

@@ -147,5 +147,21 @@ def Helion_GetModuleAttributeOp : Helion_Op<"get_module_attribute"> {
   let arguments = (ins StrAttr:$attr_name);
   let results = (outs Index:$result);
 }
+//===----------------------------------------------------------------------===//
+// helion.host_ref
+//===----------------------------------------------------------------------===//
+
+def Helion_HostRefOp : Helion_Op<"host_ref"> {
+  let summary = "reference to a derived/intermediate host tensor";
+  let description = [{
+    The `helion.host_ref` op represents a reference to a tensor that exists on
+    the host but is not a direct kernel argument. These are typically view/reshape
+    operations of input tensors (e.g., k_view, q_view in attention kernels).
+    The op carries a `name` attribute to identify which host tensor is referenced.
+  }];
+  let arguments = (ins StrAttr:$name,
+                       OptionalAttr<StrAttr>:$fx_node);
+  let results = (outs AnyTensor:$result);
+}
 
 #endif // HELION_IR_HELIONOPS_TD

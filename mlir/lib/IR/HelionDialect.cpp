@@ -17,6 +17,7 @@ void HelionDialect::initialize() {
       AllocLikeOp,
       CallTorchOp,
       GetModuleAttributeOp,
+      HostRefOp,
       LoadOp,
       PhiOp,
       StoreOp,

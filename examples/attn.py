@@ -11,11 +11,15 @@ _SYS_SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SYS_SRC) not in sys.path:
     sys.path.insert(0, str(_SYS_SRC))
 
-from helion_fx_mlir import generate_plan_stage0_mlir, validate_with_helion_opt
+from helion_fx_mlir import generate_mlir, validate_with_helion_opt
 
 
 @helion.kernel(
     static_shapes=True,
+    autotune_config_overrides={
+        "range_unroll_factors": [0, 0],
+        "range_num_stages": [0, 0],
+    },
 )
 def attention(
     q_in: torch.Tensor,
@@ -65,19 +69,30 @@ def main() -> None:
     bound = attention.bind((q, k, v))
 
     print("=== Device IR ===")
+    rolled_ids = {
+        info.new_graph_id 
+        for info in bound.host_function.device_ir.rolled_reductions 
+        if info.new_graph_id is not None
+    }
     for i, g in enumerate(bound.host_function.device_ir.graphs):
+        if i in rolled_ids:
+            continue
         print(f"Graph {i}: {type(g).__name__}")
         g.graph.print_tabular()
     print("\n")
 
-    mlir_text = generate_plan_stage0_mlir(bound, kernel_name="attention")
+    mlir_text = generate_mlir(bound, kernel_name="attention")
     print("=== MLIR Dump ===")
     print(mlir_text)
-    res = validate_with_helion_opt(mlir_text)
+    res = validate_with_helion_opt(
+        mlir_text,
+        opt_path="/mnt/fast/llvm-mlir/bin/mlir-opt",
+        extra_args=["-allow-unregistered-dialect"],
+    )
     if res.returncode != 0:
         print(res.stderr, file=sys.stderr)
-        raise SystemExit("helion-opt validation failed (see stderr above).")
-    print("helion-opt validation succeeded.\n")
+        raise SystemExit("mlir-opt validation failed (see stderr above).")
+    print("mlir-opt validation succeeded.\n")
 
 
 if __name__ == "__main__":
