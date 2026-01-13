@@ -45,7 +45,13 @@ def attention(
         for tile_n in hl.tile(v_view.size(1)):
             k = k_view[tile_b, :, tile_n]
             qk = torch.bmm(q, k)
-            m_ij = torch.maximum(m_i, torch.amax(qk, -1) * qk_scale)
+            # old version
+            #m_ij = torch.maximum(m_i, torch.amax(qk, -1) * qk_scale)
+            # new version without amax
+            max_vals, _ = torch.ops.aten.max.dim(qk, -1, False)   # (values, indices)
+            scaled = torch.ops.aten.mul.Scalar(max_vals, qk_scale)
+            m_ij = torch.ops.aten.maximum.default(m_i, scaled)
+
             qk = qk * qk_scale - m_ij[:, :, None]
             p = torch.exp2(qk)
             l_ij = torch.sum(p, -1)
