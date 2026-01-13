@@ -693,18 +693,25 @@ class IRVisitor:
             self.node_values[node.name] = result
             return result
         
-        # Fallback: emit helion.call_torch for ops not yet supported
-        result = self.builder.fresh(node.name)
-        attrs = format_attr_dict({
-            "fn_name": format_string_attr(f"aten.{op_name}"),
-            "fx_node": format_string_attr(node.name),
-        })
-        operand_str = ", ".join(operand_ssas)
-        type_str = ", ".join([tensor_type] * len(operand_ssas))
-        self.builder.emit(
-            f'{result} = "helion.call_torch"({operand_str}){attrs} '
-            f': ({type_str}) -> {tensor_type}'
-        )
+        # Use torch-mlir to generate MLIR for this operation
+        mlir_text = import_aten_node_to_mlir(node)
+        if mlir_text is None:
+             raise RuntimeError(f"Failed to lower ATen op: {node.name} ({target})")
+        
+        # Collect SSA values for tensor operands (matching what import_aten_node_to_mlir expects as args)
+        tensor_operands = []
+        def collect_operands(arg):
+            if isinstance(arg, fx.Node):
+                tensor_operands.append(self.node_values.get(arg.name, f"%{arg.name}"))
+            return arg
+            
+        fx.map_arg(node.args, collect_operands)
+        fx.map_arg(node.kwargs, collect_operands)
+        
+        # Inline the generated MLIR
+        from .torch_mlir_helper import inline_torch_mlir_output
+        result = inline_torch_mlir_output(mlir_text, tensor_operands, self.builder)
+        
         self.node_values[node.name] = result
         return result
     
