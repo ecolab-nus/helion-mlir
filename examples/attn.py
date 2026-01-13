@@ -84,15 +84,11 @@ def main() -> None:
     mlir_text = generate_mlir(bound, kernel_name="attention")
     print("=== MLIR Dump ===")
     print(mlir_text)
-    res = validate_with_helion_opt(
-        mlir_text,
-        opt_path="/mnt/fast/llvm-mlir/bin/mlir-opt",
-        extra_args=["-allow-unregistered-dialect"],
-    )
+    res = validate_with_helion_opt(mlir_text, extra_args=["-allow-unregistered-dialect"])
     if res.returncode != 0:
         print(res.stderr, file=sys.stderr)
-        raise SystemExit("mlir-opt validation failed (see stderr above).")
-    print("mlir-opt validation succeeded.\n")
+        raise SystemExit("helion-opt validation failed (see stderr above).")
+    print("helion-opt validation succeeded.\n")
 
 
 if __name__ == "__main__":

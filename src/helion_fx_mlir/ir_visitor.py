@@ -232,7 +232,13 @@ class IRVisitor:
         return ssa
     
     def visit_full(self, node: fx.Node) -> str:
-        """Generate helion.full for tensor initialization."""
+        """Generate helion.full for tensor initialization.
+        
+        For special values like -inf, we emit arith.constant with IEEE 754 hex 
+        representation and pass it as an operand to helion.full.
+        """
+        import math
+        
         shape_nodes = node.args[0]  # List of FX nodes or values
         fill_value = node.args[1] if len(node.args) > 1 else 0.0
         dtype = node.args[2] if len(node.args) > 2 else torch.float32
@@ -248,18 +254,52 @@ class IRVisitor:
         ssa = self.builder.fresh("full")
         dtype_str = torch_dtype_to_mlir_element_type(dtype) if dtype else "f32"
         
-        attrs = format_attr_dict({
-            "fill_value": fill_value,
-            "dtype": dtype_str,
-        })
+        # Handle special float values like -inf, inf, nan
+        fill_value_ssa = None
+        fill_value_attr = None
         
+        if isinstance(fill_value, float) and (math.isinf(fill_value) or math.isnan(fill_value)):
+            # Emit arith.constant with IEEE 754 hex representation
+            const_ssa = self.builder.fresh("fill_val")
+            if math.isinf(fill_value):
+                if fill_value < 0:
+                    # -inf for f32 = 0xFF800000
+                    hex_val = "0xFF800000"
+                else:
+                    # +inf for f32 = 0x7F800000
+                    hex_val = "0x7F800000"
+            else:
+                # nan for f32 = 0x7FC00000
+                hex_val = "0x7FC00000"
+            
+            self.builder.emit(f'{const_ssa} = arith.constant {hex_val} : {dtype_str}')
+            fill_value_ssa = const_ssa
+        else:
+            fill_value_attr = fill_value
+        
+        # Build the op
         shape_str = ", ".join(shape_ssa)
         type_str = ", ".join(["index"] * len(shape_ssa))
         
-        self.builder.emit(
-            f'{ssa} = "helion.full"({shape_str}){attrs} '
-            f': ({type_str}) -> tensor<?x?x{dtype_str}>'
-        )
+        if fill_value_ssa:
+            # Pass fill value as operand
+            operands = f"{shape_str}, {fill_value_ssa}"
+            operand_types = f"{type_str}, {dtype_str}"
+            attrs = format_attr_dict({"dtype": dtype_str})
+            self.builder.emit(
+                f'{ssa} = "helion.full"({operands}){attrs} '
+                f': ({operand_types}) -> tensor<?x?x{dtype_str}>'
+            )
+        else:
+            # Use fill_value as attribute
+            attrs = format_attr_dict({
+                "fill_value": fill_value_attr,
+                "dtype": dtype_str,
+            })
+            self.builder.emit(
+                f'{ssa} = "helion.full"({shape_str}){attrs} '
+                f': ({type_str}) -> tensor<?x?x{dtype_str}>'
+            )
         
         self.node_values[node.name] = ssa
         

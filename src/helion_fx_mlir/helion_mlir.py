@@ -111,12 +111,18 @@ def generate_mlir(
     builder.emit_module_start(module_attrs)
     
     # Build function signature from kernel arguments
+    # Add 'out' parameter explicitly as it's a host tensor
     func_args = ctx.get_func_signature_args()
+    out_type = format_tensor_type(full_shape, ctx.element_type)
+    func_args.append(("%out", out_type))
     
-    # Determine result type from inferred output shape
-    result_type = format_tensor_type(full_shape, ctx.element_type)
+    # Function returns void (output is via out parameter)
+    result_type = None  # void return
     
-    # Emit function start
+    # Pre-register out in host_tensors
+    ctx.host_tensors["out"] = "%out"
+    
+    # Emit function start with void return
     builder.emit_func_start(kernel_name, func_args, result_type)
     
     # Create visitor and register all graphs
@@ -127,14 +133,14 @@ def generate_mlir(
     # Get grid block IDs for parallel loops
     grid_block_ids = device_ir.grid_block_ids
     
-    # Emit block size lookups for grid blocks
+    # Emit block size lookups for grid blocks using loom.get_symbol
     block_size_ssa = {}
     for block_group in grid_block_ids:
         for block_id in block_group:
-            ssa = builder.fresh(f"block_{block_id}")
+            ssa = builder.fresh(f"block_size_{block_id}")
             builder.emit(
-                f'{ssa} = "loom.get_module_attribute"() '
-                f'{{attr_name = "loom.block_{block_id}"}} : () -> index'
+                f'{ssa} = "loom.get_symbol"() '
+                f'{{name = "block_size_{block_id}"}} : () -> index'
             )
             block_size_ssa[block_id] = ssa
     
@@ -143,10 +149,10 @@ def generate_mlir(
     for loop in ctx.reduction_loops:
         block_id = loop.block_id
         if block_id not in block_size_ssa:
-            ssa = builder.fresh(f"block_{block_id}")
+            ssa = builder.fresh(f"block_size_{block_id}")
             builder.emit(
-                f'{ssa} = "loom.get_module_attribute"() '
-                f'{{attr_name = "loom.block_{block_id}"}} : () -> index'
+                f'{ssa} = "loom.get_symbol"() '
+                f'{{name = "block_size_{block_id}"}} : () -> index'
             )
             block_size_ssa[block_id] = ssa
         
@@ -158,36 +164,12 @@ def generate_mlir(
             )
             reduction_trip_counts[block_id] = tc
     
-    # Emit output tensor allocation
-    if ctx.kernel_args:
-        first_input_ssa = None
-        first_input_type = None
-        for arg in ctx.kernel_args:
-            if arg.is_tensor and arg.name != 'out':
-                first_input_ssa = f"%{arg.name}"
-                first_input_type = arg.mlir_type or ctx.tensor_type
-                break
-        
-        out_ssa = builder.fresh("out")
-        shape_attr = format_shape_attr(full_shape)
-        builder.emit(
-            f'{out_ssa} = "helion.alloc_like"({first_input_ssa}){{shape = {shape_attr}}} '
-            f': ({first_input_type}) -> {result_type}'
-        )
-        visitor.output_tensor_ssa = out_ssa
-        visitor.output_tensor_type = result_type
-        ctx.host_tensors["out"] = out_ssa
-    
-    # Emit initial accumulator (helion.zero_tile)
-    acc_init = builder.fresh("acc_init")
-    builder.emit(
-        f'{acc_init} = "helion.zero_tile"() {{shape = [-1, -1], dtype = {ctx.element_type}}} '
-        f': () -> {ctx.tensor_type}'
-    )
-    
     # Make block sizes and trip counts available to visitor
     visitor.block_size_ssa = block_size_ssa
     visitor.reduction_trip_counts = reduction_trip_counts
+    # out is now a function parameter, so pre-register it
+    visitor.output_tensor_ssa = "%out"
+    visitor.output_tensor_type = out_type
     
     # Emit affine.parallel for grid blocks
     if grid_block_ids and grid_block_ids[0]:
@@ -222,9 +204,6 @@ def generate_mlir(
             visitor.node_values[f"block_size_{block_id}"] = block_size_ssa[block_id]
             # Register IV as a symbol for the visitor
             ctx.symbols[f"block_size_{block_id}"] = block_size_ssa[block_id]
-        
-        # Store acc_init for the visitor to use
-        visitor.initial_acc_ssa["acc"] = acc_init
     
     # Visit the root graph
     visitor.visit_graph(root_graph)
@@ -235,10 +214,8 @@ def generate_mlir(
         builder.pop()
         builder.emit("}")
     
-    # Emit function end and return
-    out_ssa = visitor.output_tensor_ssa or ctx.host_tensors.get("out", "%out")
-    out_type = visitor.output_tensor_type or result_type
-    builder.emit(f"return {out_ssa} : {out_type}")
+    # Emit function end (void return - no return statement needed)
+    builder.emit("return")
     builder.emit_func_end()
     builder.emit_module_end()
     

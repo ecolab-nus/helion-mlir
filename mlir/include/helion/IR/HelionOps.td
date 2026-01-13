@@ -57,7 +57,24 @@ def Helion_ZeroTileOp : Helion_Op<"zero_tile"> {
   let results = (outs AnyTensor:$result);
 }
 
+//===----------------------------------------------------------------------===//
+// helion.full
+//===----------------------------------------------------------------------===//
 
+def Helion_FullOp : Helion_Op<"full"> {
+  let summary = "create a tensor tile filled with a constant value";
+  let description = [{
+    The `helion.full` op produces a tile tensor pre-filled with a constant value.
+    The dimensions are passed as index operands. The fill value can be passed:
+    - As an optional `fill_value` F64 attribute for normal values
+    - As an optional f32 operand for special values like -inf (using arith.constant)
+    The `dtype` specifies the result element type.
+  }];
+  let arguments = (ins Variadic<AnyTypeOf<[Index, AnyFloat]>>:$operands,
+                       OptionalAttr<F64Attr>:$fill_value,
+                       TypeAttr:$dtype);
+  let results = (outs AnyTensor:$result);
+}
 
 //===----------------------------------------------------------------------===//
 // helion.load
@@ -66,15 +83,11 @@ def Helion_ZeroTileOp : Helion_Op<"zero_tile"> {
 def Helion_LoadOp : Helion_Op<"load"> {
   let summary = "load a dynamically sized tensor tile";
   let description = [{
-    Loads a tile slice from the source tensor, parameterised by dynamic tile
-    sizes and optional metadata attributes.
+    Loads a tile slice from the source tensor. The `indices` attribute contains
+    string representations of the indexing expressions for debugging/analysis.
   }];
   let arguments = (ins AnyTensor:$source,
-                       Index:$size_m,
-                       Index:$size_n,
-                       OptionalAttr<ArrayAttr>:$tile,
-                       OptionalAttr<ArrayAttr>:$sizes,
-                       OptionalAttr<StrAttr>:$tensor_meta,
+                       OptionalAttr<ArrayAttr>:$indices,
                        OptionalAttr<StrAttr>:$fx_node);
   let results = (outs AnyTensor:$result);
 }
@@ -119,16 +132,12 @@ def Helion_PhiOp : Helion_Op<"phi"> {
 def Helion_StoreOp : Helion_Op<"store"> {
   let summary = "store a dynamically sized tensor tile";
   let description = [{
-    Stores the tile back into the destination tensor, threading the dynamic
-    tile sizes as operands and preserving metadata for debugging.
+    Stores the tile back into the destination tensor. The `indices` attribute 
+    contains string representations of the indexing expressions for debugging/analysis.
   }];
   let arguments = (ins AnyTensor:$destination,
                        AnyTensor:$tile_value,
-                       Index:$size_m,
-                       Index:$size_n,
-                       OptionalAttr<ArrayAttr>:$tile,
-                       OptionalAttr<ArrayAttr>:$sizes,
-                       OptionalAttr<StrAttr>:$tensor_meta,
+                       OptionalAttr<ArrayAttr>:$indices,
                        OptionalAttr<StrAttr>:$fx_node);
   let results = (outs);
 }

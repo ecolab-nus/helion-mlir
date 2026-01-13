@@ -538,45 +538,27 @@ class LoweringContext:
         return getattr(self, "_symbolic_tile_args", [])
     
     def get_module_attributes(self) -> dict[str, tuple[object, str]]:
-        """Get block sizes, dimension sizes, and tensor dimension mappings as module attributes.
+        """Get block sizes as module attributes.
         
         Returns a dict mapping attribute name to (value, type) for module attributes.
         Uses -1 for undefined (symbolic) block sizes.
         
         Naming convention:
-        - loom.block_m, loom.block_n, loom.block_k = tile sizes (BM, BN, BK), -1 if undefined
-        - loom.dim_m, loom.dim_n, loom.dim_k = dimension sizes (M, N, K), -1 if dynamic
-        
-        Tensor dimension mappings (derived from loop access patterns):
-        - loom.tensor_dims.x = "M,K" (for LHS matrix, accessed by tile_m and tile_k)
-        - loom.tensor_dims.y = "K,N" (for RHS matrix, accessed by tile_k and tile_n)
-        - loom.tensor_dims.out = "M,N" (for output, accessed by tile_m and tile_n)
+        - loom.block_size_0, loom.block_size_1, ... = tile sizes for each block ID
         """
         attrs = {}
         all_loops = self.outer_loops + self.reduction_loops
         
-        # Map loop names to dimension names
-        # tile_m -> M, tile_n -> N, tile_k -> K
-        def loop_name_to_dim(name: str) -> str:
-            if name in {"tile_m", "m"}:
-                return "M"
-            elif name in {"tile_n", "n"}:
-                return "N"
-            elif name in {"tile_k", "k"}:
-                return "K"
-            elif name in {"tile_b", "b"}:
-                return "B"
-            return name.upper()
-        
-        # Emit block sizes with block_* naming (-1 for undefined)
+        # Emit block sizes using block_id-based naming
         for loop in all_loops:
-            dim_letter = loop_name_to_dim(loop.name).lower()
-            attr_name = f"loom.block_{dim_letter}"
+            attr_name = f"loom.block_size_{loop.block_id}"
             if loop.is_symbolic:
                 # Use -1 for undefined/symbolic sizes
                 attrs[attr_name] = (-1, "index")
             elif loop.tile_size is not None:
                 attrs[attr_name] = (loop.tile_size, "index")
+            else:
+                attrs[attr_name] = (-1, "index")
         
         return attrs
     
