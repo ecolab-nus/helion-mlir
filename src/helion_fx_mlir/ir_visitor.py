@@ -221,15 +221,17 @@ class IRVisitor:
             if len(args) == 1:
                 arg = args[0]
                 if isinstance(arg, fx.Node):
-                    self.current_loop_result = self.node_values.get(arg.name)
-                    return self.current_loop_result
-            # Multiple outputs
+                    result = self.node_values.get(arg.name)
+                    self.current_loop_result = [result]  # Store as list for consistency
+                    return result
+            # Multiple outputs - store ALL results
             results = []
             for arg in args:
                 if isinstance(arg, fx.Node):
                     results.append(self.node_values.get(arg.name))
-            self.current_loop_result = results[0] if results else None
-            return self.current_loop_result
+            self.current_loop_result = results  # Store entire list
+            return results[0] if results else None
+
         
         if isinstance(args, fx.Node):
             self.current_loop_result = self.node_values.get(args.name)
@@ -465,17 +467,41 @@ class IRVisitor:
                 # Last resort: emit trip count here (will cause affine symbol error)
                 trip_count_ssa = "%unknown_trip_count"
         
-        # Resolve iter_args
-        iter_args_info = []
+        # Examine ForLoopGraphInfo output to determine actual loop-carried values
+        # Find the output node to get the number of yielded values
+        output_nodes = [n for n in for_graph.graph.nodes if n.op == "output"]
+        num_loop_outputs = 0
+        if output_nodes:
+            output_args = output_nodes[0].args[0]
+            if isinstance(output_args, (list, tuple)):
+                num_loop_outputs = len(output_args)
+            elif output_args is not None:
+                num_loop_outputs = 1
+        
+        # Resolve iter_args - only include loop-carried values (those that are yielded)
+        # Read-only values (passed but not yielded) should be handled separately
+        all_args_info = []
         for i, a in enumerate(args):
             if isinstance(a, fx.Node):
                 ssa = self.node_values.get(a.name, f"%{a.name}")
-                iter_args_info.append((f"acc_iter{i}", ssa, a.name))
+                all_args_info.append((f"acc_iter{i}", ssa, a.name))
             else:
-                iter_args_info.append((f"acc_iter{i}", str(a), None))
+                all_args_info.append((f"acc_iter{i}", str(a), None))
+        
+        # Split into loop-carried (last N that match output count) and read-only (first few)
+        # The convention is: first args are read-only, last args are loop-carried
+        if num_loop_outputs > 0 and num_loop_outputs < len(all_args_info):
+            # First (len - num_outputs) are read-only, rest are loop-carried
+            num_readonly = len(all_args_info) - num_loop_outputs
+            readonly_args_info = all_args_info[:num_readonly]
+            iter_args_info = all_args_info[num_readonly:]
+        else:
+            readonly_args_info = []
+            iter_args_info = all_args_info
         
         # Determine tensor type for iter_args
         tensor_type = self.ctx.tensor_type
+
         
         # Emit affine.for
         iv = f"%iv_block{block_id}"
@@ -490,30 +516,46 @@ class IRVisitor:
         # Result types
         result_types = ", ".join([tensor_type] * len(iter_args_info))
         
+        # For multi-value results, use :N syntax (e.g., %result:3 = ...)
+        num_results = len(iter_args_info)
+        if num_results > 1:
+            result_binding = f'{result}:{num_results}'
+        else:
+            result_binding = result
+        
         self.builder.emit(
-            f'{result} = affine.for {iv} = 0 to {trip_count_ssa} '
+            f'{result_binding} = affine.for {iv} = 0 to {trip_count_ssa} '
             f'iter_args({iter_args_str}) -> ({result_types}) {{'
         )
         self.builder.push()
         
-        # Set up iter_args inside loop - map placeholder names to iter SSA values
+        # Set up args inside loop - map placeholder names to appropriate SSA values
         old_loop_iter_args = self.loop_iter_args.copy()
         
         # Get node_args from ForLoopGraphInfo if available
         node_args = getattr(for_graph, 'node_args', [])
         
-        # Map placeholders: the first placeholder after arg0_1 corresponds to iter_args
-        # In ForLoopGraphInfo, placeholders are: arg0_1, then iter_args in order
+        # Map placeholders for read-only args (use original SSA value directly)
+        for i, (_, ssa, orig_name) in enumerate(readonly_args_info):
+            placeholder_name = f"arg{i}_1"
+            self.loop_iter_args[placeholder_name] = ssa  # Use original SSA
+        
+        # Map placeholders for loop-carried iter_args
+        num_readonly = len(readonly_args_info)
         for i, (iter_name, _, orig_name) in enumerate(iter_args_info):
-            # The placeholder will be accessed via visit_placeholder
-            placeholder_name = f"arg{i + 1}_1" if i == 0 else f"arg{i}_1"
+            # Offset by number of read-only args
+            placeholder_name = f"arg{num_readonly + i}_1"
             self.loop_iter_args[placeholder_name] = f"%{iter_name}"
             
-            # Also map the original iter arg name pattern
-            self.loop_iter_args[f"arg0_{i + 2}"] = f"%{iter_name}"
+            # Also map with different naming patterns used in Device IR
+            self.loop_iter_args[f"arg0_{num_readonly + i + 1}"] = f"%{iter_name}"
         
-        # For the first placeholder in loops (typically the iter_arg from outer)
-        self.loop_iter_args["arg0_1"] = f"%{iter_args_info[0][0]}" if iter_args_info else "%acc_iter"
+        # For the first placeholder in loops - could be read-only or iter_arg
+        if readonly_args_info:
+            self.loop_iter_args["arg0_1"] = readonly_args_info[0][1]  # First read-only
+        elif iter_args_info:
+            self.loop_iter_args["arg0_1"] = f"%{iter_args_info[0][0]}"  # First iter_arg
+
         
         self.loop_depth += 1
         
@@ -525,15 +567,34 @@ class IRVisitor:
         # Restore loop_iter_args
         self.loop_iter_args = old_loop_iter_args
         
-        # Emit yield with result from inner graph
-        yield_value = self.current_loop_result or f"%{iter_args_info[0][0]}"
-        self.builder.emit(f'affine.yield {yield_value} : {tensor_type}')
+        # Emit yield with ALL results from inner graph
+        if isinstance(self.current_loop_result, list) and len(self.current_loop_result) > 1:
+            # Multiple yield values
+            yield_values = ", ".join(self.current_loop_result)
+            yield_types = ", ".join([tensor_type] * len(self.current_loop_result))
+            self.builder.emit(f'affine.yield {yield_values} : {yield_types}')
+        else:
+            # Single yield value (backward compatible)
+            yield_value = self.current_loop_result[0] if isinstance(self.current_loop_result, list) else (self.current_loop_result or f"%{iter_args_info[0][0]}")
+            self.builder.emit(f'affine.yield {yield_value} : {tensor_type}')
         
         self.builder.pop()
         self.builder.emit("}")
         
+        # Store the loop result - for multi-value loops, this SSA represents all results
+        # Individual results are extracted via getitem
         self.node_values[node.name] = result
+        
+        # Also store the result SSAs for each output index
+        # This allows visit_getitem to extract individual results
+        if isinstance(self.current_loop_result, list) and len(self.current_loop_result) > 1:
+            self._loop_result_values = {
+                node.name: result,  # The tuple result SSA
+                '_count': len(self.current_loop_result)  # Number of results
+            }
+        
         return result
+
     
     def visit_phi(self, node: fx.Node) -> str:
         """Generate helion.phi for control flow merge."""
@@ -625,10 +686,22 @@ class IRVisitor:
         # Look up in pre-registered host tensors
         ssa = self.ctx.host_tensors.get(tensor_name)
         if ssa is None:
-            ssa = f"%{tensor_name}"  # Default naming
+            # This is a derived/view tensor (like q_view, k_view) - emit host_ref
+            ssa = self.builder.fresh(tensor_name)
+            attrs = format_attr_dict({
+                "name": format_string_attr(tensor_name),
+                "fx_node": format_string_attr(node.name),
+            })
+            self.builder.emit(
+                f'{ssa} = "helion.host_ref"(){attrs} '
+                f': () -> {self.ctx.tensor_type}'
+            )
+            # Register for reuse
+            self.ctx.host_tensors[tensor_name] = ssa
         
         self.node_values[node.name] = ssa
         return ssa
+
     
     def visit_sym_size(self, node: fx.Node) -> str:
         """Handle aten.sym_size.int - maps to outer loop tile index.
@@ -741,16 +814,29 @@ class IRVisitor:
         return tensor_ssa
     
     def visit_getitem(self, node: fx.Node) -> str:
-        """Map getitem to the corresponding loop result."""
+        """Map getitem to the corresponding loop result.
+        
+        For multi-value affine.for loops, getitem(_for_loop, i) extracts
+        the i-th return value as %result#i syntax.
+        """
         source = node.args[0]
         index = node.args[1]
         
         # For _for_loop results, getitem extracts the i-th return value
         source_ssa = self.node_values.get(source.name, f"%{source.name}") if isinstance(source, fx.Node) else str(source)
         
+        # Check if this is extracting from a multi-value loop result
+        if hasattr(self, '_loop_result_values') and isinstance(source, fx.Node):
+            if source.name in self._loop_result_values:
+                # Multi-value loop result - use #index syntax
+                result_ssa = f"{source_ssa}#{index}"
+                self.node_values[node.name] = result_ssa
+                return result_ssa
+        
         # For single-return loops, just use the result directly
         self.node_values[node.name] = source_ssa
         return source_ssa
+
     
     def visit_mask_to(self, node: fx.Node) -> str:
         """Shortcircuit _mask_to by passing through the input tensor.
