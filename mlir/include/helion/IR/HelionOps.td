@@ -92,23 +92,7 @@ def Helion_LoadOp : Helion_Op<"load"> {
   let results = (outs AnyTensor:$result);
 }
 
-//===----------------------------------------------------------------------===//
-// helion.call_torch
-//===----------------------------------------------------------------------===//
 
-def Helion_CallTorchOp : Helion_Op<"call_torch"> {
-  let summary = "delegate computation to a Torch operator";
-  let description = [{
-    Proxies Helion math to an underlying Torch operator until the lowering is
-    implemented natively in MLIR.
-  }];
-  let arguments = (ins AnyTensor:$accumulator,
-                       AnyTensor:$lhs,
-                       AnyTensor:$rhs,
-                       StrAttr:$fn_name,
-                       OptionalAttr<StrAttr>:$fx_node);
-  let results = (outs AnyTensor:$result);
-}
 
 //===----------------------------------------------------------------------===//
 // helion.phi

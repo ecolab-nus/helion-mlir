@@ -11,7 +11,6 @@ corresponding MLIR operation:
 - _host_tensor -> function argument mapping
 - aten.sym_size.int -> inline concrete value
 - load/store -> helion.load/helion.store
-- aten.* compute -> helion.call_torch
 
 Architecture:
 - IRVisitor: Walks FX graphs and generates MLIR via handlers

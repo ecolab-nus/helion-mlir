@@ -644,7 +644,6 @@ class IRVisitor:
         """Generate MLIR for ATen compute ops using torch-mlir.
         
         Uses torch-mlir's FxImporter to generate proper MLIR for ATen operations.
-        Falls back to helion.call_torch if torch-mlir import fails.
         """
         target = node.target
         op_name, overload = get_aten_op_info(target)

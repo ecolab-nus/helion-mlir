@@ -15,7 +15,7 @@ using namespace helion;
 void HelionDialect::initialize() {
   addOperations<
       AllocLikeOp,
-      CallTorchOp,
+
       FullOp,
       GetModuleAttributeOp,
       HostRefOp,
