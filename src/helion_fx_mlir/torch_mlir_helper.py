@@ -441,7 +441,8 @@ def inline_torch_mlir_output(
         ssa_map[f"%arg{i}"] = op
         
     # Regex to identify SSAs
-    ssa_pattern = re.compile(r'%([a-zA-Z0-9_]+)')
+    # torch-mlir generates names like %float5.000000e-01 which include periods and signs
+    ssa_pattern = re.compile(r'%([a-zA-Z0-9_][a-zA-Z0-9_.+-]*)')
     
     # helper to replace SSAs in a string
     def replace_ssas(text, mapping):
