@@ -206,6 +206,7 @@ src/helion_fx_mlir/
 | `_for_loop` | **this project** | `affine.for` |
 | `_phi` | **this project** | `helion.phi` |
 | `full` | **this project** | `tensor.empty` + `linalg.fill` |
+| `subscript` | **this project** | `tensor.extract_slice` / `tensor.expand_shape` |
 
 ---
 

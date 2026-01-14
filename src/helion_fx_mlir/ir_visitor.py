@@ -173,7 +173,7 @@ class IRVisitor:
         if target is hl_tracing_ops._mask_to:
             return self.visit_mask_to(node)
         
-        # subscript -> helion.subscript (view/indexing operation)
+        # subscript -> tensor.extract_slice / tensor.expand_shape
         if target is hl_view_ops.subscript:
             return self.visit_subscript(node)
         
@@ -918,38 +918,178 @@ class IRVisitor:
         return ssa
     
     def visit_subscript(self, node: fx.Node) -> str:
-        """Generate helion.subscript for tensor view/indexing operations.
+        """Generate tensor ops for subscript (indexing/slicing/newaxis).
         
-        subscript is used for tensor slicing and newaxis operations.
-        For now, we emit a placeholder helion.subscript op that returns
-        a tensor type. Proper indexing support would need to handle
-        the slice objects properly.
+        Replaces helion.subscript with tensor.extract_slice and tensor.expand_shape.
         
-        TODO: Implement proper slice/index handling.
+        1. tensor.extract_slice: Used for slices (:) and integer indexing (rank reducing).
+        2. tensor.expand_shape: Used for adding new dimensions (None).
         """
         tensor_node = node.args[0]
         indices = node.args[1] if len(node.args) > 1 else []
         
-        tensor_ssa = self.node_values.get(tensor_node.name, f"%{tensor_node.name}") if isinstance(tensor_node, fx.Node) else str(tensor_node)
-        tensor_type = self.ctx.tensor_type
+        current_ssa = self.node_values.get(tensor_node.name, f"%{tensor_node.name}") if isinstance(tensor_node, fx.Node) else str(tensor_node)
+        source_type = self._get_tensor_type(tensor_node)
         
-        result = self.builder.fresh("subscript")
+        # -----------------------------------------------------------
+        # Step 1: Handle Slicing and Integer Indexing (tensor.extract_slice)
+        # -----------------------------------------------------------
         
-        # Format indices as string attribute (simplified - ignores slice details)
-        indices_str = str(indices)
+        # Filter out None (newaxis) to check for slicing requirements
+        slice_indices = [idx for idx in indices if idx is not None]
         
-        attrs = format_attr_dict({
-            "indices": format_string_attr(indices_str),
-            "fx_node": format_string_attr(node.name),
-        })
+        needs_slicing = False
+        # Always slice to resolve dynamic dimensions or if explicit indices provided
+        if slice_indices:
+             needs_slicing = True
         
-        self.builder.emit(
-            f'{result} = "helion.subscript"({tensor_ssa}){attrs} '
-            f': ({tensor_type}) -> {tensor_type}'
-        )
+        extracted_ssa = current_ssa
+        # Default intermediate type is source type
+        extracted_type = source_type
         
-        self.node_values[node.name] = result
-        return result
+        if needs_slicing:
+            offsets_ssa = []
+            sizes_ssa = []
+            strides_ssa = []
+            
+            input_dim_idx = 0
+            
+            for idx in slice_indices:
+                if isinstance(idx, slice):
+                    # Handle slice(None) aka [:]
+                    # Offset 0
+                    zero_ssa = self.builder.fresh("zero")
+                    self.builder.emit(f'{zero_ssa} = arith.constant 0 : index')
+                    offsets_ssa.append(zero_ssa)
+                    
+                    # Size: dim(input, input_dim_idx)
+                    dim_ssa = self.builder.fresh("dim")
+                    dim_idx_ssa = self.builder.fresh("dim_idx")
+                    self.builder.emit(f'{dim_idx_ssa} = arith.constant {input_dim_idx} : index')
+                    self.builder.emit(f'{dim_ssa} = tensor.dim {current_ssa}, {dim_idx_ssa} : {source_type}')
+                    
+                    sizes_ssa.append(dim_ssa)
+                    strides_ssa.append("1") # Default stride 1
+                    input_dim_idx += 1
+                    
+                elif isinstance(idx, int) or isinstance(idx, fx.Node):
+                    # Integer indexing: offset=idx, size=1, stride=1
+                    # Rank reducing -> we will drop this dimension in the result type
+                    
+                    if isinstance(idx, fx.Node):
+                        idx_val = self.node_values.get(idx.name, f"%{idx.name}")
+                    else:
+                        idx_c = self.builder.fresh("idx")
+                        self.builder.emit(f'{idx_c} = arith.constant {idx} : index')
+                        idx_val = idx_c
+                        
+                    offsets_ssa.append(idx_val)
+                    
+                    one_ssa = self.builder.fresh("one")
+                    self.builder.emit(f'{one_ssa} = arith.constant 1 : index')
+                    sizes_ssa.append(one_ssa)
+                    strides_ssa.append("1")
+                    
+                    input_dim_idx += 1
+            
+            # Count result dims to build type string
+            res_rank = 0
+            for idx in slice_indices:
+                if isinstance(idx, slice):
+                    res_rank += 1
+            
+            dims_str = "x".join(["?"] * res_rank)
+            result_type = f"tensor<{dims_str}xf32>"
+            extracted_type = result_type
+            
+            result_slice = self.builder.fresh("slice")
+            
+            offsets_str = ", ".join(offsets_ssa)
+            sizes_str = ", ".join(sizes_ssa)
+            strides_str = ", ".join(strides_ssa)
+            
+            self.builder.emit(
+                f'{result_slice} = tensor.extract_slice {current_ssa}[{offsets_str}][{sizes_str}][{strides_str}] : '
+                f'{source_type} to {result_type}'
+            )
+            
+            extracted_ssa = result_slice
+        
+        # -----------------------------------------------------------
+        # Step 2: Handle New Axis (tensor.expand_shape)
+        # -----------------------------------------------------------
+        
+        has_newaxis = any(idx is None for idx in indices)
+        
+        if has_newaxis:
+            # Reassociation logic
+            output_dim_types = [] 
+            for idx in indices:
+                if isinstance(idx, slice):
+                    output_dim_types.append('real')
+                elif idx is None:
+                    output_dim_types.append('new')
+                # ints are ignored/dropped
+            
+            input_dim_assignments = {} # int -> list[int]
+            
+            # Pass 1: map 'real' output dims to input dims
+            real_dim_counter = 0
+            real_output_indices = []
+            for i, dtype in enumerate(output_dim_types):
+                if dtype == 'real':
+                    input_dim_assignments[real_dim_counter] = [i]
+                    real_output_indices.append(i)
+                    real_dim_counter += 1
+            
+            # Pass 2: distribute 'new' dims
+            for i, dtype in enumerate(output_dim_types):
+                if dtype == 'new':
+                    # Attach to NEXT real dim group
+                    found_next = False
+                    target_input_dim = -1
+                    
+                    for k in range(real_dim_counter):
+                        # If the real dim associated with input K is AFTER current 'new' dim i
+                        if input_dim_assignments[k][0] > i:
+                            target_input_dim = k
+                            break
+                    
+                    if target_input_dim != -1:
+                        input_dim_assignments[target_input_dim].insert(0, i) # Prepend to that group
+                        found_next = True
+                    
+                    if not found_next:
+                        # Attach to last input dim
+                        last_input = real_dim_counter - 1
+                        if last_input >= 0:
+                            input_dim_assignments[last_input].append(i)
+            
+            # Flatten to list
+            reassoc_list = []
+            for k in range(real_dim_counter):
+                reassoc_list.append(input_dim_assignments[k])
+                
+            reassoc_str = "[" + ", ".join(["[" + ", ".join(map(str, grp)) + "]" for grp in reassoc_list]) + "]"
+            
+            # Result type
+            res_rank = len(output_dim_types)
+            dims_str = "x".join(["?"] * res_rank)
+            result_type = f"tensor<{dims_str}xf32>"
+            
+            result_expand = self.builder.fresh("expand")
+            
+            self.builder.emit(
+                f'{result_expand} = tensor.expand_shape {extracted_ssa} {reassoc_str} : '
+                f'{extracted_type} into {result_type}'
+            )
+            
+            self.node_values[node.name] = result_expand
+            return result_expand
+            
+        else:
+            self.node_values[node.name] = extracted_ssa
+            return extracted_ssa
     
     def visit_aten_compute(self, node: fx.Node) -> str:
         """Generate MLIR for ATen compute ops using torch-mlir.

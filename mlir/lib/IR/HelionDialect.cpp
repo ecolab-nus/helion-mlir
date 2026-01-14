@@ -14,8 +14,6 @@ using namespace helion;
 
 void HelionDialect::initialize() {
   addOperations<
-      GetModuleAttributeOp,
-      HostRefOp,
       PhiOp
       >();
 }
