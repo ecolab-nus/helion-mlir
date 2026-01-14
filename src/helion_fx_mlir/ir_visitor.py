@@ -911,48 +911,15 @@ class IRVisitor:
         
         tensor_type = self.ctx.tensor_type
         
-        # Try to use torch-mlir for well-known ops
-        # For now, emit linalg.matmul directly for addmm since it's the most common case
-        if op_name == "addmm" and len(operand_ssas) >= 3:
-            # addmm(acc, mat1, mat2) = acc + mat1 @ mat2
-            # linalg.matmul accumulates into output tensor
-            result = self.builder.fresh("matmul")
-            self.builder.emit(
-                f'{result} = linalg.matmul '
-                f'ins({operand_ssas[1]}, {operand_ssas[2]} : {tensor_type}, {tensor_type}) '
-                f'outs({operand_ssas[0]} : {tensor_type}) -> {tensor_type}'
-            )
-            self.node_values[node.name] = result
-            return result
-        
-        elif op_name == "mm" and len(operand_ssas) >= 2:
-            # mm(mat1, mat2) - need zero-initialized output
-            empty = self.builder.fresh("empty")
-            self.builder.emit(f'{empty} = tensor.empty() : {tensor_type}')
-            zero = self.builder.fresh("zero")
-            self.builder.emit(f'{zero} = arith.constant 0.0 : f32')
-            filled = self.builder.fresh("filled")
-            self.builder.emit(
-                f'{filled} = linalg.fill ins({zero} : f32) '
-                f'outs({empty} : {tensor_type}) -> {tensor_type}'
-            )
-            result = self.builder.fresh("matmul")
-            self.builder.emit(
-                f'{result} = linalg.matmul '
-                f'ins({operand_ssas[0]}, {operand_ssas[1]} : {tensor_type}, {tensor_type}) '
-                f'outs({filled} : {tensor_type}) -> {tensor_type}'
-            )
-            self.node_values[node.name] = result
-            return result
-        
         # -------------------------------------------------------------------------
-        # Use torch-mlir to generate linalg MLIR for all other ATen operations
+        # Use torch-mlir to generate torch dialect MLIR for all ATen operations
         # -------------------------------------------------------------------------
         
         # Use torch-mlir to generate MLIR for this operation
         mlir_text = import_aten_node_to_mlir(node)
         if mlir_text is None:
              raise RuntimeError(f"Failed to lower ATen op: {node.name} ({target})")
+
         
         # Collect SSA values for tensor operands (matching what import_aten_node_to_mlir expects as args)
         tensor_operands = []
