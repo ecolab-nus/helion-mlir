@@ -104,11 +104,9 @@ class IRVisitor:
         ssa = f"%{node.name}"
         self.ctx.node_values[node.name] = ssa
         
-        # Register type from kernel args if available
-        for arg in self.ctx.kernel_args:
-            if arg.name == node.name and arg.mlir_type:
-                self.ctx.node_types[node.name] = arg.mlir_type
-                break
+        # Register type from arg_mlir_types if available
+        if node.name in self.ctx.arg_mlir_types:
+            self.ctx.node_types[node.name] = self.ctx.arg_mlir_types[node.name]
                 
         return ssa
     
@@ -224,18 +222,69 @@ class IRVisitor:
     # -------------------------------------------------------------------------
     
     def visit_get_symnode(self, node: fx.Node) -> str:
-        """Generate loom.get_symbol for symnode references."""
-        name = node.args[0]  # e.g., 'block_size_0'
-        ssa = self.builder.fresh(name.replace(".", "_"))
+        """Look up pre-emitted SSA for symnode references.
         
-        # Emit: %ssa = "loom.get_symbol"() {name = "block_size_0"} : () -> index
-        attrs = format_attr_dict({"name": format_string_attr(name)})
-        self.builder.emit(
-            f'{ssa} = "loom.get_symbol"(){attrs} : () -> index'
+        Resolution order:
+        1. Check if sympy expression has concrete value in shape_env.var_to_val
+           -> emit arith.constant
+        2. Look up origin in HostFunction.expr_to_origin:
+           - TensorSizeOrigin -> ctx.tensor_dim_ssa[(arg_name, dim)]
+           - BlockSizeOrigin -> ctx.block_size_ssa[block_id]
+        """
+        from helion._compiler.variable_origin import (
+            TensorSizeOrigin,
+            BlockSizeOrigin,
+            ArgumentOrigin,
         )
         
-        # Store in symbol table
-        self.ctx.symbols[name] = ssa
+        # Get sympy expression from node metadata
+        sym_val = node.meta.get("val")
+        if sym_val is None:
+            raise ValueError(f"No meta['val'] for symnode {node.name}")
+        
+        sym = sym_val._sympy_()
+        
+        # 1. Check if the symbol has a concrete value in shape_env
+        shape_env = self.ctx.bound_kernel.env.shape_env
+        if sym in shape_env.var_to_val:
+            # Symbol has concrete value - emit arith.constant
+            concrete_val = int(shape_env.var_to_val[sym])
+            ssa = self.builder.fresh(node.name.replace(".", "_"))
+            self.builder.emit(f'{ssa} = arith.constant {concrete_val} : index')
+            self.ctx.node_values[node.name] = ssa
+            return ssa
+        
+        # 2. Look up origin info from the host_function
+        host_function = self.ctx.bound_kernel.host_function
+        origin_info = host_function.expr_to_origin.get(sym)
+        
+        if origin_info is None:
+            raise ValueError(f"No origin found for symbol {sym}")
+        
+        origin = origin_info.origin
+        
+        # Handle TensorSizeOrigin
+        if isinstance(origin, TensorSizeOrigin):
+            # Get argument name from the wrapped ArgumentOrigin
+            if isinstance(origin.value, ArgumentOrigin):
+                arg_name = origin.value.name
+            else:
+                arg_name = origin.value.suggest_var_name()
+            dim = origin.key
+            ssa = self.ctx.tensor_dim_ssa.get((arg_name, dim))
+            if ssa is None:
+                raise ValueError(f"No tensor_dim_ssa for ({arg_name}, {dim})")
+        
+        # Handle BlockSizeOrigin
+        elif isinstance(origin, BlockSizeOrigin):
+            block_id = origin.block_id
+            ssa = self.ctx.block_size_ssa.get(block_id)
+            if ssa is None:
+                raise ValueError(f"No block_size_ssa for block_id={block_id}")
+        
+        else:
+            raise ValueError(f"Unrecognized origin type: {type(origin)} for {node.name}")
+        
         self.ctx.node_values[node.name] = ssa
         return ssa
     
@@ -1168,10 +1217,9 @@ class IRVisitor:
         if name in self.ctx.node_types:
             return self.ctx.node_types[name]
             
-        # Look up in kernel args
-        for arg in self.ctx.kernel_args:
-            if arg.name == name and arg.mlir_type:
-                return arg.mlir_type
+        # Look up in arg_mlir_types
+        if name in self.ctx.arg_mlir_types:
+            return self.ctx.arg_mlir_types[name]
         
         # Look up in loop iter args (if it's a placeholder in a loop)
         if name in self.loop_iter_args:

@@ -143,9 +143,6 @@ def generate_mlir(
     # ONLY tensors in this list should be in the function signature
     all_host_tensor_names = _collect_host_tensor_names(device_ir, rolled_ids)
     
-    # Build mapping from tensor name to type info
-    kernel_arg_by_name = {arg.name: arg for arg in ctx.kernel_args if arg.is_tensor}
-    
     # Emit module start with tile size attributes
     module_attrs = ctx.get_module_attributes()
     builder.emit_module_start(module_attrs)
@@ -161,9 +158,9 @@ def generate_mlir(
             # The 'out' tensor comes from _host_tensor('out') and should be treated
             # the same as input tensors (dynamic shape)
             tensor_type = f"tensor<?x?xf32>"
-        elif tensor_name in kernel_arg_by_name:
+        elif tensor_name in ctx.arg_mlir_types:
             # This is a kernel arg that's also used in Device IR
-            tensor_type = kernel_arg_by_name[tensor_name].mlir_type or f"tensor<?x?xf32>"
+            tensor_type = ctx.arg_mlir_types[tensor_name]
         else:
             # Derived tensor (view) - use dynamic tensor type
             tensor_type = f"tensor<?x?xf32>"
@@ -194,6 +191,26 @@ def generate_mlir(
         )
         block_size_ssa[block_id] = ssa
     
+    # Emit tensor dimension symbols for symbolic tensor dimensions
+    # This centralizes all loom.get_symbol calls for shapes
+    import torch
+    param_names = list(bound_kernel.kernel.signature.parameters.keys())
+    fake_args = bound_kernel.fake_args
+    
+    for name, fake_arg in zip(param_names, fake_args):
+        if isinstance(fake_arg, torch.Tensor):
+            for dim in range(fake_arg.ndim):
+                dim_size = fake_arg.size(dim)
+                if isinstance(dim_size, torch.SymInt):
+                    # Symbolic dimension - emit loom.get_symbol
+                    symbol_name = f"{name}_dim{dim}"
+                    ssa = builder.fresh(symbol_name)
+                    builder.emit(
+                        f'{ssa} = "loom.get_symbol"() '
+                        f'{{name = "{symbol_name}"}} : () -> index'
+                    )
+                    ctx.tensor_dim_ssa[(name, dim)] = ssa
+    
     # Pre-compute trip counts for reduction loops (needed for affine.for trip count in IRVisitor)
     # These are usually constant or symbolic, but here we emit them as constants if possible
     # or rely on the IRVisitor to compute them if they are complex.
@@ -210,7 +227,7 @@ def generate_mlir(
         block_name = first_debug_name(info.debug_names, fallback=f"block_{block_id}")
         
         # Calculate trip count
-        total_extent = ctx.loop_extents[block_name]  # Pre-computed extent
+        total_extent = ctx.loop_extents[block_id]  # Pre-computed extent
         
         trip_count_ssa = builder.fresh("trip_count")
         
@@ -258,7 +275,7 @@ def generate_mlir(
         for block_id in ctx.parallel_block_ids:
             info = ctx.env.block_sizes[block_id]
             block_name = first_debug_name(info.debug_names, fallback=f"block_{block_id}")
-            total_extent = ctx.loop_extents[block_name]
+            total_extent = ctx.loop_extents[block_id]
             
             # 0 to total_extent (M/N) with step tile_size
             lower_bounds.append("0")

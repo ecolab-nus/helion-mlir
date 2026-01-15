@@ -31,9 +31,7 @@ from .mlir_builder import (
 
 from .lowering_context import (
     LoweringContext,
-    KernelArgInfo,
     first_debug_name,
-    resolve_extent,
     collect_reduction_block_ids,
 )
 
@@ -59,8 +57,6 @@ __all__ = [
     "format_attr_dict",
     # Lowering context
     "LoweringContext",
-    "KernelArgInfo",
     "first_debug_name",
-    "resolve_extent",
     "collect_reduction_block_ids",
 ]

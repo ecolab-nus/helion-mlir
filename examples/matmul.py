@@ -149,6 +149,9 @@ def main() -> None:
     print(f"Block Sizes ({len(env.block_sizes)}):")
     for bs in env.block_sizes:
         print(f"  Block {bs.block_id}: Size={bs.size}, Var={bs.var}, Reduction={bs.reduction}, Source={bs.block_size_source}")
+    print(f"Shape Env ({len(env.shape_env.var_to_val)}):")
+    for var, val in env.shape_env.var_to_val.items():
+        print(f"  Var {var}: {val}")
     print("\n")
 
     mlir_text = generate_mlir(
