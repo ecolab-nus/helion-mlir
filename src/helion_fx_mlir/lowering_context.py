@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Any, Sequence
 
 from .mlir_builder import (
     MLIRBuilder,
-    is_concrete_size,
     torch_dtype_to_mlir_element_type,
     format_tensor_type,
 )
@@ -23,18 +22,7 @@ if TYPE_CHECKING:
     import torch
 
 
-@dataclass
-class LoopInfo:
-    """Information about a loop in the MLIR emission."""
-    
-    block_id: int
-    name: str
-    tile_size: int | None  # None for symbolic
-    trip_count: int | None  # None for symbolic
-    total_extent: int
-    is_symbolic: bool
-    trip_count_ssa: str | None = None  # SSA value for trip count
-    iv_name: str | None = None  # Induction variable SSA name
+
 
 
 @dataclass
@@ -62,24 +50,52 @@ class LoweringContext:
     values directly from bound_kernel, avoiding redundant storage.
     """
     
-    def __init__(
-        self,
-        builder: MLIRBuilder,
-        bound_kernel: Any,
-    ):
-        """Initialize a LoweringContext.
+    def __init__(self, bound_kernel: Any):
+        """Initialize a LoweringContext from a bound Helion kernel.
         
         Args:
-            builder: MLIRBuilder for text emission
             bound_kernel: The bound Helion kernel
         """
-        self.builder = builder
+        import torch
+        
         self.bound_kernel = bound_kernel
+        self.builder = MLIRBuilder()
+        
+        # Derive kernel name from the kernel function
+        self.kernel_name = bound_kernel.kernel.fn.__name__
+        
+        # Extract kernel arguments upfront
+        self._kernel_args_cache = _extract_kernel_args(bound_kernel)
+        tensor_args = [arg for arg in self._kernel_args_cache if arg.is_tensor]
+        
+        if not tensor_args:
+            raise ValueError("No tensor arguments found")
+        
+        # Update kernel_args with actual shapes and types from fake_args
+        fake_args = bound_kernel.fake_args
+        for arg in self._kernel_args_cache:
+            if arg.is_tensor and arg.index < len(fake_args):
+                tensor = fake_args[arg.index]
+                # Use actual tensor shape
+                arg.shape = [int(s) if not isinstance(s, torch.SymInt) else None 
+                             for s in tensor.shape]
+                # Derive element type from THIS tensor's dtype
+                element_type = torch_dtype_to_mlir_element_type(tensor.dtype)
+                arg.mlir_type = format_tensor_type(arg.shape, element_type)
+        
+        # Build loop information from block sizes
+        self.loop_extents: dict[str, int] = {}
+        
+        # Pre-compute total extents for all blocks
+        fake_args = bound_kernel.fake_args
+        tensor_args = self.get_tensor_args()
+        
+        for info in bound_kernel.env.block_sizes:
+            block_name = first_debug_name(info.debug_names, fallback=f"block_{info.block_id}")
+            total_extent = _resolve_extent(bound_kernel, info, fake_args, tensor_args)
+            self.loop_extents[block_name] = total_extent
         
         # Mutable state that gets populated during lowering
-        self.loop_extents: dict[str, int] = {}
-        self.grid_loops: list[LoopInfo] = []
-        self.inner_loops: list[LoopInfo] = []
         self.symbols: dict[str, str] = {}
         self.host_tensors: dict[str, str] = {}
         
@@ -97,9 +113,6 @@ class LoweringContext:
         
         # Multi-value loop tracking
         self.loop_result_values: dict[str, Any] = {}  # Loop name → result info
-        
-        # Cached computed values (lazily populated)
-        self._kernel_args_cache: list[KernelArgInfo] | None = None
     
     # -------------------------------------------------------------------------
     # Property methods - derive values from bound_kernel
@@ -130,213 +143,13 @@ class LoweringContext:
     
     @property
     def kernel_args(self) -> list[KernelArgInfo]:
-        """Get kernel argument info, with caching.
-        
-        This is cached because it requires computation and may be accessed
-        multiple times during lowering.
-        """
-        if self._kernel_args_cache is None:
-            self._kernel_args_cache = _extract_kernel_args(self.bound_kernel)
+        """Get kernel argument info (pre-computed during __init__)."""
         return self._kernel_args_cache
-    
-    # -------------------------------------------------------------------------
-    # Factory method
-    # -------------------------------------------------------------------------
-    
-    @classmethod
-    def from_bound_kernel(
-        cls,
-        bound_kernel: "BoundKernel",
-        kernel_name: str = "helion_kernel",
-    ) -> "LoweringContext":
-        """Create a LoweringContext from a bound Helion kernel.
-        
-        This factory method extracts all necessary metadata from the kernel
-        and initializes the context for MLIR emission.
-        """
-        import torch
-        
-        builder = MLIRBuilder()
-        fake_args = bound_kernel.fake_args
-        
-        # Extract kernel args
-        kernel_args = _extract_kernel_args(bound_kernel)
-        tensor_args = [arg for arg in kernel_args if arg.is_tensor]
-        
-        if not tensor_args:
-            raise ValueError("No tensor arguments found")
-        
-        # Create context
-        ctx = cls(
-            builder=builder,
-            bound_kernel=bound_kernel,
-        )
-        
-        # Pre-populate kernel_args cache since we already computed it
-        ctx._kernel_args_cache = kernel_args
-        
-        # Build loop information - this populates loop_extents
-        ctx._build_loop_info()
-        
-        # Update kernel_args with actual shapes and types from fake_args
-        for arg in ctx.kernel_args:
-            if arg.is_tensor and arg.index < len(fake_args):
-                tensor = fake_args[arg.index]
-                # Use actual tensor shape
-                arg.shape = [int(s) if not isinstance(s, torch.SymInt) else None 
-                             for s in tensor.shape]
-                # Derive element type from THIS tensor's dtype
-                element_type = torch_dtype_to_mlir_element_type(tensor.dtype)
-                arg.mlir_type = format_tensor_type(arg.shape, element_type)
-        
-        return ctx
     
     def get_tensor_args(self) -> list[KernelArgInfo]:
         """Get only the tensor arguments from kernel_args."""
         return [arg for arg in self.kernel_args if arg.is_tensor]
 
-    
-    def _build_loop_info(self) -> None:
-        """Build loop information from block sizes 
-        
-        This method extracts loop extents from the BlockSizeInfo metadata,
-        which contains the total size for each dimension.
-        """
-        symbolic_tile_args: list[dict[str, object]] = []
-        
-        # Get tensor arguments for extent resolution
-        fake_args = self.bound_kernel.fake_args
-        tensor_args = self.get_tensor_args()
-        
-        # Build outer (parallel) loop info
-        for block_id in self.parallel_block_ids:
-            info = self.block_sizes[block_id]
-            block_name = first_debug_name(info.debug_names, fallback=f"block_{block_id}")
-            
-            # Get extent from BlockSizeInfo or from tensor dimensions
-            total_extent = self._resolve_extent_generic(block_name, info, fake_args, tensor_args)
-            
-            if is_concrete_size(info.size):
-                tile_size = int(info.size)
-                trip_count = max(1, math.ceil(total_extent / tile_size))
-                is_symbolic = False
-            else:
-                tile_size = None
-                trip_count = None
-                is_symbolic = True
-                symbolic_tile_args.append({
-                    "block_id": block_id,
-                    "name": block_name,
-                    "arg_name": f"{block_name}_size",
-                })
-            
-            self.grid_loops.append(LoopInfo(
-                block_id=block_id,
-                name=block_name,
-                tile_size=tile_size,
-                trip_count=trip_count,
-                total_extent=total_extent,
-                is_symbolic=is_symbolic,
-                iv_name=f"%iv_{block_name}"
-            ))
-            
-            # Store extent in loop_extents dict
-            self.loop_extents[block_name] = total_extent
-        
-        # Build reduction loop info
-        reduction_block_ids = collect_reduction_block_ids(self.device_ir)
-        reduction_block_ids = [
-            bid for bid in reduction_block_ids if bid not in self.parallel_block_ids
-        ]
-        
-        for block_id in reduction_block_ids:
-            info = self.block_sizes[block_id]
-            block_name = first_debug_name(info.debug_names, fallback=f"block_{block_id}")
-            
-            total_extent = self._resolve_extent_generic(block_name, info, fake_args, tensor_args)
-            
-            if is_concrete_size(info.size):
-                tile_size = int(info.size)
-                trip_count = max(1, math.ceil(total_extent / tile_size))
-                is_symbolic = False
-            else:
-                tile_size = None
-                trip_count = None
-                is_symbolic = True
-                if not any(arg["name"] == block_name for arg in symbolic_tile_args):
-                    symbolic_tile_args.append({
-                        "block_id": block_id,
-                        "name": block_name,
-                        "arg_name": f"{block_name}_size",
-                    })
-            
-            self.inner_loops.append(LoopInfo(
-                block_id=block_id,
-                name=block_name,
-                tile_size=tile_size,
-                trip_count=trip_count,
-                total_extent=total_extent,
-                is_symbolic=is_symbolic,
-                iv_name=f"%iv_{block_name}"
-            ))
-            
-            # Store extent in loop_extents dict
-            self.loop_extents[block_name] = total_extent
-        
-        pass  # All loop info built
-    
-    def _resolve_extent_generic(
-        self,
-        block_name: str,
-        info: Any,
-        fake_args: tuple,
-        tensor_args: list[KernelArgInfo],
-    ) -> int:
-        """Resolve extent for a named dimension.
-        
-        Extracts the dimension extent from BlockSizeInfo.size, which contains
-        the symbolic or concrete size of the dimension associated with this block.
-        This is set when hl.tile(tensor.size(dim)) is called.
-        
-        Args:
-            block_name: Debug name for the block (unused, kept for compatibility)
-            info: BlockSizeInfo containing dimension size information
-            fake_args: Fake tensor arguments (fallback)
-            tensor_args: KernelArgInfo list (fallback)
-        
-        Returns:
-            The concrete integer extent for this dimension
-        """
-        import torch
-        
-        # Primary strategy: use BlockSizeInfo.size directly
-        # info.size contains the dimension's total size (e.g., from x.size(0))
-        if hasattr(info, 'size') and info.size is not None:
-            size = info.size
-            if isinstance(size, int):
-                return size
-            elif isinstance(size, torch.SymInt):
-                # Get the concrete hint value from the CompileEnvironment
-                env = self.bound_kernel.env
-                return env.size_hint(size)
-        
-        # Fallback: use block_id to look up via CompileEnvironment.get_block_id
-        # This resolves the block ID from dimension symbols in tensor shapes
-        if hasattr(info, 'block_id'):
-            block_id = info.block_id
-            env = self.bound_kernel.env
-            # Look through tensor arguments to find matching dimension
-            for arg in tensor_args:
-                if arg.index < len(fake_args):
-                    tensor = fake_args[arg.index]
-                    for dim in range(tensor.ndim):
-                        dim_size = tensor.size(dim)
-                        resolved_block_id = env.get_block_id(dim_size)
-                        if resolved_block_id == block_id:
-                            return env.size_hint(dim_size)
-        
-        # Ultimate fallback: return 1 as a safe default
-        return 1
     
     def get_module_attributes(self) -> dict[str, tuple[object, str]]:
         """Get block sizes as module attributes.
@@ -348,19 +161,15 @@ class LoweringContext:
         - loom.block_size_0, loom.block_size_1, ... = tile sizes for each block ID
         """
         attrs = {}
-        # Consolidate loop vars by iterating order
-        all_loops = self.grid_loops + self.inner_loops
         # Emit block sizes using block_id-based naming
-        for loop in all_loops:
-            if loop.block_id is None: # Skip loops without a block_id (e.g., grid loops from outer_loop_names)
-                continue
-            attr_name = f"loom.block_size_{loop.block_id}"
-            if loop.is_symbolic:
-                # Use -1 for undefined/symbolic sizes
-                attrs[attr_name] = (-1, "index")
-            elif loop.tile_size is not None:
-                attrs[attr_name] = (loop.tile_size, "index")
+        for info in self.env.block_sizes:
+            attr_name = f"loom.block_size_{info.block_id}"
+            
+            # Use size directly if concrete int
+            if isinstance(info.size, int):
+                attrs[attr_name] = (info.size, "index")
             else:
+                # Use -1 for undefined/symbolic sizes
                 attrs[attr_name] = (-1, "index")
         
         return attrs
@@ -438,6 +247,59 @@ def first_debug_name(names: set[str], *, fallback: str) -> str:
         if name:
             return name.replace(".", "_").replace("-", "_")
     return fallback
+
+
+def _resolve_extent(
+    bound_kernel: Any,
+    info: Any,
+    fake_args: tuple,
+    tensor_args: list[KernelArgInfo],
+) -> int:
+    """Resolve extent for a named dimension.
+    
+    Extracts the dimension extent from BlockSizeInfo.size, which contains
+    the symbolic or concrete size of the dimension associated with this block.
+    This is set when hl.tile(tensor.size(dim)) is called.
+    
+    Args:
+        bound_kernel: The bound kernel for environment access
+        info: BlockSizeInfo containing dimension size information
+        fake_args: Fake tensor arguments (fallback)
+        tensor_args: KernelArgInfo list (fallback)
+    
+    Returns:
+        The concrete integer extent for this dimension
+    """
+    import torch
+    
+    # Primary strategy: use BlockSizeInfo.size directly
+    # info.size contains the dimension's total size (e.g., from x.size(0))
+    if hasattr(info, 'size') and info.size is not None:
+        size = info.size
+        if isinstance(size, int):
+            return size
+        elif isinstance(size, torch.SymInt):
+            # Get the concrete hint value from the CompileEnvironment
+            env = bound_kernel.env
+            return env.size_hint(size)
+    
+    # Fallback: use block_id to look up via CompileEnvironment.get_block_id
+    # This resolves the block ID from dimension symbols in tensor shapes
+    if hasattr(info, 'block_id'):
+        block_id = info.block_id
+        env = bound_kernel.env
+        # Look through tensor arguments to find matching dimension
+        for arg in tensor_args:
+            if arg.index < len(fake_args):
+                tensor = fake_args[arg.index]
+                for dim in range(tensor.ndim):
+                    dim_size = tensor.size(dim)
+                    resolved_block_id = env.get_block_id(dim_size)
+                    if resolved_block_id == block_id:
+                        return env.size_hint(dim_size)
+    
+    # Ultimate fallback: return 1 as a safe default
+    return 1
 
 
 def resolve_extent(name: str, lhs: "Tensor", rhs: "Tensor") -> int:

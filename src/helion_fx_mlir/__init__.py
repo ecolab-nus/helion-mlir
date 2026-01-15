@@ -22,7 +22,6 @@ from .ir_visitor import IRVisitor
 # Core infrastructure (for extending with new lowerings)
 from .mlir_builder import (
     MLIRBuilder,
-    is_concrete_size,
     torch_dtype_to_mlir_element_type,
     format_tensor_type,
     format_shape_attr,
@@ -32,7 +31,6 @@ from .mlir_builder import (
 
 from .lowering_context import (
     LoweringContext,
-    LoopInfo,
     KernelArgInfo,
     first_debug_name,
     resolve_extent,
@@ -54,7 +52,6 @@ __all__ = [
     "IRVisitor",
     # Builder and utilities
     "MLIRBuilder",
-    "is_concrete_size",
     "torch_dtype_to_mlir_element_type",
     "format_tensor_type",
     "format_shape_attr",
@@ -62,7 +59,6 @@ __all__ = [
     "format_attr_dict",
     # Lowering context
     "LoweringContext",
-    "LoopInfo",
     "KernelArgInfo",
     "first_debug_name",
     "resolve_extent",

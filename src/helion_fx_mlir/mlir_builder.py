@@ -113,25 +113,6 @@ class MLIRBuilder:
 # Utility functions for MLIR text formatting
 # -----------------------------------------------------------------------------
 
-
-def is_concrete_size(size: Any) -> bool:
-    """Check if a block size is a concrete integer value.
-    
-    Returns True for int, False for SymInt, AutoSize, or None.
-    """
-    if size is None:
-        return False
-    if AutoSize is not None and isinstance(size, AutoSize):
-        return False
-    if hasattr(torch, 'SymInt') and isinstance(size, torch.SymInt):
-        return False
-    try:
-        int(size)
-        return True
-    except (TypeError, ValueError):
-        return False
-
-
 def torch_dtype_to_mlir_element_type(dtype: torch.dtype) -> str:
     """Convert a torch dtype to MLIR element type string."""
     mapping = {

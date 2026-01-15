@@ -25,11 +25,17 @@ import subprocess
 from pathlib import Path
 from typing import Iterable, TYPE_CHECKING
 
+import math
+
 from .mlir_builder import (
     format_tensor_type,
     format_shape_attr,
 )
-from .lowering_context import LoweringContext
+from .lowering_context import (
+    LoweringContext,
+    first_debug_name,
+    collect_reduction_block_ids,
+)
 from .ir_visitor import IRVisitor
 
 if TYPE_CHECKING:
@@ -78,7 +84,7 @@ def _collect_host_tensor_names(device_ir, rolled_ids: set[int]) -> list[str]:
 def generate_mlir(
     bound_kernel: "BoundKernel",
     *,
-    kernel_name: str = "helion_kernel",
+    kernel_name: str | None = None,
 ) -> str:
     """Generate MLIR by walking Device IR instruction-by-instruction.
     
@@ -87,7 +93,8 @@ def generate_mlir(
     
     Args:
         bound_kernel: A bound Helion kernel with fake_args set
-        kernel_name: Name for the generated MLIR function
+        kernel_name: Optional name override for the generated MLIR function.
+                     If not provided, uses the kernel function's __name__.
     
     Returns:
         MLIR text representation of the kernel
@@ -95,9 +102,12 @@ def generate_mlir(
     from helion._compiler.device_ir import RootGraphInfo, ForLoopGraphInfo
     
     # Create lowering context from bound kernel
-    ctx = LoweringContext.from_bound_kernel(bound_kernel, kernel_name)
+    ctx = LoweringContext(bound_kernel)
     builder = ctx.builder
     device_ir = bound_kernel.host_function.device_ir
+    
+    # Use provided name or derive from kernel
+    actual_kernel_name = kernel_name if kernel_name else ctx.kernel_name
     
     # Find root and for-loop graphs
     root_graph = None
@@ -166,51 +176,88 @@ def generate_mlir(
     result_type = None  # void return
     
     # Emit function start with void return
-    builder.emit_func_start(kernel_name, func_args, result_type)
+    builder.emit_func_start(actual_kernel_name, func_args, result_type)
     
     # Create visitor and register all graphs in context
     visitor = IRVisitor(ctx)
     for graph_id, graph_info in for_loop_graphs.items():
         ctx.graphs[graph_id] = graph_info
     
-    # Get grid block IDs for parallel loops
-    grid_block_ids = device_ir.grid_block_ids
-    
-    # Emit block size lookups for grid blocks using loom.get_symbol
+    # Emit block size lookups for ALL blocks using loom.get_symbol
     block_size_ssa = {}
-    for block_group in grid_block_ids:
-        for block_id in block_group:
-            ssa = builder.fresh(f"block_size_{block_id}")
-            builder.emit(
-                f'{ssa} = "loom.get_symbol"() '
-                f'{{name = "block_size_{block_id}"}} : () -> index'
-            )
-            block_size_ssa[block_id] = ssa
+    for info in ctx.env.block_sizes:
+        block_id = info.block_id
+        ssa = builder.fresh(f"block_size_{block_id}")
+        builder.emit(
+            f'{ssa} = "loom.get_symbol"() '
+            f'{{name = "block_size_{block_id}"}} : () -> index'
+        )
+        block_size_ssa[block_id] = ssa
     
     # Pre-compute trip counts for reduction loops (needed for affine.for trip count in IRVisitor)
     # These are usually constant or symbolic, but here we emit them as constants if possible
     # or rely on the IRVisitor to compute them if they are complex.
     reduction_trip_counts = {}
-    for loop in ctx.inner_loops:
-        if loop.block_id is not None:
-            # Emit trip count constant
-            trip_count_ssa = builder.fresh("trip_count")
-            if isinstance(loop.trip_count, int):
-                builder.emit(f'{trip_count_ssa} = arith.constant {loop.trip_count} : index')
-            else:
-                # Handle symbolic trip count? For now assume it's resolved or we emit correct IR
-                # Fallback to simple constant if unknown
-                builder.emit(f'{trip_count_ssa} = arith.constant {loop.trip_count} : index')
+    
+    # Iterate over reduction loops
+    reduction_block_ids = collect_reduction_block_ids(device_ir)
+    parallel_block_ids_set = set(ctx.parallel_block_ids)
+    reduction_block_ids = [bid for bid in reduction_block_ids if bid not in parallel_block_ids_set]
+    
+    for block_id in reduction_block_ids:
+        # Assuming block_id is the list index as per allocate_block_size implementation.
+        info = ctx.env.block_sizes[block_id]
+        block_name = first_debug_name(info.debug_names, fallback=f"block_{block_id}")
+        
+        # Calculate trip count
+        total_extent = ctx.loop_extents[block_name]  # Pre-computed extent
+        
+        trip_count_ssa = builder.fresh("trip_count")
+        
+        if isinstance(info.size, int):
+            tile_size = info.size
+            trip_count = max(1, math.ceil(total_extent / tile_size))
+            builder.emit(f'{trip_count_ssa} = arith.constant {trip_count} : index')
             
-            # Store in visitor for use in visit_for_loop
-            reduction_trip_counts[loop.block_id] = trip_count_ssa
+        else:
+            # Symbolic trip count logic
+            # Trip count = ceil(total_extent / tile_size)
+            # tile_size is symbolic -> get from block_size_ssa
+            
+            # Block size SSA must exist since we emitted all of them above
+            tile_size_ssa = block_size_ssa[block_id]
+            
+            # Generate calculation: (total_extent + tile_size - 1) // tile_size
+            # Since total_extent is constant here, we can emit it
+            
+            # %total = arith.constant ...
+            total_ssa = builder.fresh("total_extent")
+            builder.emit(f'{total_ssa} = arith.constant {total_extent} : index')
+            
+            # %c1 = arith.constant 1
+            c1_ssa = builder.fresh("c1")
+            builder.emit(f'{c1_ssa} = arith.constant 1 : index')
+            
+            # %t_minus_1 = sub total, 1
+            t_minus_1 = builder.fresh("t_minus_1")
+            builder.emit(f'{t_minus_1} = arith.subi {total_ssa}, {c1_ssa} : index')
+            
+            # %num = add t_minus_1, tile_size
+            num_ssa = builder.fresh("numerator")
+            builder.emit(f'{num_ssa} = arith.addi {t_minus_1}, {tile_size_ssa} : index')
+            
+            # %trip_count = divui num, tile_size
+            builder.emit(f'{trip_count_ssa} = arith.divui {num_ssa}, {tile_size_ssa} : index')
+        
+        # Store in visitor for use in visit_for_loop
+        reduction_trip_counts[block_id] = trip_count_ssa
     
     # Make block sizes and trip counts available to context
     ctx.block_size_ssa = block_size_ssa
     ctx.reduction_trip_counts = reduction_trip_counts
     
     # Emit affine.parallel for grid blocks
-    if len(ctx.grid_loops) > 0:
+    if ctx.parallel_block_ids:
         # We have parallel loops (e.g., M, N tiling)
         # Emit nested affine.parallel
         
@@ -218,20 +265,28 @@ def generate_mlir(
         lower_bounds = []
         upper_bounds = []
         steps = []
+        iv_names = []
         
-        for loop in ctx.grid_loops:
+        for block_id in ctx.parallel_block_ids:
+            info = ctx.env.block_sizes[block_id]
+            block_name = first_debug_name(info.debug_names, fallback=f"block_{block_id}")
+            total_extent = ctx.loop_extents[block_name]
+            
             # 0 to total_extent (M/N) with step tile_size
             lower_bounds.append("0")
-            upper_bounds.append(str(loop.total_extent))
-            steps.append(str(loop.tile_size) if loop.tile_size else "1")
+            upper_bounds.append(str(total_extent))
+            
+            if isinstance(info.size, int):
+                 steps.append(str(info.size))
+            else:
+                 steps.append("1") # fallback step for symbolic (or symbolic constant if we had it)
+                 
+            iv_names.append(f"%iv_{block_name}")
         
         # Format parallel loop
         lb_str = "(" + ", ".join(lower_bounds) + ")"
         ub_str = "(" + ", ".join(upper_bounds) + ")"
         step_str = "(" + ", ".join(steps) + ")"
-        
-        # IV names
-        iv_names = [loop.iv_name for loop in ctx.grid_loops]
         iv_str = ", ".join(iv_names)
         
         builder.emit(

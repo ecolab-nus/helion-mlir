@@ -403,12 +403,7 @@ class IRVisitor:
         # Use pre-computed trip count (computed outside affine.parallel)
         trip_count_ssa = self.ctx.reduction_trip_counts.get(block_id)
         if trip_count_ssa is None:
-            # Fallback: find any reduction trip count
-            if self.ctx.reduction_trip_counts:
-                trip_count_ssa = list(self.ctx.reduction_trip_counts.values())[0]
-            else:
-                # Last resort: emit trip count here (will cause affine symbol error)
-                trip_count_ssa = "%unknown_trip_count"
+            raise ValueError("No trip count found for loop")
         
         # Examine ForLoopGraphInfo output to determine actual loop-carried values
         # Find the output node to get the number of yielded values
