@@ -623,18 +623,18 @@ class IRVisitor:
         # Map dimension to outer loop IV
         # dim 0 -> block 0 -> %iv_block0
         # dim 1 -> block 1 -> %iv_block1
-        if dim < len(self.ctx.outer_loops):
-            block_id = self.ctx.outer_loops[dim].block_id
+        if dim < len(self.ctx.grid_loops):
+            block_id = self.ctx.grid_loops[dim].block_id
             iv_name = f"%iv_block{block_id}"
             self.node_values[node.name] = iv_name
             return iv_name
         
         # Fallback for reduction dimension or other cases
         # Look up if this corresponds to a reduction loop
-        if dim < len(self.ctx.outer_loops) + len(self.ctx.reduction_loops):
-            idx = dim - len(self.ctx.outer_loops)
-            if idx < len(self.ctx.reduction_loops):
-                block_id = self.ctx.reduction_loops[idx].block_id
+        if dim < len(self.ctx.grid_loops) + len(self.ctx.inner_loops):
+            idx = dim - len(self.ctx.grid_loops)
+            if idx < len(self.ctx.inner_loops):
+                block_id = self.ctx.inner_loops[idx].block_id
                 iv_name = f"%iv_block{block_id}"
                 self.node_values[node.name] = iv_name
                 return iv_name

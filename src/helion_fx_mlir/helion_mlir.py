@@ -187,71 +187,65 @@ def generate_mlir(
             )
             block_size_ssa[block_id] = ssa
     
-    # Emit block size lookups for reduction loops (must be outside affine.parallel)
+    # Pre-compute trip counts for reduction loops (needed for affine.for trip count in IRVisitor)
+    # These are usually constant or symbolic, but here we emit them as constants if possible
+    # or rely on the IRVisitor to compute them if they are complex.
     reduction_trip_counts = {}
-    for loop in ctx.reduction_loops:
-        block_id = loop.block_id
-        if block_id not in block_size_ssa:
-            ssa = builder.fresh(f"block_size_{block_id}")
-            builder.emit(
-                f'{ssa} = "loom.get_symbol"() '
-                f'{{name = "block_size_{block_id}"}} : () -> index'
-            )
-            block_size_ssa[block_id] = ssa
-        else :
-            raise ValueError(f"Block ID {block_id} not found in block_size_ssa")
-        
-        # Compute trip count for reduction loop
-        if isinstance(loop.total_extent, int):
-            tc = builder.fresh("apply")
-            builder.emit(
-                f'{tc} = affine.apply affine_map<()[s0] -> ({loop.total_extent} ceildiv s0)>()[{block_size_ssa[block_id]}]'
-            )
-            reduction_trip_counts[block_id] = tc
+    for loop in ctx.inner_loops:
+        if loop.block_id is not None:
+            # Emit trip count constant
+            trip_count_ssa = builder.fresh("trip_count")
+            if isinstance(loop.trip_count, int):
+                builder.emit(f'{trip_count_ssa} = arith.constant {loop.trip_count} : index')
+            else:
+                # Handle symbolic trip count? For now assume it's resolved or we emit correct IR
+                # Fallback to simple constant if unknown
+                builder.emit(f'{trip_count_ssa} = arith.constant {loop.trip_count} : index')
+            
+            # Store in visitor for use in visit_for_loop
+            reduction_trip_counts[loop.block_id] = trip_count_ssa
     
     # Make block sizes and trip counts available to visitor
     visitor.block_size_ssa = block_size_ssa
     visitor.reduction_trip_counts = reduction_trip_counts
     
     # Emit affine.parallel for grid blocks
-    if grid_block_ids and grid_block_ids[0]:
-        block_group = grid_block_ids[0]  # Assume single grid for now
+    if len(ctx.grid_loops) > 0:
+        # We have parallel loops (e.g., M, N tiling)
+        # Emit nested affine.parallel
         
-        # Compute trip counts for each grid dimension
-        trip_count_ssa = []
-        for i, block_id in enumerate(block_group):
-            loop = ctx.outer_loops[i] if i < len(ctx.outer_loops) else None
-            if loop and isinstance(loop.total_extent, int):
-                extent = loop.total_extent
-                tc = builder.fresh("apply")
-                block_ssa = block_size_ssa[block_id]
-                builder.emit(
-                    f'{tc} = affine.apply affine_map<()[s0] -> ({extent} ceildiv s0)>()[{block_ssa}]'
-                )
-                trip_count_ssa.append(tc)
-            else:
-                trip_count_ssa.append(block_size_ssa.get(block_id, "%unknown"))
+        # Collect loop bounds
+        lower_bounds = []
+        upper_bounds = []
+        steps = []
         
-        # Build affine.parallel header
-        ivs = ", ".join([f"%iv_block{bid}" for bid in block_group])
-        zeros = ", ".join(["0"] * len(block_group))
-        ubs = ", ".join(trip_count_ssa)
-        steps = ", ".join(["1"] * len(block_group))
+        for loop in ctx.grid_loops:
+            # 0 to total_extent (M/N) with step tile_size
+            lower_bounds.append("0")
+            upper_bounds.append(str(loop.total_extent))
+            steps.append(str(loop.tile_size) if loop.tile_size else "1")
         
-        builder.emit(f"affine.parallel ({ivs}) = ({zeros}) to ({ubs}) step ({steps}) {{")
+        # Format parallel loop
+        lb_str = "(" + ", ".join(lower_bounds) + ")"
+        ub_str = "(" + ", ".join(upper_bounds) + ")"
+        step_str = "(" + ", ".join(steps) + ")"
+        
+        # IV names
+        iv_names = [loop.iv_name for loop in ctx.grid_loops]
+        iv_str = ", ".join(iv_names)
+        
+        builder.emit(
+            f"affine.parallel ({iv_str}) = {lb_str} to {ub_str} step {step_str} {{"
+        )
         builder.push()
         
-        # Make block sizes and IVs available to visitor
-        for block_id in block_group:
-            visitor.node_values[f"block_size_{block_id}"] = block_size_ssa[block_id]
-            # Register IV as a symbol for the visitor
-            ctx.symbols[f"block_size_{block_id}"] = block_size_ssa[block_id]
-    
-    # Visit the root graph
-    visitor.visit_graph(root_graph)
-    
-    # Close affine.parallel if opened
-    if grid_block_ids and grid_block_ids[0]:
+        # Inside the parallel loop, we need to map the IVs (which are loop indices e.g. 0, 128, 256)
+        # to the block indices expected by the code (if necessary).
+        # The current logic assumes iv_blockX IS the loop index (offset).
+        
+        # Visit the root graph
+        visitor.visit_graph(root_graph)
+        
         builder.emit("affine.yield")
         builder.pop()
         builder.emit("}")

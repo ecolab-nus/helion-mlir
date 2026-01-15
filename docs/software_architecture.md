@@ -111,8 +111,8 @@ class LoweringContext:
     loop_extents: dict[str, int]  # Name → total extent
 
     # Loop information
-    outer_loops: list[LoopInfo]      # Parallel loops (tile_m, tile_n)
-    reduction_loops: list[LoopInfo]  # Reduction loops (tile_k)
+    grid_loops: list[LoopInfo]      # Parallel loops (tile_m, tile_n)
+    inner_loops: list[LoopInfo]  # Reduction loops (tile_k)
     block_sizes: dict[int, Any]      # BlockSizeInfo by block_id
     parallel_block_ids: list[int]    # Grid block IDs
 
@@ -214,7 +214,160 @@ Helion compiles kernels into an FX-based Device IR containing multiple graphs:
 │ 5. OUTPUT: MLIR Text                                                │
 │    - Dialects: affine, tensor, linalg, arith, torch, helion, loom   │
 └─────────────────────────────────────────────────────────────────────┘
+---
+
+## LoweringContext and IRVisitor Data Flow
+
+This section details the information held by `LoweringContext` and how `IRVisitor` uses it to correctly generate MLIR.
+
+### LoweringContext Fields
+
+`LoweringContext` is a dataclass that holds all state during FX-to-MLIR conversion. It is created once via `LoweringContext.from_bound_kernel()` before graph walking begins.
+
+#### Core Infrastructure
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `builder` | `MLIRBuilder` | Shared builder for MLIR text emission. IRVisitor accesses this to emit operations via `self.builder.emit()`, `self.builder.fresh()`, etc. |
+| `bound_kernel` | `BoundKernel` | The source Helion kernel containing `fake_args`, `env`, and `host_function`. |
+| `device_ir` | `DeviceIR` | The Device IR containing the FX graphs to be lowered. |
+
+#### Type Information
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `element_type` | `str` | MLIR element type (e.g., `"f32"`, `"f16"`). Derived from the first tensor argument's dtype. |
+| `tensor_type` | `str` | Default dynamic tensor type (e.g., `"tensor<?x?xf32>"`). Used for intermediate tile tensors. |
+
+**Usage in IRVisitor**: `tensor_type` is used extensively in:
+- `visit_for_loop`: to build `iter_args` and result types
+- `visit_phi`: to build the phi operation type signature
+- `visit_load`/`visit_store`: as the result/value type
+- `visit_subscript`: as the output tensor type
+- `visit_aten_compute`: to determine output types
+
+#### Loop Information
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `grid_loops` | `list[LoopInfo]` | Parallel (outer) loops. Each has `block_id`, `name`, `tile_size`, `trip_count`, `total_extent`, `is_symbolic`, `iv_name`. |
+| `inner_loops` | `list[LoopInfo]` | Reduction (inner) loops. Same structure as `grid_loops`. |
+| `loop_extents` | `dict[str, int]` | Maps loop name to total iteration extent (e.g., `{"tile_m": 128, "tile_n": 256}`). |
+| `block_sizes` | `dict[int, BlockSizeInfo]` | Maps block_id to Helion's BlockSizeInfo containing tile size and debug names. |
+| `parallel_block_ids` | `list[int]` | Block IDs for parallel (outer) loops, derived from `device_ir.grid_block_ids`. |
+
+**Usage in IRVisitor**:
+- `visit_sym_size`: Uses `grid_loops` and `inner_loops` to map dimension indices to loop induction variables:
+  ```python
+  if dim < len(self.ctx.grid_loops):
+      block_id = self.ctx.grid_loops[dim].block_id
+      iv_name = f"%iv_block{block_id}"
+  ```
+- This allows `sym_size_int(tensor, 0)` to resolve to `%iv_block0` (first outer loop IV).
+
+#### SSA Value Mappings
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `symbols` | `dict[str, str]` | Maps symbol names to SSA values (e.g., `{"block_size_0": "%block_size_00"}`). |
+| `host_tensors` | `dict[str, str]` | Maps tensor names to function argument SSA values (e.g., `{"x": "%x", "out": "%out"}`). |
+
+**Usage in IRVisitor**:
+- `visit_get_symnode`: Stores the emitted symbol SSA in `ctx.symbols`:
+  ```python
+  self.ctx.symbols[name] = ssa  # e.g., symbols["block_size_0"] = "%block_size_00"
+  ```
+- `visit_host_tensor`: Looks up tensor names in `ctx.host_tensors`:
+  ```python
+  ssa = self.ctx.host_tensors.get(tensor_name)  # e.g., "x" → "%x"
+  if ssa is None:
+      raise ValueError(f"Host tensor '{tensor_name}' not found...")
+  ```
+
+#### Kernel Arguments
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `kernel_args` | `list[KernelArgInfo]` | Metadata for each kernel parameter: name, index, is_tensor, dtype, shape, mlir_type, ssa_name. |
+
+**Usage in IRVisitor**:
+- `_get_tensor_type`: Searches `kernel_args` to find the MLIR type for a specific tensor:
+  ```python
+  for arg in self.ctx.kernel_args:
+      if arg.name == tensor_name:
+          return arg.mlir_type  # e.g., "tensor<128x256xf32>"
+  ```
+
+### IRVisitor's Own State
+
+In addition to using `LoweringContext`, `IRVisitor` maintains its own transient state during graph walking:
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `node_values` | `dict[str, str]` | Maps FX node names to MLIR SSA values. Grows as nodes are visited. |
+| `graphs` | `dict[int, GraphInfo]` | Registered ForLoopGraphInfo objects by graph_id. Set before walking. |
+| `loop_iter_args` | `dict[str, str]` | Maps placeholder names to iter_arg SSA values during loop body visitation. |
+| `current_loop_result` | `str \| list[str]` | The SSA value(s) from the inner graph's output node. Used for `affine.yield`. |
+| `loop_depth` | `int` | Current nesting depth for loops. |
+| `initial_acc_ssa` | `dict[str, str]` | Maps accumulator node names to their initial SSA values (before loop entry). Used by `visit_phi`. |
+| `block_size_ssa` | `dict[int, str]` | Pre-computed block size SSA values by block_id. |
+| `reduction_trip_counts` | `dict[int, str]` | Pre-computed trip count SSA values for reduction loops. |
+
+### Data Flow Diagram
+
 ```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           LoweringContext (Shared State)                      │
+│                                                                               │
+│  ┌─────────────┐    ┌────────────────┐    ┌─────────────────────────────┐   │
+│  │   builder   │    │  tensor_type   │    │         host_tensors        │   │
+│  │ (MLIRBuilder│    │ "tensor<?x?    │    │ {"x": "%x", "out": "%out"}  │   │
+│  │  emit/fresh)│    │   xf32>"       │    │                             │   │
+│  └──────┬──────┘    └───────┬────────┘    └────────────┬────────────────┘   │
+│         │                   │                          │                     │
+│  ┌──────┴──────┐    ┌───────┴────────┐    ┌────────────┴────────────────┐   │
+│  │  grid_loops │    │   symbols      │    │       kernel_args           │   │
+│  │ [LoopInfo]  │    │ {"block_size_0"│    │ [KernelArgInfo for each arg]│   │
+│  │             │    │  : "%bs0"}     │    │                             │   │
+│  └──────┬──────┘    └───────┬────────┘    └────────────┬────────────────┘   │
+└─────────┼───────────────────┼──────────────────────────┼────────────────────┘
+          │                   │                          │
+          ▼                   ▼                          ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          IRVisitor (Transient State)                         │
+│                                                                               │
+│  ┌─────────────────┐    ┌────────────────┐    ┌──────────────────────────┐  │
+│  │   node_values   │    │ loop_iter_args │    │  reduction_trip_counts   │  │
+│  │ {"load": "%s1"} │    │ {"arg0_1": ... │    │ {2: "%trip_count0"}      │  │
+│  └────────┬────────┘    └───────┬────────┘    └────────────┬─────────────┘  │
+│           │                     │                          │                 │
+│           └─────────────────────┴──────────────────────────┘                 │
+│                                    │                                         │
+│                                    ▼                                         │
+│                          ┌──────────────────┐                                │
+│                          │   MLIR Output    │                                │
+│                          │ via builder.emit │                                │
+│                          └──────────────────┘                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Example: Visiting `_host_tensor("x")`
+
+1. FX node: `call_function(_host_tensor, ('x',))`
+2. IRVisitor calls `visit_host_tensor(node)`
+3. Retrieves `tensor_name = "x"` from `node.args[0]`
+4. Looks up in `self.ctx.host_tensors.get("x")` → returns `"%x"`
+5. Stores `self.node_values["x"] = "%x"`
+6. Returns `"%x"` for downstream nodes to reference
+
+### Example: Visiting `aten.sym_size.int(tensor, 0)`
+
+1. FX node: `call_function(aten.sym_size.int, (tensor_node, 0))`
+2. IRVisitor calls `visit_sym_size(node)` with `dim = 0`
+3. Checks `len(self.ctx.grid_loops)` to see if dimension is within outer loops
+4. Gets `block_id = self.ctx.grid_loops[0].block_id` (e.g., `0`)
+5. Returns `iv_name = "%iv_block0"` as the SSA value
+6. Stores in `self.node_values` for downstream reference
 
 ---
 

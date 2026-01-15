@@ -75,8 +75,8 @@ class LoweringContext:
     loop_extents: dict[str, int] = field(default_factory=dict)
     
     # Loop information
-    outer_loops: list[LoopInfo] = field(default_factory=list)
-    reduction_loops: list[LoopInfo] = field(default_factory=list)
+    grid_loops: list[LoopInfo] = field(default_factory=list)
+    inner_loops: list[LoopInfo] = field(default_factory=list)
     # Block sizes from the kernel environment
     block_sizes: dict[int, Any] = field(default_factory=dict)  # BlockSizeInfo
     
@@ -198,13 +198,14 @@ class LoweringContext:
                     "arg_name": f"{block_name}_size",
                 })
             
-            self.outer_loops.append(LoopInfo(
+            self.grid_loops.append(LoopInfo(
                 block_id=block_id,
                 name=block_name,
                 tile_size=tile_size,
                 trip_count=trip_count,
                 total_extent=total_extent,
                 is_symbolic=is_symbolic,
+                iv_name=f"%iv_{block_name}"
             ))
             
             # Store extent in loop_extents dict
@@ -237,13 +238,14 @@ class LoweringContext:
                         "arg_name": f"{block_name}_size",
                     })
             
-            self.reduction_loops.append(LoopInfo(
+            self.inner_loops.append(LoopInfo(
                 block_id=block_id,
                 name=block_name,
                 tile_size=tile_size,
                 trip_count=trip_count,
                 total_extent=total_extent,
                 is_symbolic=is_symbolic,
+                iv_name=f"%iv_{block_name}"
             ))
             
             # Store extent in loop_extents dict
@@ -314,10 +316,12 @@ class LoweringContext:
         - loom.block_size_0, loom.block_size_1, ... = tile sizes for each block ID
         """
         attrs = {}
-        all_loops = self.outer_loops + self.reduction_loops
-        
+        # Consolidate loop vars by iterating order
+        all_loops = self.grid_loops + self.inner_loops
         # Emit block sizes using block_id-based naming
         for loop in all_loops:
+            if loop.block_id is None: # Skip loops without a block_id (e.g., grid loops from outer_loop_names)
+                continue
             attr_name = f"loom.block_size_{loop.block_id}"
             if loop.is_symbolic:
                 # Use -1 for undefined/symbolic sizes
