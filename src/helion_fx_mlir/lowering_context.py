@@ -19,9 +19,6 @@ from .mlir_builder import (
 )
 
 if TYPE_CHECKING:
-    from helion._compiler.device_ir import DeviceIR, GraphInfo
-    from helion._compiler.compile_environment import BlockSizeInfo
-    from helion.runtime.kernel import BoundKernel
     from torch import Tensor
     import torch
 
@@ -36,7 +33,6 @@ class LoopInfo:
     trip_count: int | None  # None for symbolic
     total_extent: int
     is_symbolic: bool
-    tile_const: str | None = None  # SSA value for tile size constant
     trip_count_ssa: str | None = None  # SSA value for trip count
     iv_name: str | None = None  # Induction variable SSA name
 
@@ -55,22 +51,6 @@ class KernelArgInfo:
 
 
 @dataclass
-class LoadInfo:
-    """Information about a load operation extracted from the FX graph.
-    
-    This enables dynamic handling of any number of input tensor loads,
-    instead of hard-coding for exactly 2 inputs (lhs/rhs).
-    """
-    
-    fx_node_name: str  # FX node name (e.g., "load", "load_1")
-    source_tensor_name: str  # Source tensor name from FX graph (e.g., "x", "y")
-    source_tensor_arg_idx: int | None = None  # Index in kernel args, if matched
-    tile_dim_names: list[str] = field(default_factory=list)  # Legacy: Dimension names for tile
-    tile_block_ids: list[int | None] = field(default_factory=list)  # Block IDs for each tile dimension
-    ssa_name: str | None = None  # Assigned MLIR SSA name after emission
-
-
-@dataclass
 class LoweringContext:
     """Context passed to lowering functions during FX-to-MLIR conversion.
     
@@ -86,9 +66,6 @@ class LoweringContext:
     bound_kernel: Any  # BoundKernel, using Any to avoid import issues
     device_ir: Any  # DeviceIR
     
-    # Current graph being processed
-    current_graph: Any | None = None  # GraphInfo
-    
     # Type information
     element_type: str = "f32"
     tensor_type: str = "tensor<?x?xf32>"
@@ -97,74 +74,23 @@ class LoweringContext:
     # e.g., {"tile_m": 128, "tile_n": 256, "tile_k": 128}
     loop_extents: dict[str, int] = field(default_factory=dict)
     
-    # Output tensor
-    out_value: str | None = None
-    acc_seed: str | None = None
-    
     # Loop information
     outer_loops: list[LoopInfo] = field(default_factory=list)
     reduction_loops: list[LoopInfo] = field(default_factory=list)
-    
-    # Symbolic tile size arguments (name -> SSA value)
-    symbolic_arg_ssa: dict[str, str] = field(default_factory=dict)
-    
-    # Dynamic tile sizes computed inside loops (name -> SSA value)
-    outer_tile_sizes: dict[str, str] = field(default_factory=dict)
-    
-    # Dimension to SSA value (or int) mapping
-    dims_map: dict[str, str | int] = field(default_factory=dict)
-    
-    # FX node name to MLIR SSA value mapping
-    fx_value_map: dict[str, str] = field(default_factory=dict)
-    
     # Block sizes from the kernel environment
     block_sizes: dict[int, Any] = field(default_factory=dict)  # BlockSizeInfo
-    
-    # Current accumulator value in reduction loops
-    current_acc: str | None = None
     
     # Grid block IDs for parallel loops
     parallel_block_ids: list[int] = field(default_factory=list)
     
-    # Extracted FX node names for annotation
-    fx_names: dict[str, str] = field(default_factory=dict)
-    root_fx_info: dict[str, str] = field(default_factory=dict)
-    
-    # Tile shape attribute string
-    tile_shape_attr: str = "[]"
-    
     # Kernel function arguments (extracted from bound kernel)
     kernel_args: list[KernelArgInfo] = field(default_factory=list)
-    
-    # Load operations extracted from FX graph
-    load_infos: list[LoadInfo] = field(default_factory=list)
-    
-    # Output tensor shape (inferred from outer loops or store target)
-    output_shape: list[int | None] = field(default_factory=list)
     
     # Symbol table for _get_symnode values (name -> SSA value)
     symbols: dict[str, str] = field(default_factory=dict)
     
-    # Map from FX node name to MLIR SSA value (for IRVisitor)
-    node_ssa_values: dict[str, str] = field(default_factory=dict)
-    
     # Host tensor name to function argument mapping (tensor name -> SSA)
     host_tensors: dict[str, str] = field(default_factory=dict)
-    
-    # Concrete dimension extents by loop name (generalized from m/n/k)
-    # Backward compat properties derive from this
-    
-    @property
-    def m_extent(self) -> int | None:
-        return self.loop_extents.get("tile_m")
-    
-    @property
-    def n_extent(self) -> int | None:
-        return self.loop_extents.get("tile_n")
-    
-    @property
-    def k_extent(self) -> int | None:
-        return self.loop_extents.get("tile_k")
     
     @classmethod
     def from_bound_kernel(
@@ -237,150 +163,6 @@ class LoweringContext:
     def get_tensor_args(self) -> list[KernelArgInfo]:
         """Get only the tensor arguments from kernel_args."""
         return [arg for arg in self.kernel_args if arg.is_tensor]
-    
-    def get_func_signature_args(self) -> list[tuple[str, str]]:
-        """Get function signature arguments as (ssa_name, mlir_type) tuples.
-        
-        Returns only kernel arguments. Symbolic tile sizes are now module attributes.
-        """
-        args = []
-        
-        # Add kernel arguments only
-        for arg in self.kernel_args:
-            if arg.ssa_name and arg.mlir_type:
-                args.append((arg.ssa_name, arg.mlir_type))
-        
-        return args
-    
-    def get_lhs_tensor_ssa(self) -> str:
-        """Get SSA name of the first (LHS) tensor argument."""
-        tensor_args = self.get_tensor_args()
-        if tensor_args:
-            return tensor_args[0].ssa_name or "%arg0"
-        return "%arg0"
-    
-    def get_rhs_tensor_ssa(self) -> str:
-        """Get SSA name of the second (RHS) tensor argument."""
-        tensor_args = self.get_tensor_args()
-        if len(tensor_args) > 1:
-            return tensor_args[1].ssa_name or "%arg1"
-        return "%arg1"
-    
-    def get_lhs_tensor_type(self) -> str:
-        """Get MLIR type of the first (LHS) tensor argument."""
-        tensor_args = self.get_tensor_args()
-        if tensor_args:
-            return tensor_args[0].mlir_type or self.tensor_type
-        return self.tensor_type
-    
-    def get_rhs_tensor_type(self) -> str:
-        """Get MLIR type of the second (RHS) tensor argument."""
-        tensor_args = self.get_tensor_args()
-        if len(tensor_args) > 1:
-            return tensor_args[1].mlir_type or self.tensor_type
-        return self.tensor_type
-    
-    def get_tensor_arg_by_name(self, name: str) -> KernelArgInfo | None:
-        """Get a kernel argument by name."""
-        for arg in self.kernel_args:
-            if arg.name == name:
-                return arg
-        return None
-    
-    def get_tensor_arg_ssa(self, index: int) -> str:
-        """Get SSA name of tensor argument at given index."""
-        tensor_args = self.get_tensor_args()
-        if index < len(tensor_args):
-            return tensor_args[index].ssa_name or f"%arg{index}"
-        return f"%arg{index}"
-    
-    def get_tensor_arg_type(self, index: int) -> str:
-        """Get MLIR type of tensor argument at given index."""
-        tensor_args = self.get_tensor_args()
-        if index < len(tensor_args):
-            return tensor_args[index].mlir_type or self.tensor_type
-        return self.tensor_type
-    
-    def _build_loop_info(self, lhs: "Tensor", rhs: "Tensor") -> None:
-        """Build loop information from block sizes and parallel block IDs."""
-        symbolic_tile_args: list[dict[str, object]] = []
-        
-        # Build outer (parallel) loop info
-        for block_id in self.parallel_block_ids:
-            info = self.block_sizes[block_id]
-            block_name = first_debug_name(info.debug_names, fallback=f"block_{block_id}")
-            total_extent = resolve_extent(block_name, lhs, rhs)
-            
-            if is_concrete_size(info.size):
-                tile_size = int(info.size)
-                trip_count = max(1, math.ceil(total_extent / tile_size))
-                is_symbolic = False
-            else:
-                tile_size = None
-                trip_count = None
-                is_symbolic = True
-                symbolic_tile_args.append({
-                    "block_id": block_id,
-                    "name": block_name,
-                    "arg_name": f"{block_name}_size",
-                })
-            
-            self.outer_loops.append(LoopInfo(
-                block_id=block_id,
-                name=block_name,
-                tile_size=tile_size,
-                trip_count=trip_count,
-                total_extent=total_extent,
-                is_symbolic=is_symbolic,
-            ))
-        
-        # Build reduction loop info
-        reduction_block_ids = collect_reduction_block_ids(self.device_ir)
-        reduction_block_ids = [
-            bid for bid in reduction_block_ids if bid not in self.parallel_block_ids
-        ]
-        
-        for block_id in reduction_block_ids:
-            info = self.block_sizes[block_id]
-            block_name = first_debug_name(info.debug_names, fallback=f"block_{block_id}")
-            total_extent = resolve_extent(block_name, lhs, rhs)
-            
-            if is_concrete_size(info.size):
-                tile_size = int(info.size)
-                trip_count = max(1, math.ceil(total_extent / tile_size))
-                is_symbolic = False
-            else:
-                tile_size = None
-                trip_count = None
-                is_symbolic = True
-                if not any(arg["name"] == block_name for arg in symbolic_tile_args):
-                    symbolic_tile_args.append({
-                        "block_id": block_id,
-                        "name": block_name,
-                        "arg_name": f"{block_name}_size",
-                    })
-            
-            self.reduction_loops.append(LoopInfo(
-                block_id=block_id,
-                name=block_name,
-                tile_size=tile_size,
-                trip_count=trip_count,
-                total_extent=total_extent,
-                is_symbolic=is_symbolic,
-            ))
-        
-        # Store symbolic arguments for later
-        self._symbolic_tile_args = symbolic_tile_args
-        
-        # Build tile shape attribute
-        tile_shape = []
-        for loop in self.outer_loops[:2]:
-            if loop.is_symbolic:
-                tile_shape.append(None)
-            else:
-                tile_shape.append(loop.tile_size)
-        from .mlir_builder import format_shape_attr
-        self.tile_shape_attr = format_shape_attr(tile_shape)
     
     def _build_loop_info_generic(self) -> None:
         """Build loop information from block sizes without assuming matmul patterns.
@@ -467,18 +249,7 @@ class LoweringContext:
             # Store extent in loop_extents dict
             self.loop_extents[block_name] = total_extent
         
-        # Store symbolic arguments for later
-        self._symbolic_tile_args = symbolic_tile_args
-        
-        # Build tile shape attribute
-        tile_shape = []
-        for loop in self.outer_loops[:2]:
-            if loop.is_symbolic:
-                tile_shape.append(None)
-            else:
-                tile_shape.append(loop.tile_size)
-        from .mlir_builder import format_shape_attr
-        self.tile_shape_attr = format_shape_attr(tile_shape)
+        pass  # All loop info built
     
     def _resolve_extent_generic(
         self,
@@ -533,10 +304,6 @@ class LoweringContext:
         # Fallback: return 1 as a safe default
         return 1
     
-    def get_symbolic_tile_args(self) -> list[dict[str, object]]:
-        """Get the list of symbolic tile size arguments."""
-        return getattr(self, "_symbolic_tile_args", [])
-    
     def get_module_attributes(self) -> dict[str, tuple[object, str]]:
         """Get block sizes as module attributes.
         
@@ -562,28 +329,6 @@ class LoweringContext:
         
         return attrs
     
-    def get_loop_map(self) -> dict[str, LoopInfo]:
-        """Get a mapping from loop name to LoopInfo."""
-        loop_map = {loop.name: loop for loop in self.outer_loops}
-        loop_map.update({loop.name: loop for loop in self.reduction_loops})
-        return loop_map
-    
-    def setup_dims_map(self) -> None:
-        """Set up the dimension name to SSA value mapping.
-        
-        Builds dims_map from loop_extents, handling various naming conventions.
-        """
-        # Build dims_map from loop_extents - each loop name maps to its extent
-        self.dims_map = {}
-        
-        for loop_name, extent in self.loop_extents.items():
-            self.dims_map[loop_name] = extent
-            # Also map short names (without "tile_" prefix)
-            if loop_name.startswith("tile_"):
-                short_name = loop_name[5:]  # Remove "tile_" prefix
-                self.dims_map[short_name] = extent
-
-
 # -----------------------------------------------------------------------------
 # Helper functions
 # -----------------------------------------------------------------------------

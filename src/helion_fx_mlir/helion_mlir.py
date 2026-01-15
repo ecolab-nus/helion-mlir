@@ -34,7 +34,6 @@ from .ir_visitor import IRVisitor
 
 if TYPE_CHECKING:
     from helion._compiler.device_ir import RootGraphInfo, ForLoopGraphInfo
-    from helion.runtime.kernel import BoundKernel
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELION_OPT_CANDIDATES = [
@@ -137,9 +136,6 @@ def generate_mlir(
     # Build mapping from tensor name to type info
     kernel_arg_by_name = {arg.name: arg for arg in ctx.kernel_args if arg.is_tensor}
     
-    # Infer output shape (needed for 'out' parameter type)
-    full_shape = _infer_output_shape(ctx)
-    
     # Emit module start with tile size attributes
     module_attrs = ctx.get_module_attributes()
     builder.emit_module_start(module_attrs)
@@ -202,6 +198,8 @@ def generate_mlir(
                 f'{{name = "block_size_{block_id}"}} : () -> index'
             )
             block_size_ssa[block_id] = ssa
+        else :
+            raise ValueError(f"Block ID {block_id} not found in block_size_ssa")
         
         # Compute trip count for reduction loop
         if isinstance(loop.total_extent, int):
@@ -214,10 +212,6 @@ def generate_mlir(
     # Make block sizes and trip counts available to visitor
     visitor.block_size_ssa = block_size_ssa
     visitor.reduction_trip_counts = reduction_trip_counts
-    # out is now a function parameter, so pre-register it
-    visitor.output_tensor_ssa = "%out"
-    # Get output tensor type from host_tensors registration (stored during func_args construction)
-    visitor.output_tensor_type = format_tensor_type(full_shape, ctx.element_type)
     
     # Emit affine.parallel for grid blocks
     if grid_block_ids and grid_block_ids[0]:
@@ -270,25 +264,25 @@ def generate_mlir(
     return builder.build()
 
 
-def _infer_output_shape(ctx: LoweringContext) -> list[int | None]:
-    """Infer output shape from outer loop extents.
+# def _infer_output_shape(ctx: LoweringContext) -> list[int | None]:
+#     """Infer output shape from outer loop extents.
     
-    The outer (parallel) loops define the output tensor dimensions.
-    For matmul: [tile_m, tile_n] -> [M, N]
-    """
-    shape = []
-    for loop in ctx.outer_loops:
-        extent = loop.total_extent
-        if isinstance(extent, int):
-            shape.append(extent)
-        else:
-            shape.append(None)  # Dynamic dimension
+#     The outer (parallel) loops define the output tensor dimensions.
+#     For matmul: [tile_m, tile_n] -> [M, N]
+#     """
+#     shape = []
+#     for loop in ctx.outer_loops:
+#         extent = loop.total_extent
+#         if isinstance(extent, int):
+#             shape.append(extent)
+#         else:
+#             shape.append(None)  # Dynamic dimension
     
-    # Ensure we have at least 2 dimensions for typical 2D output tensors
-    while len(shape) < 2:
-        shape.append(None)
+#     # Ensure we have at least 2 dimensions for typical 2D output tensors
+#     while len(shape) < 2:
+#         shape.append(None)
     
-    return shape
+#     return shape
 
 
 # -----------------------------------------------------------------------------

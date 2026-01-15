@@ -63,9 +63,9 @@ def attention(
 
 
 def main() -> None:
-    q = torch.randn([2, 4, 8])
-    k = torch.randn([2, 4, 8])
-    v = torch.randn([2, 4, 8])
+    q = torch.randn([256, 512, 128])
+    k = torch.randn([256, 512, 128])
+    v = torch.randn([256, 512, 128])
     bound = attention.bind((q, k, v))
 
     print("=== Device IR ===")

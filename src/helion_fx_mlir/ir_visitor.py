@@ -17,7 +17,7 @@ The visitor dispatches to specific handlers based on the node's target:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.fx as fx
@@ -31,7 +31,6 @@ import helion.language.view_ops as hl_view_ops
 from .mlir_builder import (
     format_attr_dict,
     format_string_attr,
-    format_indices_attr,
     torch_dtype_to_mlir_element_type,
     format_tensor_type,
 )
@@ -41,11 +40,8 @@ from .torch_mlir_helper import (
     import_aten_node_to_mlir,
 )
 
-# Import lowerings to trigger registration of ATen op lowerings
-from . import lowerings  # noqa: F401 - triggers @register_lowering decorators
-
 if TYPE_CHECKING:
-    from helion._compiler.device_ir import GraphInfo, ForLoopGraphInfo, RootGraphInfo
+    from helion._compiler.device_ir import ForLoopGraphInfo, RootGraphInfo
     from .lowering_context import LoweringContext
 
 
@@ -80,10 +76,6 @@ class IRVisitor:
         
         # Depth tracking for nested loops
         self.loop_depth: int = 0
-        
-        # Track output tensor SSA and type
-        self.output_tensor_ssa: str | None = None
-        self.output_tensor_type: str | None = None
         
         # Track the initial accumulator (before loop) for phi
         self.initial_acc_ssa: dict[str, str] = {}  # acc node name -> initial SSA
@@ -191,19 +183,8 @@ class IRVisitor:
         if target is aten.full.default:
             return self.visit_aten_full(node)
         
-        # aten.* compute operations
-        # First check if there's a registered lowering in op_registry
+        # aten.* compute operations - emit via torch-mlir
         if hasattr(target, '__module__') and 'aten' in str(target):
-            from .op_registry import LoweringRegistry
-            if LoweringRegistry.has(target):
-                # Sync node_values to ctx.fx_value_map for registered lowerings
-                self.ctx.fx_value_map.update(self.node_values)
-                # Use registered lowering (e.g., linalg.matmul for addmm)
-                result = LoweringRegistry.emit_node(self.ctx, node)
-                if result is not None:
-                    self.node_values[node.name] = result
-                    return result
-            # Fall back to generic visit_aten_compute
             return self.visit_aten_compute(node)
         
         # Fallback for unknown targets
@@ -415,8 +396,6 @@ class IRVisitor:
 
         """Generate affine.for and visit the inner ForLoopGraphInfo."""
         graph_id = node.args[0]
-        begin = node.args[1]  # [0]
-        end = node.args[2]    # [x_size1]
         args = node.args[3]   # [acc]
         
         # Get the ForLoopGraphInfo
@@ -507,13 +486,13 @@ class IRVisitor:
         node_args = getattr(for_graph, 'node_args', [])
         
         # Map placeholders for read-only args (use original SSA value directly)
-        for i, (_, ssa, orig_name) in enumerate(readonly_args_info):
+        for i, (_, ssa, _) in enumerate(readonly_args_info):
             placeholder_name = f"arg{i}_1"
             self.loop_iter_args[placeholder_name] = ssa  # Use original SSA
         
         # Map placeholders for loop-carried iter_args
         num_readonly = len(readonly_args_info)
-        for i, (iter_name, _, orig_name) in enumerate(iter_args_info):
+        for i, (iter_name, _, _) in enumerate(iter_args_info):
             # Offset by number of read-only args
             placeholder_name = f"arg{num_readonly + i}_1"
             self.loop_iter_args[placeholder_name] = f"%{iter_name}"
