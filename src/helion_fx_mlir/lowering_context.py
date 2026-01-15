@@ -83,6 +83,21 @@ class LoweringContext:
         self.symbols: dict[str, str] = {}
         self.host_tensors: dict[str, str] = {}
         
+        # SSA Value Tracking (populated during graph walking by IRVisitor)
+        self.node_values: dict[str, str] = {}      # FX node name → MLIR SSA value
+        self.node_types: dict[str, str] = {}       # FX node name → MLIR type string
+        self.initial_acc_ssa: dict[str, str] = {}  # Accumulator node → initial SSA (for phi)
+        
+        # Graph Registry (populated before walking starts)
+        self.graphs: dict[int, Any] = {}           # Graph ID → ForLoopGraphInfo
+        
+        # Pre-computed MLIR values (computed before graph walking)
+        self.block_size_ssa: dict[int, str] = {}   # Block ID → block size SSA value
+        self.reduction_trip_counts: dict[int, str] = {}  # Block ID → trip count SSA
+        
+        # Multi-value loop tracking
+        self.loop_result_values: dict[str, Any] = {}  # Loop name → result info
+        
         # Cached computed values (lazily populated)
         self._kernel_args_cache: list[KernelArgInfo] | None = None
     

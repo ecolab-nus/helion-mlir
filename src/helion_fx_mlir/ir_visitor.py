@@ -62,34 +62,15 @@ class IRVisitor:
         self.ctx = ctx
         self.builder = ctx.builder
         
-        # FX node name -> MLIR SSA value
-        self.node_values: dict[str, str] = {}
-        
-        # FX node name -> MLIR type string (e.g., "tensor<?x?xf32>")
-        self.node_types: dict[str, str] = {}
-        
-        # Graph ID -> GraphInfo for nested graphs (ForLoopGraphInfo)
-        self.graphs: dict[int, "GraphInfo"] = {}
-        
-        # Current loop context for iter_args management
-        self.loop_iter_args: dict[str, str] = {}  # placeholder name -> SSA
-        
-        # Current loop result (set by inner graph output)
-        self.current_loop_result: str | None = None
-        
-        # Depth tracking for nested loops
-        self.loop_depth: int = 0
-        
-        # Track the initial accumulator (before loop) for phi
-        self.initial_acc_ssa: dict[str, str] = {}  # acc node name -> initial SSA
-        
-        # Pre-computed block sizes and trip counts (set by generate_mlir)
-        self.block_size_ssa: dict[int, str] = {}  # block_id -> SSA
-        self.reduction_trip_counts: dict[int, str] = {}  # block_id -> trip count SSA
+        # Loop-local state (managed per loop, not persisted globally)
+        # These are reset/managed during visit_for_loop calls
+        self.loop_iter_args: dict[str, str] = {}  # placeholder name → SSA (per loop context)
+        self.current_loop_result: str | list[str] | None = None  # Set by inner graph output
+        self.loop_depth: int = 0  # Depth tracking for nested loops
         
     def register_graph(self, graph_id: int, graph_info: "GraphInfo") -> None:
         """Register a graph for later visitation (e.g., ForLoopGraphInfo)."""
-        self.graphs[graph_id] = graph_info
+        self.ctx.graphs[graph_id] = graph_info
     
     def visit_graph(self, graph_info: "GraphInfo") -> None:
         """Visit all nodes in a graph in order."""
@@ -115,18 +96,18 @@ class IRVisitor:
         # Check if this is a loop iter_arg
         if node.name in self.loop_iter_args:
             ssa = self.loop_iter_args[node.name]
-            self.node_values[node.name] = ssa
+            self.ctx.node_values[node.name] = ssa
             return ssa
         
         # Otherwise it's a function argument placeholder
         # For now, just create a placeholder SSA value
         ssa = f"%{node.name}"
-        self.node_values[node.name] = ssa
+        self.ctx.node_values[node.name] = ssa
         
         # Register type from kernel args if available
         for arg in self.ctx.kernel_args:
             if arg.name == node.name and arg.mlir_type:
-                self.node_types[node.name] = arg.mlir_type
+                self.ctx.node_types[node.name] = arg.mlir_type
                 break
                 
         return ssa
@@ -213,20 +194,20 @@ class IRVisitor:
             if len(args) == 1:
                 arg = args[0]
                 if isinstance(arg, fx.Node):
-                    result = self.node_values.get(arg.name)
+                    result = self.ctx.node_values.get(arg.name)
                     self.current_loop_result = [result]  # Store as list for consistency
                     return result
             # Multiple outputs - store ALL results
             results = []
             for arg in args:
                 if isinstance(arg, fx.Node):
-                    results.append(self.node_values.get(arg.name))
+                    results.append(self.ctx.node_values.get(arg.name))
             self.current_loop_result = results  # Store entire list
             return results[0] if results else None
 
         
         if isinstance(args, fx.Node):
-            self.current_loop_result = self.node_values.get(args.name)
+            self.current_loop_result = self.ctx.node_values.get(args.name)
             return self.current_loop_result
         
         return None
@@ -235,7 +216,7 @@ class IRVisitor:
         """Handle get_attr nodes."""
         # Just create a placeholder SSA
         ssa = self.builder.fresh(node.name)
-        self.node_values[node.name] = ssa
+        self.ctx.node_values[node.name] = ssa
         return ssa
     
     # -------------------------------------------------------------------------
@@ -255,7 +236,7 @@ class IRVisitor:
         
         # Store in symbol table
         self.ctx.symbols[name] = ssa
-        self.node_values[node.name] = ssa
+        self.ctx.node_values[node.name] = ssa
         return ssa
     
     def visit_full(self, node: fx.Node) -> str:
@@ -278,7 +259,7 @@ class IRVisitor:
         shape_ssa = []
         for s in shape_nodes:
             if isinstance(s, fx.Node):
-                shape_ssa.append(self.node_values.get(s.name, f"%{s.name}"))
+                shape_ssa.append(self.ctx.node_values.get(s.name, f"%{s.name}"))
             elif isinstance(s, int):
                 # Integer literals need to be emitted as arith.constant
                 const_ssa = self.builder.fresh("dim")
@@ -322,11 +303,11 @@ class IRVisitor:
             f'outs({empty_ssa} : {tensor_type}) -> {tensor_type}'
         )
         
-        self.node_values[node.name] = filled_ssa
-        self.node_types[node.name] = tensor_type
+        self.ctx.node_values[node.name] = filled_ssa
+        self.ctx.node_types[node.name] = tensor_type
         
         # Track initial accumulator for phi
-        self.initial_acc_ssa[node.name] = filled_ssa
+        self.ctx.initial_acc_ssa[node.name] = filled_ssa
         
         return filled_ssa
     
@@ -352,7 +333,7 @@ class IRVisitor:
         shape_ssa = []
         for s in shape_nodes:
             if isinstance(s, fx.Node):
-                shape_ssa.append(self.node_values.get(s.name, f"%{s.name}"))
+                shape_ssa.append(self.ctx.node_values.get(s.name, f"%{s.name}"))
             elif isinstance(s, int):
                 # Integer literals need to be emitted as arith.constant
                 const_ssa = self.builder.fresh("dim")
@@ -396,11 +377,11 @@ class IRVisitor:
             f'outs({empty_ssa} : {tensor_type}) -> {tensor_type}'
         )
         
-        self.node_values[node.name] = filled_ssa
-        self.node_types[node.name] = tensor_type
+        self.ctx.node_values[node.name] = filled_ssa
+        self.ctx.node_types[node.name] = tensor_type
         
         # Track initial accumulator for phi
-        self.initial_acc_ssa[node.name] = filled_ssa
+        self.ctx.initial_acc_ssa[node.name] = filled_ssa
         
         return filled_ssa
     
@@ -411,7 +392,7 @@ class IRVisitor:
         args = node.args[3]   # [acc]
         
         # Get the ForLoopGraphInfo
-        for_graph = self.graphs.get(graph_id)
+        for_graph = self.ctx.graphs.get(graph_id)
         if for_graph is None:
             raise ValueError(f"ForLoopGraphInfo with graph_id={graph_id} not registered")
         
@@ -420,11 +401,11 @@ class IRVisitor:
         block_id = block_ids[0] if block_ids else 2
         
         # Use pre-computed trip count (computed outside affine.parallel)
-        trip_count_ssa = self.reduction_trip_counts.get(block_id)
+        trip_count_ssa = self.ctx.reduction_trip_counts.get(block_id)
         if trip_count_ssa is None:
             # Fallback: find any reduction trip count
-            if self.reduction_trip_counts:
-                trip_count_ssa = list(self.reduction_trip_counts.values())[0]
+            if self.ctx.reduction_trip_counts:
+                trip_count_ssa = list(self.ctx.reduction_trip_counts.values())[0]
             else:
                 # Last resort: emit trip count here (will cause affine symbol error)
                 trip_count_ssa = "%unknown_trip_count"
@@ -445,7 +426,7 @@ class IRVisitor:
         all_args_info = []
         for i, a in enumerate(args):
             if isinstance(a, fx.Node):
-                ssa = self.node_values.get(a.name, f"%{a.name}")
+                ssa = self.ctx.node_values.get(a.name, f"%{a.name}")
                 all_args_info.append((f"acc_iter{i}", ssa, a.name))
             else:
                 all_args_info.append((f"acc_iter{i}", str(a), None))
@@ -464,8 +445,8 @@ class IRVisitor:
         # Determine tensor type for iter_args from their initial values
         iter_args_types = []
         for name, ssa, fx_name in iter_args_info:
-            if fx_name and fx_name in self.node_types:
-                iter_args_types.append(self.node_types[fx_name])
+            if fx_name and fx_name in self.ctx.node_types:
+                iter_args_types.append(self.ctx.node_types[fx_name])
             else:
                 # Fallback to f32 dynamic tensor if type is unknown
                 # Use ctx.element_type for element type guess if possible
@@ -552,12 +533,12 @@ class IRVisitor:
         
         # Store the loop result - for multi-value loops, this SSA represents all results
         # Individual results are extracted via getitem
-        self.node_values[node.name] = result
+        self.ctx.node_values[node.name] = result
         
         # Also store the result SSAs for each output index
         # This allows visit_getitem to extract individual results
         if isinstance(self.current_loop_result, list) and len(self.current_loop_result) > 1:
-            self._loop_result_values = {
+            self.ctx.loop_result_values = {
                 node.name: result,  # The tuple result SSA
                 '_count': len(self.current_loop_result)  # Number of results
             }
@@ -573,14 +554,14 @@ class IRVisitor:
         # lhs is the initial value (before the loop), rhs is the loop result
         # Use the tracked initial accumulator for lhs
         if isinstance(lhs, fx.Node):
-            lhs_ssa = self.initial_acc_ssa.get(lhs.name)
+            lhs_ssa = self.ctx.initial_acc_ssa.get(lhs.name)
             if lhs_ssa is None:
-                lhs_ssa = self.node_values.get(lhs.name, f"%{lhs.name}")
+                lhs_ssa = self.ctx.node_values.get(lhs.name, f"%{lhs.name}")
         else:
             lhs_ssa = str(lhs)
         
         # rhs is the loop result (getitem on _for_loop)
-        rhs_ssa = self.node_values.get(rhs.name, f"%{rhs.name}") if isinstance(rhs, fx.Node) else str(rhs)
+        rhs_ssa = self.ctx.node_values.get(rhs.name, f"%{rhs.name}") if isinstance(rhs, fx.Node) else str(rhs)
         
         ssa = self.builder.fresh("phi")
         
@@ -594,21 +575,21 @@ class IRVisitor:
             f': ({tensor_type}, {tensor_type}) -> {tensor_type}'
         )
         
-        self.node_values[node.name] = ssa
-        self.node_types[node.name] = tensor_type
+        self.ctx.node_values[node.name] = ssa
+        self.ctx.node_types[node.name] = tensor_type
         return ssa
     
     def visit_new_var(self, node: fx.Node) -> str:
         """Pass through _new_var nodes (just forward the input value)."""
         arg = node.args[0]
         if isinstance(arg, fx.Node):
-            ssa = self.node_values.get(arg.name, f"%{arg.name}")
+            ssa = self.ctx.node_values.get(arg.name, f"%{arg.name}")
         else:
             ssa = str(arg)
         
-        self.node_values[node.name] = ssa
+        self.ctx.node_values[node.name] = ssa
         if isinstance(arg, fx.Node):
-            self.node_types[node.name] = self._get_tensor_type(arg)
+            self.ctx.node_types[node.name] = self._get_tensor_type(arg)
         return ssa
     
     def visit_host_tensor(self, node: fx.Node) -> str:
@@ -629,7 +610,7 @@ class IRVisitor:
                 "All _host_tensor calls should map to function parameters."
             )
         
-        self.node_values[node.name] = ssa
+        self.ctx.node_values[node.name] = ssa
         return ssa
 
     
@@ -652,7 +633,7 @@ class IRVisitor:
         if isinstance(tensor_node, fx.Node):
             tensor_ssa = self.loop_iter_args.get(tensor_node.name)
             if tensor_ssa is None:
-                tensor_ssa = self.node_values.get(tensor_node.name, f"%{tensor_node.name}")
+                tensor_ssa = self.ctx.node_values.get(tensor_node.name, f"%{tensor_node.name}")
         else:
             tensor_ssa = str(tensor_node)
         
@@ -666,7 +647,7 @@ class IRVisitor:
         result_ssa = self.builder.fresh("dim_size")
         self.builder.emit(f'{result_ssa} = tensor.dim {tensor_ssa}, {dim_idx_ssa} : {tensor_type}')
         
-        self.node_values[node.name] = result_ssa
+        self.ctx.node_values[node.name] = result_ssa
         return result_ssa
     
     def visit_load(self, node: fx.Node) -> str:
@@ -684,7 +665,7 @@ class IRVisitor:
         tensor_node = node.args[0]
         indices = node.args[1]  # [sym_size_int, block_size_2] or [block_size_0, block_size_1, slice(...)]
         
-        tensor_ssa = self.node_values.get(tensor_node.name, f"%{tensor_node.name}")
+        tensor_ssa = self.ctx.node_values.get(tensor_node.name, f"%{tensor_node.name}")
         tensor_type = self._get_tensor_type(tensor_node)
         
         # Collect offset and size SSA values for each dimension
@@ -706,7 +687,7 @@ class IRVisitor:
                 sizes_ssa.append(dim_ssa)
             elif isinstance(idx, fx.Node):
                 # Get the SSA value for this index
-                idx_ssa = self.node_values.get(idx.name, f"%{idx.name}")
+                idx_ssa = self.ctx.node_values.get(idx.name, f"%{idx.name}")
                 
                 # Determine if this is a loop IV (sym_size_int) or a block size
                 if 'sym_size' in idx.name:
@@ -787,7 +768,7 @@ class IRVisitor:
             # Fallback
             result_type = self.ctx.tensor_type
             
-        self.node_types[node.name] = result_type
+        self.ctx.node_types[node.name] = result_type
         
         # Format as tensor.extract_slice
         rank = len(indices)
@@ -801,7 +782,7 @@ class IRVisitor:
             f'{tensor_type} to {result_type}'
         )
         
-        self.node_values[node.name] = result
+        self.ctx.node_values[node.name] = result
         return result
     
     def visit_store(self, node: fx.Node) -> str:
@@ -819,10 +800,10 @@ class IRVisitor:
         indices = node.args[1]
         value = node.args[2]
         
-        tensor_ssa = self.node_values.get(tensor_node.name, f"%{tensor_node.name}")
+        tensor_ssa = self.ctx.node_values.get(tensor_node.name, f"%{tensor_node.name}")
         tensor_type = self._get_tensor_type(tensor_node)  # Use dynamic type for destination
         
-        value_ssa = self.node_values.get(value.name, f"%{value.name}") if isinstance(value, fx.Node) else str(value)
+        value_ssa = self.ctx.node_values.get(value.name, f"%{value.name}") if isinstance(value, fx.Node) else str(value)
         value_type = self._get_tensor_type(value) if isinstance(value, fx.Node) else f"tensor<?x?xf32>"
         
         # Collect offset and size SSA values for each dimension
@@ -843,7 +824,7 @@ class IRVisitor:
                 self.builder.emit(f'{dim_ssa} = tensor.dim {value_ssa}, {dim_idx_ssa} : {value_type}')
                 sizes_ssa.append(dim_ssa)
             elif isinstance(idx, fx.Node):
-                idx_ssa = self.node_values.get(idx.name, f"%{idx.name}")
+                idx_ssa = self.ctx.node_values.get(idx.name, f"%{idx.name}")
                 
                 if 'sym_size' in idx.name:
                     # Tile index as offset
@@ -897,7 +878,7 @@ class IRVisitor:
             f'{value_type} into {tensor_type}'
         )
         
-        self.node_values[node.name] = result
+        self.ctx.node_values[node.name] = result
         return result
     
     def visit_getitem(self, node: fx.Node) -> str:
@@ -910,18 +891,18 @@ class IRVisitor:
         index = node.args[1]
         
         # For _for_loop results, getitem extracts the i-th return value
-        source_ssa = self.node_values.get(source.name, f"%{source.name}") if isinstance(source, fx.Node) else str(source)
+        source_ssa = self.ctx.node_values.get(source.name, f"%{source.name}") if isinstance(source, fx.Node) else str(source)
         
         # Check if this is extracting from a multi-value loop result
         if hasattr(self, '_loop_result_values') and isinstance(source, fx.Node):
-            if source.name in self._loop_result_values:
+            if source.name in self.ctx.loop_result_values:
                 # Multi-value loop result - use #index syntax
                 result_ssa = f"{source_ssa}#{index}"
-                self.node_values[node.name] = result_ssa
+                self.ctx.node_values[node.name] = result_ssa
                 return result_ssa
         
         # For single-return loops, just use the result directly
-        self.node_values[node.name] = source_ssa
+        self.ctx.node_values[node.name] = source_ssa
         return source_ssa
 
     
@@ -939,11 +920,11 @@ class IRVisitor:
         
         # Just pass through the input tensor
         if isinstance(tensor_node, fx.Node):
-            ssa = self.node_values.get(tensor_node.name, f"%{tensor_node.name}")
+            ssa = self.ctx.node_values.get(tensor_node.name, f"%{tensor_node.name}")
         else:
             ssa = str(tensor_node)
         
-        self.node_values[node.name] = ssa
+        self.ctx.node_values[node.name] = ssa
         return ssa
     
     def visit_subscript(self, node: fx.Node) -> str:
@@ -957,7 +938,7 @@ class IRVisitor:
         tensor_node = node.args[0]
         indices = node.args[1] if len(node.args) > 1 else []
         
-        current_ssa = self.node_values.get(tensor_node.name, f"%{tensor_node.name}") if isinstance(tensor_node, fx.Node) else str(tensor_node)
+        current_ssa = self.ctx.node_values.get(tensor_node.name, f"%{tensor_node.name}") if isinstance(tensor_node, fx.Node) else str(tensor_node)
         source_type = self._get_tensor_type(tensor_node)
         
         # -----------------------------------------------------------
@@ -1006,7 +987,7 @@ class IRVisitor:
                     # Rank reducing -> we will drop this dimension in the result type
                     
                     if isinstance(idx, fx.Node):
-                        idx_val = self.node_values.get(idx.name, f"%{idx.name}")
+                        idx_val = self.ctx.node_values.get(idx.name, f"%{idx.name}")
                     else:
                         idx_c = self.builder.fresh("idx")
                         self.builder.emit(f'{idx_c} = arith.constant {idx} : index')
@@ -1113,11 +1094,11 @@ class IRVisitor:
                 f'{extracted_type} into {result_type}'
             )
             
-            self.node_values[node.name] = result_expand
+            self.ctx.node_values[node.name] = result_expand
             return result_expand
             
         else:
-            self.node_values[node.name] = extracted_ssa
+            self.ctx.node_values[node.name] = extracted_ssa
             return extracted_ssa
     
     def visit_aten_compute(self, node: fx.Node) -> str:
@@ -1132,7 +1113,7 @@ class IRVisitor:
         operand_ssas = []
         for arg in node.args:
             if isinstance(arg, fx.Node):
-                operand_ssas.append(self.node_values.get(arg.name, f"%{arg.name}"))
+                operand_ssas.append(self.ctx.node_values.get(arg.name, f"%{arg.name}"))
             elif arg is not None:
                 operand_ssas.append(str(arg))
         
@@ -1150,7 +1131,7 @@ class IRVisitor:
         tensor_operands = []
         def collect_operands(arg):
             if isinstance(arg, fx.Node):
-                tensor_operands.append(self.node_values.get(arg.name, f"%{arg.name}"))
+                tensor_operands.append(self.ctx.node_values.get(arg.name, f"%{arg.name}"))
             return arg
             
         fx.map_arg(node.args, collect_operands)
@@ -1160,7 +1141,7 @@ class IRVisitor:
         from .torch_mlir_helper import inline_torch_mlir_output
         result = inline_torch_mlir_output(mlir_text, tensor_operands, self.builder)
         
-        self.node_values[node.name] = result
+        self.ctx.node_values[node.name] = result
         return result
     
     def visit_unknown(self, node: fx.Node) -> str | None:
@@ -1178,7 +1159,7 @@ class IRVisitor:
             f'{ssa} = "helion.unknown"(){attrs} : () -> index'
         )
         
-        self.node_values[node.name] = ssa
+        self.ctx.node_values[node.name] = ssa
         return ssa
     
     def _get_tensor_type(self, tensor_node: fx.Node | str) -> str:
@@ -1189,8 +1170,8 @@ class IRVisitor:
             name = str(tensor_node)
         
         # Look up in registered node types
-        if name in self.node_types:
-            return self.node_types[name]
+        if name in self.ctx.node_types:
+            return self.ctx.node_types[name]
             
         # Look up in kernel args
         for arg in self.ctx.kernel_args:

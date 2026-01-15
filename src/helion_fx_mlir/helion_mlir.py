@@ -168,10 +168,10 @@ def generate_mlir(
     # Emit function start with void return
     builder.emit_func_start(kernel_name, func_args, result_type)
     
-    # Create visitor and register all graphs
+    # Create visitor and register all graphs in context
     visitor = IRVisitor(ctx)
     for graph_id, graph_info in for_loop_graphs.items():
-        visitor.register_graph(graph_id, graph_info)
+        ctx.graphs[graph_id] = graph_info
     
     # Get grid block IDs for parallel loops
     grid_block_ids = device_ir.grid_block_ids
@@ -205,9 +205,9 @@ def generate_mlir(
             # Store in visitor for use in visit_for_loop
             reduction_trip_counts[loop.block_id] = trip_count_ssa
     
-    # Make block sizes and trip counts available to visitor
-    visitor.block_size_ssa = block_size_ssa
-    visitor.reduction_trip_counts = reduction_trip_counts
+    # Make block sizes and trip counts available to context
+    ctx.block_size_ssa = block_size_ssa
+    ctx.reduction_trip_counts = reduction_trip_counts
     
     # Emit affine.parallel for grid blocks
     if len(ctx.grid_loops) > 0:
