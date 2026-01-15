@@ -155,6 +155,7 @@ def main() -> None:
         bound_kernel,
         kernel_name="matmul",
     )
+    print("=== MLIR Dump ===")
     print(mlir_text)
 
     # Validate with helion-opt
