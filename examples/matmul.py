@@ -33,7 +33,7 @@ _SRC_ROOT = _REPO_ROOT / "src"
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 
-from helion_fx_mlir import generate_mlir, validate_with_mlir_opt
+from helion_mlir import generate_mlir, validate_with_mlir_opt
 
 
 # %%

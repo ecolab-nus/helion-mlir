@@ -1,32 +1,7 @@
-# requirements.txt — PyTorch + Helion
-# Python >= 3.10 recommended
-#
-# INSTALL OPTIONS (pick one when running pip):
-# 1) CPU-only (default PyPI wheels)
-#    pip install -r requirements.txt
-#
-# 2) NVIDIA GPUs (CUDA 12.4 wheels)
-#    pip install --index-url https://download.pytorch.org/whl/cu124 -r requirements.txt
-#
-# 3) NVIDIA GPUs (CUDA 12.1 wheels)
-#    pip install --index-url https://download.pytorch.org/whl/cu121 -r requirements.txt
-#
-# 4) AMD GPUs (ROCm 6.1, Linux)
-#    pip install --index-url https://download.pytorch.org/whl/rocm6.1 -r requirements.txt
-#
-# Notes:
-# - Helion targets Linux. The environment markers below avoid installing it (and Triton) on non-Linux systems.
-# - If you specifically need/avoid Helion or Triton, you can edit the lines with the markers or install them separately.
-
-triton>=3.5 ; sys_platform == "linux"
-helion ; sys_platform == "linux"
-pydantic
-packaging
-pytest
+triton
+helion
 tabulate
---extra-index-url https://download.pytorch.org/whl/nightly/cpu
+pytest
 -f https://github.com/llvm/torch-mlir-release/releases/expanded_assets/dev-wheels
 torch-mlir
 torch
-torchaudio
-torchvision

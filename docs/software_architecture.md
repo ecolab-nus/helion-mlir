@@ -1,10 +1,10 @@
 # Helion FX-to-MLIR Software Architecture
 
-This document describes the software architecture of the `helion_fx_mlir` package, which converts Helion Device IR (FX graphs) to MLIR text representation.
+This document describes the software architecture of the `helion_mlir` package, which converts Helion Device IR (FX graphs) to MLIR text representation.
 
 ## Overview
 
-The `helion_fx_mlir` package uses a **visitor pattern** to walk Device IR FX graphs node-by-node. It generates:
+The `helion_mlir` package uses a **visitor pattern** to walk Device IR FX graphs node-by-node. It generates:
 1. **Standard MLIR dialects** (`tensor`, `affine`, `linalg`, `arith`) for Helion-specific operations
 2. **Torch dialect** (`torch.aten.*`) via **torch-mlir** for ATen operations
 
@@ -54,9 +54,9 @@ The `helion_fx_mlir` package uses a **visitor pattern** to walk Device IR FX gra
 ## Package Structure
 
 ```
-src/helion_fx_mlir/
+src/helion_mlir/
 ├── __init__.py              # Public API exports
-├── helion_mlir.py           # Main entry: generate_mlir(), validate_with_helion_opt()
+├── helion_mlir.py           # Main entry: generate_mlir(), validate_with_mlir_opt()
 ├── ir_visitor.py            # IRVisitor: walks FX graphs, dispatches to visit_* methods
 ├── lowering_context.py      # LoweringContext: state (loops, args, SSA mappings)
 ├── mlir_builder.py          # MLIRBuilder: text emission, SSA naming, indentation
@@ -73,7 +73,7 @@ src/helion_fx_mlir/
 
 **Key Functions**:
 - `generate_mlir(bound_kernel, kernel_name)` → MLIR text
-- `validate_with_helion_opt(mlir_text)` → validates via `helion-opt` or `mlir-opt`
+- `validate_with_mlir_opt(mlir_text)` → validates via `mlir-opt -allow-unregistered-dialect`
 - `_collect_host_tensor_names()` → pre-scans graphs for tensor function parameters
 
 ### 2. `ir_visitor.py` — Graph Walker
@@ -83,12 +83,12 @@ src/helion_fx_mlir/
 **Key Methods**:
 | Method | Device IR Target | Generated MLIR |
 |--------|------------------|----------------|
-| `visit_load` | `helion.language.memory_ops.load` | `tensor.extract_slice` |
-| `visit_store` | `helion.language.memory_ops.store` | `tensor.insert_slice` |
+| `visit_load` | `helion.language.memory_ops.load` | `tensor.extract_slice` (sizes from FakeTensor metadata via Origin) |
+| `visit_store` | `helion.language.memory_ops.store` | `tensor.insert_slice` (sizes from FakeTensor metadata via Origin) |
 | `visit_for_loop` | `_for_loop` | `affine.for` with iter_args |
-| `visit_phi` | `_phi` | `helion.phi` |
+| `visit_phi` | `_phi` | Loop result SSA (simplified merge pattern detection) |
 | `visit_full` | `helion.language.creation_ops.full` | `tensor.empty` + `linalg.fill` |
-| `visit_get_symnode` | `_get_symnode` | `loom.get_symbol` |
+| `visit_get_symnode` | `_get_symnode` | SSA lookup via Origin (BlockSizeOrigin → `block_size_ssa`, etc.) |
 | `visit_host_tensor` | `_host_tensor` | lookup in `host_tensors` map |
 | `visit_subscript` | subscript ops | `tensor.extract_slice` / `tensor.expand_shape` |
 | `visit_aten_full` | `aten.full.default` | `tensor.empty` + `linalg.fill` |
@@ -102,31 +102,36 @@ src/helion_fx_mlir/
 
 **Key Data**:
 ```python
-@dataclass
 class LoweringContext:
     builder: MLIRBuilder          # MLIR text emission
     kernel_name: str              # Function name
     bound_kernel: Any             # Source BoundKernel
-    device_ir: Any                # DeviceIR
-    loop_extents: dict[str, int]  # Name → total extent
-
+    
+    # Type mappings
+    arg_mlir_types: dict[str, str]  # Kernel arg name → MLIR type string (tensors only)
+    
     # Loop information
-    grid_loops: list[LoopInfo]      # Parallel loops (tile_m, tile_n)
-    inner_loops: list[LoopInfo]  # Reduction loops (tile_k)
-    block_sizes: dict[int, Any]      # BlockSizeInfo by block_id
-    parallel_block_ids: list[int]    # Grid block IDs
-
-    # Kernel arguments
-    kernel_args: list[KernelArgInfo]  # Argument metadata
+    loop_extents: dict[int, int]    # block_id → total extent
 
     # SSA mappings
     symbols: dict[str, str]       # Symbol name → SSA
     host_tensors: dict[str, str]  # Tensor name → SSA (function args)
+    
+    # Pre-computed MLIR values
+    block_size_ssa: dict[int, str]   # Block ID → block size SSA value
+    reduction_trip_counts: dict[int, str]  # Block ID → trip count SSA
+    
+    # SSA Value Tracking (populated during graph walking)
+    node_values: dict[str, str]      # FX node name → MLIR SSA value
+    node_types: dict[str, str]       # FX node name → MLIR type string
+    initial_acc_ssa: dict[str, str]  # Accumulator node → initial SSA (for phi)
 ```
 
-**Supporting Dataclasses**:
-- `LoopInfo`: block_id, name, tile_size, trip_count, iv_name
-- `KernelArgInfo`: name, index, is_tensor, dtype, shape, mlir_type, ssa_name
+**Property Methods**:
+- `device_ir`: Get DeviceIR from bound_kernel
+- `block_sizes`: Get block sizes as dict from bound_kernel.env
+- `parallel_block_ids`: Get grid block IDs for parallel loops
+- `env`: Get CompileEnvironment from bound_kernel
 
 ### 4. `mlir_builder.py` — Text Emission
 
@@ -173,8 +178,8 @@ Helion compiles kernels into an FX-based Device IR containing multiple graphs:
 | `helion.language.memory_ops.load` | Tile load | `tensor.extract_slice` |
 | `helion.language.memory_ops.store` | Tile store | `tensor.insert_slice` |
 | `helion.language._tracing_ops._host_tensor` | Kernel arg tensor | SSA from `host_tensors` |
-| `helion.language._tracing_ops._phi` | Loop-carried value | `helion.phi` |
-| `helion.language._tracing_ops._get_symnode` | Symbolic size | `loom.get_symbol` |
+| `helion.language._tracing_ops._phi` | Loop-carried value | Loop result SSA (simplified merge) |
+| `helion.language._tracing_ops._get_symnode` | Symbolic size | SSA lookup via Origin type |
 | `helion.language._tracing_ops._for_loop` | Reduction loop | `affine.for` |
 | `helion.language.creation_ops.full` | Tensor init | `tensor.empty` + `linalg.fill` |
 | `aten.*` | PyTorch ops | `torch.aten.*` (via torch-mlir) |
@@ -190,7 +195,7 @@ Helion compiles kernels into an FX-based Device IR containing multiple graphs:
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│ 2. CREATE CONTEXT: LoweringContext.from_bound_kernel()              │
+│ 2. CREATE CONTEXT: LoweringContext(bound_kernel)                    │
 │    - Extract kernel args, loop info, block sizes                    │
 └─────────────────────────────────────────────────────────────────────┘
                                     │
@@ -203,7 +208,13 @@ Helion compiles kernels into an FX-based Device IR containing multiple graphs:
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│ 4. WALK GRAPHS: IRVisitor.visit_graph()                             │
+│ 4. PRE-EMIT BLOCK SIZES: loom.get_symbol for each block_id         │
+│    - Store SSA values in ctx.block_size_ssa                         │
+└─────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│ 5. WALK GRAPHS: IRVisitor.visit_graph()                             │
 │    For each FX node:                                                │
 │    ├─ Helion ops → visit_* methods (emit standard MLIR)            │
 │    └─ ATen ops → torch_mlir_helper (emit torch dialect)            │
@@ -211,8 +222,8 @@ Helion compiles kernels into an FX-based Device IR containing multiple graphs:
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│ 5. OUTPUT: MLIR Text                                                │
-│    - Dialects: affine, tensor, linalg, arith, torch, helion, loom   │
+│ 6. OUTPUT: MLIR Text                                                │
+│    - Dialects: affine, tensor, linalg, arith, torch, loom           │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -222,48 +233,30 @@ This section details the information held by `LoweringContext` and how `IRVisito
 
 ### LoweringContext Fields
 
-`LoweringContext` is a dataclass that holds all state during FX-to-MLIR conversion. It is created once via `LoweringContext.from_bound_kernel()` before graph walking begins.
+`LoweringContext` is a class that holds all state during FX-to-MLIR conversion. It is created once via `LoweringContext(bound_kernel)` before graph walking begins.
 
 #### Core Infrastructure
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `builder` | `MLIRBuilder` | Shared builder for MLIR text emission. IRVisitor accesses this to emit operations via `self.builder.emit()`, `self.builder.fresh()`, etc. |
+| `builder` | `MLIRBuilder` | Shared builder for MLIR text emission. IRVisitor accesses this to emit operations via `self.ctx.builder.emit()`, `self.ctx.builder.fresh()`, etc. |
 | `bound_kernel` | `BoundKernel` | The source Helion kernel containing `fake_args`, `env`, and `host_function`. |
-| `device_ir` | `DeviceIR` | The Device IR containing the FX graphs to be lowered. |
 
 #### Type Information
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `element_type` | `str` | MLIR element type (e.g., `"f32"`, `"f16"`). Derived from the first tensor argument's dtype. |
-| `tensor_type` | `str` | Default dynamic tensor type (e.g., `"tensor<?x?xf32>"`). Used for intermediate tile tensors. |
-
-**Usage in IRVisitor**: `tensor_type` is used extensively in:
-- `visit_for_loop`: to build `iter_args` and result types
-- `visit_phi`: to build the phi operation type signature
-- `visit_load`/`visit_store`: as the result/value type
-- `visit_subscript`: as the output tensor type
-- `visit_aten_compute`: to determine output types
+| `arg_mlir_types` | `dict[str, str]` | Maps kernel argument name to MLIR type string (e.g., `{"x": "tensor<128x256xf32>"}`). Only tensor args are included. |
 
 #### Loop Information
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `grid_loops` | `list[LoopInfo]` | Parallel (outer) loops. Each has `block_id`, `name`, `tile_size`, `trip_count`, `total_extent`, `is_symbolic`, `iv_name`. |
-| `inner_loops` | `list[LoopInfo]` | Reduction (inner) loops. Same structure as `grid_loops`. |
-| `loop_extents` | `dict[str, int]` | Maps loop name to total iteration extent (e.g., `{"tile_m": 128, "tile_n": 256}`). |
-| `block_sizes` | `dict[int, BlockSizeInfo]` | Maps block_id to Helion's BlockSizeInfo containing tile size and debug names. |
-| `parallel_block_ids` | `list[int]` | Block IDs for parallel (outer) loops, derived from `device_ir.grid_block_ids`. |
+| `loop_extents` | `dict[int, int]` | Maps block_id to total iteration extent (e.g., `{0: 128, 1: 256, 2: 128}`). |
 
-**Usage in IRVisitor**:
-- `visit_sym_size`: Uses `grid_loops` and `inner_loops` to map dimension indices to loop induction variables:
-  ```python
-  if dim < len(self.ctx.grid_loops):
-      block_id = self.ctx.grid_loops[dim].block_id
-      iv_name = f"%iv_block{block_id}"
-  ```
-- This allows `sym_size_int(tensor, 0)` to resolve to `%iv_block0` (first outer loop IV).
+**Property Methods**:
+- `parallel_block_ids`: Returns list of block IDs for parallel (outer) loops from `device_ir.grid_block_ids`.
+- `block_sizes`: Returns dict mapping block_id → BlockSizeInfo from `env.block_sizes`.
 
 #### SSA Value Mappings
 
@@ -271,47 +264,28 @@ This section details the information held by `LoweringContext` and how `IRVisito
 |-------|------|-------------|
 | `symbols` | `dict[str, str]` | Maps symbol names to SSA values (e.g., `{"block_size_0": "%block_size_00"}`). |
 | `host_tensors` | `dict[str, str]` | Maps tensor names to function argument SSA values (e.g., `{"x": "%x", "out": "%out"}`). |
+| `block_size_ssa` | `dict[int, str]` | Pre-computed block size SSA values by block_id. |
+| `reduction_trip_counts` | `dict[int, str]` | Pre-computed trip count SSA values for reduction loops. |
 
 **Usage in IRVisitor**:
-- `visit_get_symnode`: Stores the emitted symbol SSA in `ctx.symbols`:
-  ```python
-  self.ctx.symbols[name] = ssa  # e.g., symbols["block_size_0"] = "%block_size_00"
-  ```
+- `visit_get_symnode`: Uses Origin-based lookup:
+  - `BlockSizeOrigin` → Use pre-emitted `ctx.block_size_ssa[block_id]`
+  - Other origins → Use `shape_env.var_to_val` for concrete value → `arith.constant`
 - `visit_host_tensor`: Looks up tensor names in `ctx.host_tensors`:
   ```python
   ssa = self.ctx.host_tensors.get(tensor_name)  # e.g., "x" → "%x"
-  if ssa is None:
-      raise ValueError(f"Host tensor '{tensor_name}' not found...")
-  ```
-
-#### Kernel Arguments
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `kernel_args` | `list[KernelArgInfo]` | Metadata for each kernel parameter: name, index, is_tensor, dtype, shape, mlir_type, ssa_name. |
-
-**Usage in IRVisitor**:
-- `_get_tensor_type`: Searches `kernel_args` to find the MLIR type for a specific tensor:
-  ```python
-  for arg in self.ctx.kernel_args:
-      if arg.name == tensor_name:
-          return arg.mlir_type  # e.g., "tensor<128x256xf32>"
   ```
 
 ### IRVisitor's Own State
 
-In addition to using `LoweringContext`, `IRVisitor` maintains its own transient state during graph walking:
+In addition to using `LoweringContext`, `IRVisitor` accesses state stored in `ctx` during graph walking:
 
 | Field | Type | Purpose |
 |-------|------|---------|
-| `node_values` | `dict[str, str]` | Maps FX node names to MLIR SSA values. Grows as nodes are visited. |
-| `graphs` | `dict[int, GraphInfo]` | Registered ForLoopGraphInfo objects by graph_id. Set before walking. |
-| `loop_iter_args` | `dict[str, str]` | Maps placeholder names to iter_arg SSA values during loop body visitation. |
-| `current_loop_result` | `str \| list[str]` | The SSA value(s) from the inner graph's output node. Used for `affine.yield`. |
-| `loop_depth` | `int` | Current nesting depth for loops. |
-| `initial_acc_ssa` | `dict[str, str]` | Maps accumulator node names to their initial SSA values (before loop entry). Used by `visit_phi`. |
-| `block_size_ssa` | `dict[int, str]` | Pre-computed block size SSA values by block_id. |
-| `reduction_trip_counts` | `dict[int, str]` | Pre-computed trip count SSA values for reduction loops. |
+| `ctx.node_values` | `dict[str, str]` | Maps FX node names to MLIR SSA values. Grows as nodes are visited. |
+| `ctx.node_types` | `dict[str, str]` | Maps FX node names to MLIR type strings. |
+| `ctx.graphs` | `dict[int, GraphInfo]` | Registered ForLoopGraphInfo objects by graph_id. Set before walking. |
+| `ctx.initial_acc_ssa` | `dict[str, str]` | Maps accumulator node names to their initial SSA values (before loop entry). |
 
 ### Data Flow Diagram
 
@@ -320,25 +294,25 @@ In addition to using `LoweringContext`, `IRVisitor` maintains its own transient 
 │                           LoweringContext (Shared State)                      │
 │                                                                               │
 │  ┌─────────────┐    ┌────────────────┐    ┌─────────────────────────────┐   │
-│  │   builder   │    │  tensor_type   │    │         host_tensors        │   │
-│  │ (MLIRBuilder│    │ "tensor<?x?    │    │ {"x": "%x", "out": "%out"}  │   │
-│  │  emit/fresh)│    │   xf32>"       │    │                             │   │
-│  └──────┬──────┘    └───────┬────────┘    └────────────┬────────────────┘   │
-│         │                   │                          │                     │
+│  │   builder   │    │ arg_mlir_types │    │         host_tensors        │   │
+│  │ (MLIRBuilder│    │ {"x": "tensor  │    │ {"x": "%x", "out": "%out"}  │   │
+│  │  emit/fresh)│    │   <128x256xf32>│    │                             │   │
+│  └──────┬──────┘    │   "}           │    └────────────┬────────────────┘   │
+│         │           └───────┬────────┘                 │                     │
 │  ┌──────┴──────┐    ┌───────┴────────┐    ┌────────────┴────────────────┐   │
-│  │  grid_loops │    │   symbols      │    │       kernel_args           │   │
-│  │ [LoopInfo]  │    │ {"block_size_0"│    │ [KernelArgInfo for each arg]│   │
-│  │             │    │  : "%bs0"}     │    │                             │   │
+│  │loop_extents │    │ block_size_ssa │    │  reduction_trip_counts      │   │
+│  │ {0:128,..}  │    │ {0: "%bs0"}    │    │ {2: "%trip_count0"}         │   │
+│  │             │    │                │    │                             │   │
 │  └──────┬──────┘    └───────┬────────┘    └────────────┬────────────────┘   │
 └─────────┼───────────────────┼──────────────────────────┼────────────────────┘
           │                   │                          │
           ▼                   ▼                          ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                          IRVisitor (Transient State)                         │
+│                          IRVisitor (using ctx state)                          │
 │                                                                               │
 │  ┌─────────────────┐    ┌────────────────┐    ┌──────────────────────────┐  │
-│  │   node_values   │    │ loop_iter_args │    │  reduction_trip_counts   │  │
-│  │ {"load": "%s1"} │    │ {"arg0_1": ... │    │ {2: "%trip_count0"}      │  │
+│  │ ctx.node_values │    │ ctx.node_types │    │   ctx.initial_acc_ssa    │  │
+│  │ {"load": "%s1"} │    │ {"load": ...}  │    │ {acc_name: "%init_ssa"}  │  │
 │  └────────┬────────┘    └───────┬────────┘    └────────────┬─────────────┘  │
 │           │                     │                          │                 │
 │           └─────────────────────┴──────────────────────────┘                 │
@@ -357,17 +331,40 @@ In addition to using `LoweringContext`, `IRVisitor` maintains its own transient 
 2. IRVisitor calls `visit_host_tensor(node)`
 3. Retrieves `tensor_name = "x"` from `node.args[0]`
 4. Looks up in `self.ctx.host_tensors.get("x")` → returns `"%x"`
-5. Stores `self.node_values["x"] = "%x"`
+5. Stores `self.ctx.node_values["x"] = "%x"`
 6. Returns `"%x"` for downstream nodes to reference
 
 ### Example: Visiting `aten.sym_size.int(tensor, 0)`
 
 1. FX node: `call_function(aten.sym_size.int, (tensor_node, 0))`
 2. IRVisitor calls `visit_sym_size(node)` with `dim = 0`
-3. Resolves tensor SSA from `loop_iter_args` or `node_values`
+3. Resolves tensor SSA from `ctx.node_values`
 4. Emits `tensor.dim %tensor_ssa, %dim_idx : tensor_type` to get the dimension size
 5. Returns the dimension size SSA value
-6. Stores in `self.node_values` for downstream reference
+6. Stores in `self.ctx.node_values` for downstream reference
+
+### Example: Visiting `load` with Origin-Based Tile Size Resolution
+
+1. FX node: `call_function(load, (tensor_node, indices))`
+2. IRVisitor calls `visit_load(node)`
+3. Gets tile sizes from `node.meta['val'].size()` (FakeTensor metadata)
+4. For each dimension's SymInt:
+   - Uses `Origin.get()` to determine origin type
+   - `BlockSizeOrigin` → lookup `ctx.block_size_ssa[block_id]`
+   - Other origin → emit `arith.constant` or lookup existing SSA
+5. Emits `tensor.extract_slice` with computed offsets, sizes, strides
+6. Stores result SSA in `ctx.node_values`
+
+### Example: Visiting `_phi` with Simplified Merge Pattern
+
+1. FX node: `call_function(_phi, (initial_val, getitem_node))`
+2. IRVisitor calls `visit_phi(node)`
+3. Detects loop merge pattern:
+   - `rhs_node.target == operator.getitem`
+   - `rhs_node.args[0]` is a `_for_loop` node
+4. Uses the loop result SSA directly: `%result#i` from the corresponding `affine.for`
+5. No separate `helion.phi` operation emitted
+6. Stores in `ctx.node_values`
 
 ---
 
@@ -384,6 +381,6 @@ In addition to using `LoweringContext`, `IRVisitor` maintains its own transient 
 | `load` | `tensor.extract_slice` |
 | `store` | `tensor.insert_slice` |
 | `_for_loop` | `affine.for` with iter_args |
-| `_phi` | `helion.phi` |
+| `_phi` | Loop result SSA (simplified) |
 | `full` | `tensor.empty` + `linalg.fill` |
 | `subscript` | `tensor.extract_slice` / `tensor.expand_shape` |

@@ -11,7 +11,7 @@ _SYS_SRC = Path(__file__).resolve().parents[1] / "src"
 if str(_SYS_SRC) not in sys.path:
     sys.path.insert(0, str(_SYS_SRC))
 
-from helion_fx_mlir import generate_mlir, validate_with_helion_opt
+from helion_mlir import generate_mlir, validate_with_mlir_opt
 
 
 @helion.kernel(
@@ -85,13 +85,12 @@ def main() -> None:
     print("=== MLIR Dump ===")
     print(mlir_text)
     
-    # Skip helion-opt validation - torch dialect not registered in helion-opt
-    # res = validate_with_helion_opt(mlir_text, extra_args=["-allow-unregistered-dialect"])
-    # if res.returncode != 0:
-    #     print(res.stderr, file=sys.stderr)
-    #     raise SystemExit("helion-opt validation failed (see stderr above).")
-    # print("helion-opt validation succeeded.\n")
-    print("MLIR generation complete.\n")
+    # Validate with mlir-opt (use -allow-unregistered-dialect for loom.* and torch.* ops)
+    res = validate_with_mlir_opt(mlir_text)
+    if res.returncode != 0:
+        print(res.stderr, file=sys.stderr)
+        raise SystemExit("mlir-opt validation failed (see stderr above).")
+    print("mlir-opt validation succeeded.\n")
 
 
 
