@@ -114,6 +114,99 @@ class LoweringContext:
         
         # Multi-value loop tracking
         self.loop_result_values: dict[str, Any] = {}  # Loop name → result info
+        
+        # Pre-computed host tensor types (computed by scanning all graphs)
+        # Maps tensor name -> MLIR type string (e.g., "tensor<128x128xf32>")
+        self.host_tensor_types: dict[str, str] = {}
+        self._precompute_host_tensor_types()
+    
+    def _precompute_host_tensor_types(self) -> None:
+        """Pre-compute MLIR types for all _host_tensor nodes by scanning all graphs.
+        
+        Uses origin-based logic to determine dynamic vs concrete dimensions:
+        - BlockSizeOrigin -> dynamic '?'
+        - Other with concrete value in shape_env -> concrete int
+        - Unknown -> dynamic '?'
+        """
+        import helion.language._tracing_ops as hl_tracing_ops
+        
+        device_ir = self.bound_kernel.host_function.device_ir
+        
+        # Find rolled reduction graph IDs to skip
+        rolled_ids = {
+            info.new_graph_id 
+            for info in device_ir.rolled_reductions 
+            if info.new_graph_id is not None
+        }
+        
+        seen: set[str] = set()
+        
+        for graph_info in device_ir.graphs:
+            if graph_info.graph_id in rolled_ids:
+                continue
+            for node in graph_info.graph.nodes:
+                if node.op == "call_function" and node.target is hl_tracing_ops._host_tensor:
+                    name = node.args[0]
+                    if name not in seen:
+                        seen.add(name)
+                        
+                        # Get FakeTensor from node metadata
+                        fake_tensor = node.meta.get("val")
+                        mlir_type = self.compute_mlir_type_from_fake_tensor(fake_tensor)
+                        self.host_tensor_types[name] = mlir_type
+    
+    def compute_mlir_type_from_fake_tensor(self, fake_tensor, dtype: str = "f32") -> str:
+        """Compute MLIR tensor type from a FakeTensor using origin-based logic.
+        
+        For each dimension:
+        - BlockSizeOrigin -> dynamic '?'
+        - Other with concrete value in shape_env -> concrete int
+        - Unknown -> dynamic '?'
+        
+        Args:
+            fake_tensor: A FakeTensor from node.meta['val']
+            dtype: Element type string (default "f32")
+            
+        Returns:
+            MLIR tensor type string like "tensor<128x256xf32>" or "tensor<?x?xf32>"
+        """
+        from helion._compiler.variable_origin import BlockSizeOrigin
+        
+        if fake_tensor is None or not hasattr(fake_tensor, "shape"):
+            # Fallback: use 2D dynamic shape
+            return f"tensor<?x?x{dtype}>"
+        
+        host_function = self.bound_kernel.host_function
+        shape_env = self.bound_kernel.env.shape_env
+        
+        # Determine shape: ? for BlockSizeOrigin, concrete otherwise
+        shape = []
+        ndim = len(fake_tensor.shape)
+        for dim_idx in range(ndim):
+            dim_size = fake_tensor.shape[dim_idx]
+            if hasattr(dim_size, '_sympy_'):
+                # This is a SymInt - check its origin
+                sym = dim_size._sympy_()
+                origin_info = host_function.expr_to_origin.get(sym)
+                origin = origin_info.origin if origin_info else None
+                
+                if isinstance(origin, BlockSizeOrigin):
+                    # Dynamic dimension
+                    shape.append(None)
+                elif sym in shape_env.var_to_val:
+                    # Concrete value from shape_env
+                    shape.append(int(shape_env.var_to_val[sym]))
+                else:
+                    # Unknown - use dynamic
+                    shape.append(None)
+            elif isinstance(dim_size, int):
+                # Already concrete
+                shape.append(int(dim_size))
+            else:
+                # Unknown type - use dynamic
+                shape.append(None)
+        
+        return format_tensor_type(shape, dtype)
     
     # -------------------------------------------------------------------------
     # Property methods - derive values from bound_kernel

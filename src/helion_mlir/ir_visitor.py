@@ -821,29 +821,41 @@ class IRVisitor:
         
         result = self.builder.fresh("slice")
         
-        # Infer result type - same rank as source tensor, same element type
-        # format: tensor<?x?xf32>
+        # Infer result type based on input tensor type and indexing
+        # For slice(None, None, None), preserve the input's dimension size
+        # For other indices (block_size, sym_size), use dynamic '?'
         if 'tensor<' in tensor_type and '>' in tensor_type:
             # Extract content between <>
             content = tensor_type[tensor_type.find('<')+1 : tensor_type.rfind('>')]
             if 'x' in content:
                 parts = content.split('x')
                 dtype_str = parts[-1]
-                rank = len(parts) - 1
+                input_dims = parts[:-1]  # List of dim sizes from input type
             else:
-                # 0-D or 1-D with no dims?
-                rank = 0
+                # 0-D tensor
                 dtype_str = content
+                input_dims = []
             
-            # Construct dynamic type with same rank
-            if rank > 0:
-                dim_wildcards = "x".join(["?"] * rank)
-                result_type = f"tensor<{dim_wildcards}x{dtype_str}>"
+            # Determine output dimensions based on indices
+            output_dims = []
+            for i, idx in enumerate(indices):
+                if isinstance(idx, slice) and idx == slice(None, None, None):
+                    # Full slice - preserve input dimension if known
+                    if i < len(input_dims):
+                        output_dims.append(input_dims[i])
+                    else:
+                        output_dims.append("?")
+                else:
+                    # Block size or sym_size index - dimension becomes dynamic
+                    output_dims.append("?")
+            
+            # Construct result type
+            if output_dims:
+                result_type = f"tensor<{'x'.join(output_dims)}x{dtype_str}>"
             else:
                 result_type = f"tensor<{dtype_str}>"
         else:
-            # Fallback
-            result_type = f"tensor<?x?xf32>"
+            raise ValueError(f"Invalid tensor type: {tensor_type}")
             
         self.ctx.node_types[node.name] = result_type
         
@@ -1283,27 +1295,38 @@ class IRVisitor:
         return ssa
     
     def _get_tensor_type(self, tensor_node: fx.Node | str) -> str:
-        """Get MLIR tensor type for a tensor node."""
+        """Get MLIR tensor type for a tensor node.
+        
+        Lookup order:
+        1. ctx.node_types (already computed for this node)
+        2. ctx.host_tensor_types (pre-computed for _host_tensor nodes)
+        3. ctx.arg_mlir_types (kernel arguments)
+        4. Compute from FakeTensor if available
+        5. Fallback to dynamic type
+        """
         if isinstance(tensor_node, fx.Node):
             name = tensor_node.name
+            node = tensor_node
         else:
             name = str(tensor_node)
+            node = None
         
         # Look up in registered node types
         if name in self.ctx.node_types:
             return self.ctx.node_types[name]
+        
+        # Look up in host tensor types (pre-computed in LoweringContext)
+        if name in self.ctx.host_tensor_types:
+            return self.ctx.host_tensor_types[name]
             
         # Look up in arg_mlir_types
         if name in self.ctx.arg_mlir_types:
             return self.ctx.arg_mlir_types[name]
         
-        # Look up in loop iter args (if it's a placeholder in a loop)
-        if name in self.loop_iter_args:
-            # We might not have the type easily available for loop args unless we track them
-            # For now, try to find the corresponding acc_iter info if possible,
-            # or rely on the caller to handle this case.
-            pass
-
-        # Fallback to f32 if we can't determine type (temporary for migration)
-        # But generally we should raise an error if type is unknown
+        # Try to compute from FakeTensor in node metadata
+        if node is not None and 'val' in node.meta:
+            fake_tensor = node.meta['val']
+            return self.ctx.compute_mlir_type_from_fake_tensor(fake_tensor)
+        
+        # Fallback to dynamic type (should rarely reach here)
         return f"tensor<?x?xf32>"

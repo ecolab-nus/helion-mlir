@@ -48,36 +48,6 @@ MLIR_OPT_CANDIDATES = [
 ]
 
 
-def _collect_host_tensor_names(device_ir, rolled_ids: set[int]) -> list[str]:
-    """Collect all unique host tensor names from _host_tensor calls across all graphs.
-    
-    This pre-scans all FX graphs to identify every tensor that will be referenced
-    via _host_tensor calls, so they can all be registered as function parameters.
-    
-    Args:
-        device_ir: The DeviceIR containing all graphs
-        rolled_ids: Set of graph IDs to skip (rolled reductions)
-    
-    Returns:
-        List of unique host tensor names in order of first occurrence
-    """
-    import helion.language._tracing_ops as hl_tracing_ops
-    
-    host_tensor_names: list[str] = []
-    seen: set[str] = set()
-    
-    for graph_info in device_ir.graphs:
-        if graph_info.graph_id in rolled_ids:
-            continue
-        for node in graph_info.graph.nodes:
-            if node.op == "call_function" and node.target is hl_tracing_ops._host_tensor:
-                name = node.args[0]
-                if name not in seen:
-                    host_tensor_names.append(name)
-                    seen.add(name)
-    
-    return host_tensor_names
-
 
 def generate_mlir(
     bound_kernel: "BoundKernel"
@@ -131,33 +101,15 @@ def generate_mlir(
             "Multiple nested loops not yet supported."
         )
     
-    # Collect ALL host tensor names from _host_tensor calls across ALL graphs
-    # This ensures every tensor referenced via _host_tensor becomes a function parameter
-    # ONLY tensors in this list should be in the function signature
-    all_host_tensor_names = _collect_host_tensor_names(device_ir, rolled_ids)
-    
     # Emit module start with tile size attributes
     module_attrs = ctx.get_module_attributes()
     builder.emit_module_start(module_attrs)
     
-    # Build function signature ONLY from host tensors actually used in Device IR
-    # This ensures parameter names match what the Device IR expects
+    # Build function signature using pre-computed host tensor types from LoweringContext
+    # host_tensor_types is computed during LoweringContext init by scanning all graphs
     func_args = []
-    for tensor_name in all_host_tensor_names:
+    for tensor_name, tensor_type in ctx.host_tensor_types.items():
         ssa_name = f"%{tensor_name}"
-        
-        if tensor_name == 'out':
-            # Output tensor - use dynamic type like other _host_tensor parameters
-            # The 'out' tensor comes from _host_tensor('out') and should be treated
-            # the same as input tensors (dynamic shape)
-            tensor_type = f"tensor<?x?xf32>"
-        elif tensor_name in ctx.arg_mlir_types:
-            # This is a kernel arg that's also used in Device IR
-            tensor_type = ctx.arg_mlir_types[tensor_name]
-        else:
-            # Derived tensor (view) - use dynamic tensor type
-            tensor_type = f"tensor<?x?xf32>"
-        
         func_args.append((ssa_name, tensor_type))
         # Pre-register in host_tensors for later lookup
         ctx.host_tensors[tensor_name] = ssa_name
