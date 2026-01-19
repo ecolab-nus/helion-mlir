@@ -487,9 +487,13 @@ def inline_torch_mlir_output(
     builder._affine_map_counter = affine_map_counter
     
     # Helper to replace affine map aliases with inline definitions
+    # Use regex to ensure we match whole aliases (e.g., #map but not #map1)
     def replace_affine_maps(text):
         for old_alias, (new_alias, affine_map_def) in affine_map_aliases.items():
-            text = text.replace(old_alias, affine_map_def)
+            # Escape the alias for regex and use word boundary to prevent partial matches
+            # e.g., #map should not match inside #map1
+            pattern = re.escape(old_alias) + r'(?![0-9a-zA-Z_])'
+            text = re.sub(pattern, affine_map_def, text)
         return text
     
     # 2. Map function arguments
