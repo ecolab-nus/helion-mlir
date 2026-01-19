@@ -33,7 +33,6 @@ from .mlir_builder import (
 )
 from .lowering_context import (
     LoweringContext,
-    first_debug_name,
     collect_reduction_block_ids,
 )
 from .ir_visitor import IRVisitor
@@ -199,7 +198,6 @@ def generate_mlir(
     for block_id in reduction_block_ids:
         # Assuming block_id is the list index as per allocate_block_size implementation.
         info = ctx.env.block_sizes[block_id]
-        block_name = first_debug_name(info.debug_names, fallback=f"block_{block_id}")
         
         # Calculate trip count
         total_extent = ctx.loop_extents[block_id]  # Pre-computed extent
@@ -249,7 +247,6 @@ def generate_mlir(
         
         for block_id in ctx.parallel_block_ids:
             info = ctx.env.block_sizes[block_id]
-            block_name = first_debug_name(info.debug_names, fallback=f"block_{block_id}")
             total_extent = ctx.loop_extents[block_id]
             
             # 0 to total_extent (M/N) with step tile_size
@@ -261,7 +258,7 @@ def generate_mlir(
             else:
                  steps.append("1") # fallback step for symbolic (or symbolic constant if we had it)
                  
-            iv_names.append(f"%iv_{block_name}")
+            iv_names.append(f"%iv_block{block_id}")
         
         # Format parallel loop
         lb_str = "(" + ", ".join(lower_bounds) + ")"

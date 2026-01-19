@@ -214,20 +214,38 @@ class TorchMLIRNodeImporter:
         """
         self._ensure_initialized()
         
-        from torch_mlir.compiler_utils import OutputType, lower_mlir_module
+        from torch_mlir.compiler_utils import (
+            OutputType, 
+            lower_mlir_module,
+            run_pipeline_with_repro_report,
+        )
         
         # Import the graph
         self._importer.import_stateless_graph(graph, func_name=func_name)
         
-        # Get the module and lower if needed
+        # Get the module
         module = self._importer.module
         
-        if self.output_type != "raw":
-            module = lower_mlir_module(
-                False,  # verbose
-                OutputType.get(self.output_type),
-                module
-            )
+        if self.output_type == "raw":
+            return str(module)
+        
+        # For non-raw output types, we need to run the torch backend pipeline first
+        # This converts RAW torch dialect -> torch backend IR (decompositions, etc.)
+        # Then lower_mlir_module handles torch backend IR -> target dialect
+        
+        # Step 1: Run the torch backend pipeline (RAW -> torch backend IR)
+        run_pipeline_with_repro_report(
+            module,
+            "builtin.module(func.func(torch-match-quantized-custom-ops), torchdynamo-export-to-torch-backend-pipeline{ extra-library=})",
+            "Lowering TorchFX IR -> Torch Backend IR",
+        )
+        
+        # Step 2: Lower to target dialect (torch backend IR -> linalg/tosa/stablehlo)
+        module = lower_mlir_module(
+            False,  # verbose
+            OutputType.get(self.output_type),
+            module
+        )
         
         return str(module)
     
@@ -415,6 +433,10 @@ def import_aten_node_to_mlir(
 
 
 
+
+
+
+
 import re
 
 def inline_torch_mlir_output(
@@ -423,6 +445,15 @@ def inline_torch_mlir_output(
     builder
 ) -> str:
     """Inline torch-mlir generated text into the current builder.
+    
+    Handles multiline operations like linalg.generic which have block bodies:
+    ```
+    %3 = linalg.generic {...} ins(...) outs(...) {
+    ^bb0(%in: f32, ...):
+      %4 = arith.addf %in, %in_0 : f32
+      linalg.yield %4 : f32
+    } -> tensor<32x64xf32>
+    ```
     
     Args:
         mlir_text: The full MLIR module text from torch-mlir.
@@ -435,16 +466,39 @@ def inline_torch_mlir_output(
     lines = mlir_text.splitlines()
     ssa_map = {}
     
-    # 1. Map function arguments
-    # Torch-mlir output always starts args with %arg0, %arg1...
+    # Track affine map aliases to inline them
+    affine_map_aliases = {}  # old_alias -> (new_alias, affine_map_def)
+    affine_map_counter = getattr(builder, '_affine_map_counter', 0)
+    
+    # 1. First pass: collect affine map definitions
+    # These are lines like: #map = affine_map<(d0, d1) -> (d0, d1)>
+    affine_map_pattern = re.compile(r'^(#\w+)\s*=\s*(affine_map<.+>)\s*$')
+    
+    for line in lines:
+        line_stripped = line.strip()
+        match = affine_map_pattern.match(line_stripped)
+        if match:
+            old_alias = match.group(1)
+            affine_map_def = match.group(2)
+            new_alias = f"#map{affine_map_counter}"
+            affine_map_counter += 1
+            affine_map_aliases[old_alias] = (new_alias, affine_map_def)
+    
+    builder._affine_map_counter = affine_map_counter
+    
+    # Helper to replace affine map aliases with inline definitions
+    def replace_affine_maps(text):
+        for old_alias, (new_alias, affine_map_def) in affine_map_aliases.items():
+            text = text.replace(old_alias, affine_map_def)
+        return text
+    
+    # 2. Map function arguments
     for i, op in enumerate(operands):
         ssa_map[f"%arg{i}"] = op
         
     # Regex to identify SSAs
-    # torch-mlir generates names like %float5.000000e-01 which include periods and signs
     ssa_pattern = re.compile(r'%([a-zA-Z0-9_][a-zA-Z0-9_.+-]*)')
     
-    # helper to replace SSAs in a string
     def replace_ssas(text, mapping):
         def repl(m):
             name = m.group(1)
@@ -452,89 +506,120 @@ def inline_torch_mlir_output(
             return mapping.get(full, full)
         return ssa_pattern.sub(repl, text)
 
-    # Find body start
-    start_idx = 0
+    # Find function body start and end
+    func_start_idx = 0
+    func_end_idx = len(lines)
+    brace_count = 0
+    
     for i, line in enumerate(lines):
         if "func.func @aten_op" in line:
-            start_idx = i + 1
+            func_start_idx = i + 1
+            brace_count = 1  # Opening brace of func
+            break
+    
+    # Find the closing brace of the function
+    for i in range(func_start_idx, len(lines)):
+        line = lines[i]
+        brace_count += line.count('{') - line.count('}')
+        if brace_count == 0:
+            func_end_idx = i
             break
             
     result_ssa = None
     
-    for line in lines[start_idx:]:
-        line = line.strip()
-        if not line or line.startswith("}"):
+    # Process lines within the function body
+    i = func_start_idx
+    while i < func_end_idx:
+        line = lines[i].strip()
+        i += 1
+        
+        if not line:
+            continue
+        
+        # Skip affine map definitions (already handled)
+        if affine_map_pattern.match(line):
             continue
             
-        # Handle Return
+        # Handle Return - extract result SSA
         if line.startswith("return"):
             parts = line.split()
             if len(parts) >= 2:
-                # "return %res : type"
-                ret = parts[1]
+                ret = parts[1].rstrip(',')
                 result_ssa = ssa_map.get(ret, ret)
+            continue
+            
+        # Handle lines that are just closing braces with result type: "} -> tensor<...>"
+        if line.startswith("}"):
+            # This is a closing brace for an inline region, emit it
+            new_line = replace_ssas(line, ssa_map)
+            new_line = replace_affine_maps(new_line)
+            builder.emit(new_line)
             continue
             
         # Handle Block Args (e.g. ^bb0(%a: f32, %b: f32):)
         if line.startswith("^"):
-            # This is a block label with args. Args are definitions.
-            # format: ^bb0(%arg: type, ...):
-            # We need to extract the arg names and map them to fresh names.
-            
-            # Find definitions
-            # split by ( and )
-            pre, rest = line.split("(", 1)
-            args_part, post = rest.rsplit(")", 1)
-            
-            # Split args
-            args_list = args_part.split(",")
-            new_args_list = []
-            for arg_def in args_list:
-                # "%name: type"
-                arg_def = arg_def.strip()
-                if ":" in arg_def:
-                    name_part, type_part = arg_def.split(":", 1)
-                    name = name_part.strip()
-                    if name.startswith("%"):
-                        fresh = builder.fresh("blk_arg")
-                        ssa_map[name] = fresh
-                        new_args_list.append(f"{fresh}: {type_part}")
+            if "(" in line and ")" in line:
+                pre, rest = line.split("(", 1)
+                args_part, post = rest.rsplit(")", 1)
+                
+                args_list = args_part.split(",")
+                new_args_list = []
+                for arg_def in args_list:
+                    arg_def = arg_def.strip()
+                    if ":" in arg_def:
+                        name_part, type_part = arg_def.split(":", 1)
+                        name = name_part.strip()
+                        if name.startswith("%"):
+                            fresh = builder.fresh("blk_arg")
+                            ssa_map[name] = fresh
+                            new_args_list.append(f"{fresh}:{type_part}")
+                        else:
+                            new_args_list.append(arg_def)
                     else:
                         new_args_list.append(arg_def)
-                else:
-                    new_args_list.append(arg_def)
-            
-            new_line = f"{pre}({', '.join(new_args_list)}){post}"
+                
+                new_line = f"{pre}({', '.join(new_args_list)}){post}"
+            else:
+                new_line = line
+            new_line = replace_affine_maps(new_line)
             builder.emit(new_line)
             continue
 
-        # Handle Assignment
-        if "=" in line:
-            lhs, rhs = line.split("=", 1)
-            lhs = lhs.strip()
-            rhs = rhs.strip()
+        # Handle Assignment (lines with '=' that define SSA values)
+        if "=" in line and not line.startswith("cf.assert"):
+            # Check if the '=' is part of an SSA assignment (not inside attribute syntax like '=')
+            # Simple heuristic: if line starts with '%', it's an SSA assignment
+            first_eq = line.index("=")
+            lhs = line[:first_eq].strip()
+            rhs = line[first_eq+1:].strip()
             
-            # LHS are definitions
-            lhs_vars = [x.strip() for x in lhs.split(",")]
-            new_lhs_vars = []
-            for v in lhs_vars:
-                if v.startswith("%"):
-                    fresh = builder.fresh("t")
-                    ssa_map[v] = fresh
-                    new_lhs_vars.append(fresh)
-                else:
-                    new_lhs_vars.append(v)
-            
-            new_lhs = ", ".join(new_lhs_vars)
-            
-            # RHS are usages
-            new_rhs = replace_ssas(rhs, ssa_map)
-            
-            builder.emit(f"{new_lhs} = {new_rhs}")
+            if lhs.startswith("%"):
+                # LHS is SSA definition
+                lhs_vars = [x.strip() for x in lhs.split(",")]
+                new_lhs_vars = []
+                for v in lhs_vars:
+                    if v.startswith("%"):
+                        fresh = builder.fresh("t")
+                        ssa_map[v] = fresh
+                        new_lhs_vars.append(fresh)
+                    else:
+                        new_lhs_vars.append(v)
+                
+                new_lhs = ", ".join(new_lhs_vars)
+                new_rhs = replace_ssas(rhs, ssa_map)
+                new_rhs = replace_affine_maps(new_rhs)
+                
+                builder.emit(f"{new_lhs} = {new_rhs}")
+            else:
+                # Not an SSA assignment, emit as-is with SSA replacement
+                new_line = replace_ssas(line, ssa_map)
+                new_line = replace_affine_maps(new_line)
+                builder.emit(new_line)
             continue
             
-        # Handle standalone ops (like linalg.yield)
+        # Handle standalone ops (like linalg.yield, cf.assert, etc.)
         new_line = replace_ssas(line, ssa_map)
+        new_line = replace_affine_maps(new_line)
         builder.emit(new_line)
 
     return result_ssa

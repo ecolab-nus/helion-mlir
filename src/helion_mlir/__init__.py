@@ -31,7 +31,6 @@ from .mlir_builder import (
 
 from .lowering_context import (
     LoweringContext,
-    first_debug_name,
     collect_reduction_block_ids,
 )
 

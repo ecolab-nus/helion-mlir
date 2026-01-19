@@ -1215,7 +1215,12 @@ class IRVisitor:
     def visit_aten_compute(self, node: fx.Node) -> str:
         """Generate MLIR for ATen compute ops using torch-mlir.
         
-        Uses torch-mlir's FxImporter to generate proper MLIR for ATen operations.
+        Uses torch-mlir's FxImporter to generate MLIR for ATen operations.
+        The output dialect is controlled by ctx.aten_output_type:
+        - "raw": torch dialect (torch.aten.*)
+        - "linalg-on-tensors": linalg dialect on tensors
+        - "tosa": TOSA dialect
+        - "stablehlo": StableHLO dialect
         """
         target = node.target
         op_name, overload = get_aten_op_info(target)
@@ -1229,11 +1234,15 @@ class IRVisitor:
                 operand_ssas.append(str(arg))
         
         # -------------------------------------------------------------------------
-        # Use torch-mlir to generate torch dialect MLIR for all ATen operations
+        # Use torch-mlir to generate MLIR for all ATen operations
+        # The output type is controlled by ctx.aten_output_type
         # -------------------------------------------------------------------------
         
+        # Get output type from context (defaults to "raw" for torch dialect)
+        output_type = getattr(self.ctx, 'aten_output_type', 'raw')
+        
         # Use torch-mlir to generate MLIR for this operation
-        mlir_text = import_aten_node_to_mlir(node)
+        mlir_text = import_aten_node_to_mlir(node, output_type=output_type)
         if mlir_text is None:
              raise RuntimeError(f"Failed to lower ATen op: {node.name} ({target})")
 

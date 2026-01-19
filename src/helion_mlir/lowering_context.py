@@ -46,6 +46,8 @@ class LoweringContext:
         
         self.bound_kernel = bound_kernel
         self.builder = MLIRBuilder()
+        # Always output linalg-on-tensors for now as per user request
+        self.aten_output_type = "linalg-on-tensors"
         
         # Derive kernel name from the kernel function
         self.kernel_name = bound_kernel.kernel.fn.__name__
@@ -168,12 +170,12 @@ class LoweringContext:
 # Helper functions
 # -----------------------------------------------------------------------------
 
-def first_debug_name(names: set[str], *, fallback: str) -> str:
-    """Get the first debug name from a set, sanitizing for MLIR."""
-    for name in names:
-        if name:
-            return name.replace(".", "_").replace("-", "_")
-    return fallback
+# def first_debug_name(names: set[str], *, fallback: str) -> str:
+#     """Get the first debug name from a set, sanitizing for MLIR."""
+#     for name in names:
+#         if name:
+#             return name.replace(".", "_").replace("-", "_")
+#     return fallback
 
 def resolve_extent(name: str, lhs: "Tensor", rhs: "Tensor") -> int:
     """Resolve the extent for a named dimension."""
