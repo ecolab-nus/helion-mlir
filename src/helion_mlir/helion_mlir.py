@@ -55,7 +55,7 @@ def generate_mlir(
     
     Args:
         bound_kernel: A bound Helion kernel with fake_args set
-        cleanup: Whether to run mlir-opt canonicalize/cse passes (default: True)
+        cleanup: Whether to run mlir-opt canonicalize/cse passes (default: True), you should keep it to False if you want more intuitive variable names.
     
     Returns:
         MLIR text representation of the kernel
