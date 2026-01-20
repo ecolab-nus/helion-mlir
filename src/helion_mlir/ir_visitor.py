@@ -177,8 +177,8 @@ class IRVisitor:
         if hasattr(target, '__module__') and 'aten' in str(target):
             return self.visit_aten_compute(node)
         
-        # Fallback for unknown targets
-        return self.visit_unknown(node)
+        # Unsupported target
+        raise RuntimeError(f"Unsupported target: {target}")
 
     
     def visit_output(self, node: fx.Node) -> str | None:
@@ -261,7 +261,6 @@ class IRVisitor:
             self.ctx.node_values[node.name] = ssa
             return ssa
         
-        # Fallback: no resolution found
         raise ValueError(
             f"Cannot resolve symbol {sym} for {node.name}. "
             f"Origin: {origin}, not in shape_env.var_to_val"
@@ -294,8 +293,7 @@ class IRVisitor:
                 self.builder.emit(f'{const_ssa} = arith.constant {s} : index')
                 shape_ssa.append(const_ssa)
             else:
-                # Fallback for other values
-                shape_ssa.append(str(s))
+                raise RuntimeError(f"Unsupported shape type: {type(s)}")
         
         dtype_str = torch_dtype_to_mlir_element_type(dtype) if dtype else "f32"
         
@@ -305,9 +303,7 @@ class IRVisitor:
         if fake_tensor is not None and hasattr(fake_tensor, "shape"):
             tensor_type = self.ctx.compute_mlir_type_from_fake_tensor(fake_tensor, dtype_str)
         else:
-            # Fallback: all dynamic dimensions
-            dim_wildcards = "x".join(["?"] * len(shape_ssa))
-            tensor_type = f"tensor<{dim_wildcards}x{dtype_str}>"
+            raise RuntimeError(f"Cannot compute MLIR type for node {node.name}")
         
         # Step 1: Emit tensor.empty
         # Only include SSA values for dynamic dimensions (?)
@@ -389,8 +385,7 @@ class IRVisitor:
                 self.builder.emit(f'{const_ssa} = arith.constant {s} : index')
                 shape_ssa.append(const_ssa)
             else:
-                # Fallback for other values
-                shape_ssa.append(str(s))
+                raise RuntimeError(f"Unsupported shape type: {type(s)}")
         
         dtype_str = torch_dtype_to_mlir_element_type(dtype) if dtype else "f32"
         
@@ -400,9 +395,7 @@ class IRVisitor:
         if fake_tensor is not None and hasattr(fake_tensor, "shape"):
             tensor_type = self.ctx.compute_mlir_type_from_fake_tensor(fake_tensor, dtype_str)
         else:
-            # Fallback: all dynamic dimensions
-            dim_wildcards = "x".join(["?"] * len(shape_ssa))
-            tensor_type = f"tensor<{dim_wildcards}x{dtype_str}>"
+            raise RuntimeError(f"Cannot compute MLIR type for node {node.name}")
         
         # Step 1: Emit tensor.empty
         # Only include SSA values for dynamic dimensions (?)
@@ -513,9 +506,7 @@ class IRVisitor:
             if fx_name and fx_name in self.ctx.node_types:
                 iter_args_types.append(self.ctx.node_types[fx_name])
             else:
-                # Fallback to f32 dynamic tensor if type is unknown
-                # Use ctx.element_type for element type guess if possible
-                iter_args_types.append(f"tensor<?x?xf32>")
+                raise RuntimeError(f"Cannot compute MLIR type for node {fx_name}")
         
         # Emit affine.for
         iv = f"%iv_block{block_id}"
@@ -844,9 +835,7 @@ class IRVisitor:
                             output_dim_sizes.append(int(dim_size))  # Static
                         sizes_ssa.append(size_ssa)
                     else:
-                        # Fallback: use idx_ssa as size (shouldn't happen with proper metadata)
-                        sizes_ssa.append(idx_ssa)
-                        output_dim_sizes.append(None)
+                        raise RuntimeError(f"Cannot compute MLIR type for node {node.name}")
                         
                 elif 'block_size' in idx.name:
                     # block_size node indicates the tile size for this dimension
@@ -887,14 +876,7 @@ class IRVisitor:
                 sizes_ssa.append(size_ssa)
                 output_dim_sizes.append(1)  # Static size 1
             else:
-                # Fallback
-                offset_ssa = self.builder.fresh("offset")
-                self.builder.emit(f'{offset_ssa} = arith.constant 0 : index')
-                offsets_ssa.append(offset_ssa)
-                size_ssa = self.builder.fresh("size")
-                self.builder.emit(f'{size_ssa} = arith.constant 1 : index')
-                sizes_ssa.append(size_ssa)
-                output_dim_sizes.append(1)  # Static size 1
+                raise RuntimeError(f"Unsupported index type: {type(idx)}")
         
         result = self.builder.fresh("slice")
         
@@ -1413,24 +1395,6 @@ class IRVisitor:
         self.ctx.node_values[node.name] = result
         return result
     
-    def visit_unknown(self, node: fx.Node) -> str | None:
-        """Handle unknown node targets."""
-        # Log or emit a placeholder
-        target_str = str(node.target)
-        ssa = self.builder.fresh(f"unknown_{node.name}")
-        
-        attrs = format_attr_dict({
-            "target": format_string_attr(target_str),
-            "fx_node": format_string_attr(node.name),
-        })
-        
-        self.builder.emit(
-            f'{ssa} = "helion.unknown"(){attrs} : () -> index'
-        )
-        
-        self.ctx.node_values[node.name] = ssa
-        return ssa
-    
     def _get_tensor_type(self, tensor_node: fx.Node | str) -> str:
         """Get MLIR tensor type for a tensor node.
         
@@ -1439,7 +1403,6 @@ class IRVisitor:
         2. ctx.host_tensor_types (pre-computed for _host_tensor nodes)
         3. ctx.arg_mlir_types (kernel arguments)
         4. Compute from FakeTensor if available
-        5. Fallback to dynamic type
         """
         if isinstance(tensor_node, fx.Node):
             name = tensor_node.name
@@ -1465,5 +1428,4 @@ class IRVisitor:
             fake_tensor = node.meta['val']
             return self.ctx.compute_mlir_type_from_fake_tensor(fake_tensor)
         
-        # Fallback to dynamic type (should rarely reach here)
-        return f"tensor<?x?xf32>"
+        raise RuntimeError(f"Cannot compute MLIR type for node {name}")

@@ -89,10 +89,9 @@ class LoweringContext:
                 if sym in shape_env.var_to_val:
                     self.loop_extents[info.block_id] = int(shape_env.var_to_val[sym])
                 else:
-                    # Fall back to size_hint
-                    self.loop_extents[info.block_id] = bound_kernel.env.size_hint(size)
+                    raise RuntimeError(f"Cannot resolve extent for block {info.block_id}")
             else:
-                self.loop_extents[info.block_id] = 1  # fallback
+                raise RuntimeError(f"Unsupported size type: {type(size)} for block {info.block_id}")
         
         # Mutable state that gets populated during lowering
         self.host_tensors: dict[str, str] = {}
@@ -170,8 +169,7 @@ class LoweringContext:
         from helion._compiler.variable_origin import BlockSizeOrigin
         
         if fake_tensor is None or not hasattr(fake_tensor, "shape"):
-            # Fallback: use 2D dynamic shape
-            return f"tensor<?x?x{dtype}>"
+            raise RuntimeError("FakeTensor is None or does not have shape")
         
         host_function = self.bound_kernel.host_function
         shape_env = self.bound_kernel.env.shape_env

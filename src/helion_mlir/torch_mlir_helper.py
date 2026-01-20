@@ -32,18 +32,9 @@ def get_aten_op_info(target: Any) -> tuple[str, str]:
     """
     if isinstance(target, OpOverload):
         return target.__name__, target._overloadname
+    else :
+        raise RuntimeError(f"Unsupported target type: {type(target)}")
     
-    # Fallback: parse from string representation
-    target_str = str(target)
-    if "aten." in target_str:
-        parts = target_str.replace("aten::", "aten.").split(".")
-        if len(parts) >= 2:
-            op_name = parts[1]
-            overload = parts[2] if len(parts) > 2 else "default"
-            return op_name, overload
-    
-    return target_str, "default"
-
 
 class TorchMLIRNodeImporter:
     """Imports FX nodes to MLIR using torch-mlir's FxImporter.
@@ -240,9 +231,7 @@ def create_fake_tensors_for_node(node: fx.Node) -> list[torch.Tensor]:
                 # For scalars, append the value itself
                 fake_tensors.append(val)
             else:
-                # Default fallback
-                fake = torch.empty([1, 1], dtype=torch.float32, device="meta")
-                fake_tensors.append(fake)
+                raise RuntimeError(f"Unsupported arg type: {type(arg)}")
         return arg
 
     with fake_mode:
