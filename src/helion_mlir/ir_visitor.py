@@ -1346,9 +1346,11 @@ class IRVisitor:
         """Generate MLIR for ATen compute ops using torch-mlir.
         
         Uses torch-mlir's FxImporter to generate MLIR for ATen operations.
-        Uses torch-mlir's FxImporter to generate MLIR for ATen operations.
         The output is always lowered to linalg-on-tensors.
+        
+        Optimizes tensor.dim operations by passing pre-existing dimension SSAs.
         """
+        from helion._compiler.variable_origin import BlockSizeOrigin
         target = node.target
         
         # Resolve all operands to SSA values
@@ -1372,17 +1374,76 @@ class IRVisitor:
         
         # Collect SSA values for tensor operands (matching what import_aten_node_to_mlir expects as args)
         tensor_operands = []
+        tensor_operand_nodes = []  # Keep track of the actual nodes for dimension analysis
         def collect_operands(arg):
             if isinstance(arg, fx.Node):
                 tensor_operands.append(self.ctx.node_values.get(arg.name, f"%{arg.name}"))
+                tensor_operand_nodes.append(arg)
             return arg
             
         fx.map_arg(node.args, collect_operands)
         fx.map_arg(node.kwargs, collect_operands)
         
-        # Inline the generated MLIR
+        # -------------------------------------------------------------------------
+        # Build dimension_ssa_map for tensor.dim optimization
+        # Maps each tensor operand SSA to a list of dimension SSAs
+        # -------------------------------------------------------------------------
+        host_function = self.ctx.bound_kernel.host_function
+        shape_env = self.ctx.bound_kernel.env.shape_env
+        
+        dimension_ssa_map = {}
+        
+        for operand_ssa, operand_node in zip(tensor_operands, tensor_operand_nodes):
+            fake_tensor = operand_node.meta.get("val") if operand_node else None
+            if fake_tensor is None or not hasattr(fake_tensor, 'ndim'):
+                continue
+                
+            dim_ssas = []
+            for dim_idx in range(fake_tensor.ndim):
+                dim_size = fake_tensor.size(dim_idx)
+                
+                if hasattr(dim_size, '_sympy_'):
+                    # It's a SymInt - look up its origin
+                    sym = dim_size._sympy_()
+                    origin_info = host_function.expr_to_origin.get(sym)
+                    origin = origin_info.origin if origin_info else None
+                    
+                    if isinstance(origin, BlockSizeOrigin):
+                        block_id = origin.block_id
+                        block_info = self.ctx.env.block_sizes[block_id]
+                        
+                        # If concrete int, use inline literal (represented as str)
+                        if isinstance(block_info.size, int):
+                            dim_ssas.append(str(block_info.size))
+                        else:
+                            # Symbolic - use pre-emitted block_size SSA
+                            ssa = self.ctx.block_size_ssa.get(block_id)
+                            if ssa:
+                                dim_ssas.append(ssa)
+                            else:
+                                dim_ssas.append(None)
+                    else:
+                        # Not a BlockSizeOrigin - check shape_env for concrete value
+                        if sym in shape_env.var_to_val:
+                            concrete_val = int(shape_env.var_to_val[sym])
+                            dim_ssas.append(str(concrete_val))
+                        else:
+                            dim_ssas.append(None)
+                else:
+                    # Concrete int dimension
+                    dim_ssas.append(str(int(dim_size)))
+            
+            if any(d is not None for d in dim_ssas):
+                dimension_ssa_map[operand_ssa] = dim_ssas
+        
+        # Inline the generated MLIR with dimension optimization
         from .torch_mlir_helper import inline_torch_mlir_output
-        result = inline_torch_mlir_output(mlir_text, tensor_operands, self.mlir_output_helper)
+        result = inline_torch_mlir_output(
+            mlir_text, 
+            tensor_operands, 
+            self.mlir_output_helper,
+            dimension_ssa_map=dimension_ssa_map if dimension_ssa_map else None
+        )
         
         self.ctx.node_values[node.name] = result
         return result

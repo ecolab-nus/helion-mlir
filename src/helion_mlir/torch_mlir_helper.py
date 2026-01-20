@@ -281,7 +281,9 @@ import re
 def inline_torch_mlir_output(
     mlir_text: str, 
     operands: list[str], 
-    mlir_output_helper
+    mlir_output_helper,
+    *,
+    dimension_ssa_map: dict[str, list[str | None]] | None = None,
 ) -> str:
     """Inline torch-mlir generated text into the current output helper.
     
@@ -298,6 +300,12 @@ def inline_torch_mlir_output(
         mlir_text: The full MLIR module text from torch-mlir.
         operands: SSA values to use as arguments.
         mlir_output_helper: The MLIR helper to emit to.
+        dimension_ssa_map: Optional mapping from operand SSA to list of dimension SSAs.
+            If provided, tensor.dim operations are replaced with pre-existing SSAs.
+            Each list entry is either:
+            - str: Use this SSA value for the dimension
+            - None: Dimension is static, cannot be queried (or let tensor.dim run)
+            Example: {"%slice16": ["%block_size_0", "%block_size_1", None]}
         
     Returns:
         The SSA value of the result.
@@ -348,6 +356,14 @@ def inline_torch_mlir_output(
             full = f"%{name}"
             return mapping.get(full, full)
         return ssa_pattern.sub(repl, text)
+    
+    # Track arith.constant values for tensor.dim index resolution
+    # Maps SSA name (e.g., "%0") to integer value
+    const_index_values = {}
+    
+    # Deferred arith.constant emissions - only emit if not consumed by optimized tensor.dim
+    # Maps original SSA name to (fresh_name, rhs_text)
+    deferred_const_emissions = {}
 
     # Find function body start and end
     func_start_idx = 0
@@ -440,6 +456,60 @@ def inline_torch_mlir_output(
                 # LHS is SSA definition - handle multiple results
                 # Cases: "%0 = op", "%0, %1 = op", "%0:2 = op"
                 lhs_vars = [x.strip() for x in lhs.split(",")]
+                
+                # -----------------------------------------------------------------
+                # Optimization: Track arith.constant index values for tensor.dim
+                # Pattern: %0 = arith.constant 0 : index
+                # We DEFER emission - only emit if not consumed by optimized tensor.dim
+                # -----------------------------------------------------------------
+                arith_const_match = re.match(r'arith\.constant\s+(\d+)\s*:\s*index', rhs)
+                if arith_const_match and len(lhs_vars) == 1:
+                    const_val = int(arith_const_match.group(1))
+                    ssa_name = lhs_vars[0]
+                    const_index_values[ssa_name] = const_val
+                    # Create a fresh name mapping but DON'T emit yet
+                    fresh = mlir_output_helper.fresh("t")
+                    ssa_map[ssa_name] = fresh
+                    # Store the deferred emission info
+                    # Format: (fresh_name, rhs_text)
+                    deferred_const_emissions[ssa_name] = (fresh, rhs)
+                    continue
+                
+                # -----------------------------------------------------------------
+                # Optimization: Replace tensor.dim with pre-existing dimension SSA
+                # Pattern: %N = tensor.dim %arg0, %const : tensor<...>
+                # -----------------------------------------------------------------
+                tensor_dim_match = re.match(r'tensor\.dim\s+(%\w+),\s*(%\w+)\s*:', rhs)
+                if tensor_dim_match and dimension_ssa_map:
+                    tensor_ssa_ref = tensor_dim_match.group(1)
+                    const_ssa_ref = tensor_dim_match.group(2)
+                    
+                    # Resolve the tensor SSA to our operand name
+                    tensor_ssa_resolved = ssa_map.get(tensor_ssa_ref, tensor_ssa_ref)
+                    
+                    # Get the dimension index from the constant
+                    dim_idx = const_index_values.get(const_ssa_ref)
+                    
+                    # Check if we have a pre-existing SSA for this dimension
+                    if tensor_ssa_resolved in dimension_ssa_map and dim_idx is not None:
+                        dim_ssas = dimension_ssa_map[tensor_ssa_resolved]
+                        if dim_idx < len(dim_ssas) and dim_ssas[dim_idx] is not None:
+                            # We have a pre-existing SSA - use it!
+                            result_ssa_name = lhs_vars[0]
+                            ssa_map[result_ssa_name] = dim_ssas[dim_idx]
+                            # Mark the index constant as consumed (don't emit it)
+                            if const_ssa_ref in deferred_const_emissions:
+                                del deferred_const_emissions[const_ssa_ref]
+                            # Skip emitting this tensor.dim operation
+                            continue
+                    
+                    # Fallback: emit the tensor.dim normally
+                    # First, emit the deferred constant if it exists
+                    if const_ssa_ref in deferred_const_emissions:
+                        fresh_name, const_rhs = deferred_const_emissions.pop(const_ssa_ref)
+                        mlir_output_helper.emit(f"{fresh_name} = {const_rhs}")
+                
+                # Normal SSA assignment processing
                 new_lhs_vars = []
                 num_results = len(lhs_vars)
                 
