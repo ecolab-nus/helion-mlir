@@ -129,7 +129,7 @@ def generate_mlir(
     block_size_ssa = {}
     for info in ctx.env.block_sizes:
         block_id = info.block_id
-        ssa = builder.fresh(f"block_size_{block_id}")
+        ssa = f"%block_size_{block_id}"
         builder.emit(
             f'{ssa} = "loom.get_symbol"() '
             f'{{name = "block_size_{block_id}"}} : () -> index'
