@@ -20,22 +20,6 @@ from torch._ops import OpOverload
 if TYPE_CHECKING:
     from .lowering_context import LoweringContext
 
-def get_aten_op_info(target: Any) -> tuple[str, str]:
-
-    """Extract ATen operation name and overload from target.
-    
-    Args:
-        target: FX node target (typically torch._ops.OpOverload)
-        
-    Returns:
-        Tuple of (op_name, overload) e.g., ("addmm", "default")
-    """
-    if isinstance(target, OpOverload):
-        return target.__name__, target._overloadname
-    else :
-        raise RuntimeError(f"Unsupported target type: {type(target)}")
-    
-
 class TorchMLIRNodeImporter:
     """Imports FX nodes to MLIR using torch-mlir's FxImporter.
     

@@ -36,7 +36,6 @@ from .mlir_utils import (
 )
 from .torch_mlir_helper import (
     TorchMLIRNodeImporter,
-    get_aten_op_info,
     import_aten_node_to_mlir,
 )
 
@@ -1357,7 +1356,6 @@ class IRVisitor:
         The output is always lowered to linalg-on-tensors.
         """
         target = node.target
-        op_name, overload = get_aten_op_info(target)
         
         # Resolve all operands to SSA values
         operand_ssas = []
