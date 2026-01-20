@@ -138,7 +138,7 @@ def main() -> None:
     y = torch.randn([k, n], device="cpu", dtype=torch.float32)
     bound_kernel = matmul.bind((x, y))
 
-    print_debug_info(bound_kernel)
+    print_debug_info(bound_kernel, cleanup=False)
 
 
 

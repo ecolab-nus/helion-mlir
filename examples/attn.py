@@ -70,7 +70,7 @@ def main() -> None:
 
     print_debug_info(bound)
 
-    mlir_text = generate_mlir(bound)
+    mlir_text = generate_mlir(bound, cleanup=False)
     print("=== MLIR Dump ===")
     print(mlir_text)
     

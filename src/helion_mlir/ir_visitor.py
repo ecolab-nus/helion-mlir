@@ -750,6 +750,9 @@ class IRVisitor:
         Replaces the custom helion.load with standard MLIR tensor.extract_slice.
         The tile sizes come from the load node's FakeTensor metadata (node.meta['val'].size()),
         and each dimension's SymInt origin is used to look up the pre-emitted SSA.
+        
+        Uses inline literals for known constants (e.g., [0, %offset][%size, 128][1, 1])
+        instead of emitting arith.constant for every value.
         """
         from helion._compiler.variable_origin import BlockSizeOrigin
         
@@ -764,50 +767,45 @@ class IRVisitor:
         host_function = self.ctx.bound_kernel.host_function
         shape_env = self.ctx.bound_kernel.env.shape_env
         
-        # Helper: resolve a SymInt to SSA using Origin lookup
-        def resolve_symint_to_ssa(sym_int, dim_hint: int) -> str:
-            """Resolve a SymInt to its SSA value using Origin-based lookup."""
+        # Helper: resolve a SymInt to SSA or inline literal
+        # Returns (value_str, is_static) where is_static=True means it's an inline literal
+        def resolve_symint(sym_int, dim_hint: int) -> tuple[str, bool]:
+            """Resolve a SymInt to its value. Returns (str_value, is_static)."""
             sym = sym_int._sympy_()
             origin_info = host_function.expr_to_origin.get(sym)
             origin = origin_info.origin if origin_info else None
             
-            # BlockSizeOrigin -> check if concrete int size, otherwise use pre-emitted block_size_ssa
+            # BlockSizeOrigin -> check if concrete int size
             if isinstance(origin, BlockSizeOrigin):
                 block_id = origin.block_id
                 block_info = self.ctx.env.block_sizes[block_id]
                 
-                # If size is concrete int, emit arith.constant
+                # If size is concrete int, return inline literal
                 if isinstance(block_info.size, int):
-                    ssa = self.mlir_output_helper.fresh(f"size_dim{dim_hint}")
-                    self.mlir_output_helper.emit(f'{ssa} = arith.constant {block_info.size} : index')
-                    return ssa
+                    return (str(block_info.size), True)
                 
                 # Symbolic size -> use pre-emitted block_size_ssa
                 ssa = self.ctx.block_size_ssa.get(block_id)
                 if ssa is not None:
-                    return ssa
+                    return (ssa, False)
             
             # Other origins -> use shape_env for concrete value
             if sym in shape_env.var_to_val:
                 concrete_val = int(shape_env.var_to_val[sym])
-                ssa = self.mlir_output_helper.fresh(f"size_dim{dim_hint}")
-                self.mlir_output_helper.emit(f'{ssa} = arith.constant {concrete_val} : index')
-                return ssa
+                return (str(concrete_val), True)
             
             raise ValueError(f"Cannot resolve SymInt {sym} for dimension {dim_hint}")
         
-        # Collect offset and size SSA values for each dimension
-        # Track which dimensions have static sizes (for result type construction)
-        offsets_ssa = []
-        sizes_ssa = []
-        output_dim_sizes = []  # Store (static_size | None) for each dim
+        # Collect offset and size values for each dimension
+        # Each entry is (value_str, is_static) where is_static determines if it's an inline literal
+        offsets = []  # list of (str, bool) 
+        sizes = []    # list of (str, bool)
+        output_dim_sizes = []  # Store (static_size | None) for type construction
         
         for i, idx in enumerate(indices):
             if isinstance(idx, slice):
-                # Full dimension slice - offset=0, size comes from tensor dim
-                zero_ssa = self.mlir_output_helper.fresh("zero")
-                self.mlir_output_helper.emit(f'{zero_ssa} = arith.constant 0 : index')
-                offsets_ssa.append(zero_ssa)
+                # Full dimension slice - offset=0 (static), size comes from tensor dim
+                offsets.append(("0", True))
                 
                 # Get dimension size from tensor
                 # Check if source tensor's dimension is static
@@ -823,12 +821,16 @@ class IRVisitor:
                                 except ValueError:
                                     pass
                 
-                dim_ssa = self.mlir_output_helper.fresh("dim")
-                dim_idx_ssa = self.mlir_output_helper.fresh("dim_idx")
-                self.mlir_output_helper.emit(f'{dim_idx_ssa} = arith.constant {i} : index')
-                self.mlir_output_helper.emit(f'{dim_ssa} = tensor.dim {tensor_ssa}, {dim_idx_ssa} : {tensor_type}')
-                sizes_ssa.append(dim_ssa)
-                output_dim_sizes.append(src_dim_static)  # Preserve static size
+                if src_dim_static is not None:
+                    # Static dimension - use inline literal
+                    sizes.append((str(src_dim_static), True))
+                else:
+                    # Dynamic - need tensor.dim
+                    dim_ssa = self.mlir_output_helper.fresh("dim")
+                    self.mlir_output_helper.emit(f'{dim_ssa} = tensor.dim {tensor_ssa}, %c{i} : {tensor_type}')
+                    sizes.append((dim_ssa, False))
+                output_dim_sizes.append(src_dim_static)
+                
             elif isinstance(idx, fx.Node):
                 # Get the SSA value for this index (offset)
                 idx_ssa = self.ctx.node_values.get(idx.name, f"%{idx.name}")
@@ -836,22 +838,21 @@ class IRVisitor:
                 # Determine if this is a loop IV (sym_size_int) or a block size
                 if 'sym_size' in idx.name:
                     # sym_size_int represents an offset derived from tensor.dim
-                    # Use it directly as the offset
-                    offsets_ssa.append(idx_ssa)
+                    # Use it directly as the offset (dynamic)
+                    offsets.append((idx_ssa, False))
                     
                     # Size comes from the output FakeTensor's shape for this dimension
                     if output_fake_tensor is not None and i < output_fake_tensor.ndim:
                         dim_size = output_fake_tensor.size(i)
                         if hasattr(dim_size, '_sympy_'):
                             # It's a SymInt, resolve via Origin
-                            size_ssa = resolve_symint_to_ssa(dim_size, i)
-                            output_dim_sizes.append(None)  # Dynamic
+                            size_val, is_static = resolve_symint(dim_size, i)
+                            sizes.append((size_val, is_static))
+                            output_dim_sizes.append(int(size_val) if is_static else None)
                         else:
-                            # Concrete int
-                            size_ssa = self.mlir_output_helper.fresh(f"size_dim{i}")
-                            self.mlir_output_helper.emit(f'{size_ssa} = arith.constant {int(dim_size)} : index')
-                            output_dim_sizes.append(int(dim_size))  # Static
-                        sizes_ssa.append(size_ssa)
+                            # Concrete int - use inline
+                            sizes.append((str(int(dim_size)), True))
+                            output_dim_sizes.append(int(dim_size))
                     else:
                         raise RuntimeError(f"Cannot compute MLIR type for node {node.name}")
                         
@@ -860,40 +861,33 @@ class IRVisitor:
                     # The offset comes from the corresponding loop IV
                     
                     # Determine which block_id this index corresponds to
-                    # For reduction loops, use current_block_id; for parallel, use position
                     if self.current_block_id is not None:
                         # Inside a reduction loop - use the current block's IV
                         iv_ssa = f"%iv_block_{self.current_block_id}"
                     elif hasattr(self, 'current_loop_ivs') and i < len(self.current_loop_ivs):
                         iv_ssa = self.current_loop_ivs[i]
                     else:
-                        # TODO double check this block size thing
                         iv_ssa = f"%iv_block_{i}"
                     
-                    # Compute offset: iv * block_size
+                    # Compute offset: iv * block_size (always dynamic since iv is runtime)
                     offset_ssa = self.mlir_output_helper.fresh("offset")
                     self.mlir_output_helper.emit(
                         f'{offset_ssa} = arith.muli {iv_ssa}, {idx_ssa} : index'
                     )
-                    offsets_ssa.append(offset_ssa)
-                    sizes_ssa.append(idx_ssa)
+                    offsets.append((offset_ssa, False))
+                    sizes.append((idx_ssa, False))
                     output_dim_sizes.append(None)  # Dynamic (block sizes are runtime)
                 else:
-                    # Generic index - treat as offset with unknown size
-                    offsets_ssa.append(idx_ssa)
-                    size_ssa = self.mlir_output_helper.fresh("size")
-                    self.mlir_output_helper.emit(f'{size_ssa} = arith.constant 1 : index')
-                    sizes_ssa.append(size_ssa)
-                    output_dim_sizes.append(1)  # Static size 1
+                    # Generic index - treat as offset with size 1
+                    offsets.append((idx_ssa, False))
+                    sizes.append(("1", True))
+                    output_dim_sizes.append(1)
+                    
             elif isinstance(idx, int):
-                # Integer literal offset
-                offset_ssa = self.mlir_output_helper.fresh("offset")
-                self.mlir_output_helper.emit(f'{offset_ssa} = arith.constant {idx} : index')
-                offsets_ssa.append(offset_ssa)
-                size_ssa = self.mlir_output_helper.fresh("size")
-                self.mlir_output_helper.emit(f'{size_ssa} = arith.constant 1 : index')
-                sizes_ssa.append(size_ssa)
-                output_dim_sizes.append(1)  # Static size 1
+                # Integer literal offset with size 1
+                offsets.append((str(idx), True))
+                sizes.append(("1", True))
+                output_dim_sizes.append(1)
             else:
                 raise RuntimeError(f"Unsupported index type: {type(idx)}")
         
@@ -927,20 +921,9 @@ class IRVisitor:
             
         self.ctx.node_types[node.name] = result_type
         
-        # Format as tensor.extract_slice
-        # For static dimensions, use the concrete value in sizes bracket (not SSA)
-        # For dynamic dimensions, use SSA values
-        sizes_formatted = []
-        for i, dim_size in enumerate(output_dim_sizes):
-            if dim_size is not None:
-                # Static dimension - use integer literal
-                sizes_formatted.append(str(dim_size))
-            else:
-                # Dynamic dimension - use SSA value
-                sizes_formatted.append(sizes_ssa[i])
-        
-        offsets_str = ", ".join(offsets_ssa)
-        sizes_str = ", ".join(sizes_formatted)
+        # Format offsets, sizes, strides - using inline literals or SSA values
+        offsets_str = ", ".join(v for v, _ in offsets)
+        sizes_str = ", ".join(v for v, _ in sizes)
         strides_str = ", ".join(["1"] * len(indices))
         
         # Use tensor.extract_slice syntax
@@ -957,6 +940,9 @@ class IRVisitor:
         
         Replaces the custom helion.store with standard MLIR tensor.insert_slice.
         The tile sizes come from the value node's FakeTensor metadata.
+        
+        Uses inline literals for known constants (e.g., [0, %offset][%size, 128][1, 1])
+        instead of emitting arith.constant for every value.
         """
         from helion._compiler.variable_origin import BlockSizeOrigin
         
@@ -975,41 +961,44 @@ class IRVisitor:
         host_function = self.ctx.bound_kernel.host_function
         shape_env = self.ctx.bound_kernel.env.shape_env
         
-        # Helper: resolve a SymInt to SSA using Origin lookup
-        def resolve_symint_to_ssa(sym_int, dim_hint: int) -> str:
-            """Resolve a SymInt to its SSA value using Origin-based lookup."""
+        # Helper: resolve a SymInt to SSA or inline literal
+        def resolve_symint(sym_int, dim_hint: int) -> tuple[str, bool]:
+            """Resolve a SymInt to its value. Returns (str_value, is_static)."""
             sym = sym_int._sympy_()
             origin_info = host_function.expr_to_origin.get(sym)
             origin = origin_info.origin if origin_info else None
             
-            # BlockSizeOrigin -> use pre-emitted block_size_ssa
+            # BlockSizeOrigin -> check if concrete int size
             if isinstance(origin, BlockSizeOrigin):
                 block_id = origin.block_id
+                block_info = self.ctx.env.block_sizes[block_id]
+                
+                # If size is concrete int, return inline literal
+                if isinstance(block_info.size, int):
+                    return (str(block_info.size), True)
+                
+                # Symbolic size -> use pre-emitted block_size_ssa
                 ssa = self.ctx.block_size_ssa.get(block_id)
                 if ssa is not None:
-                    return ssa
+                    return (ssa, False)
             
             # Other origins -> use shape_env for concrete value
             if sym in shape_env.var_to_val:
                 concrete_val = int(shape_env.var_to_val[sym])
-                ssa = self.mlir_output_helper.fresh(f"size_dim{dim_hint}")
-                self.mlir_output_helper.emit(f'{ssa} = arith.constant {concrete_val} : index')
-                return ssa
+                return (str(concrete_val), True)
             
             raise ValueError(f"Cannot resolve SymInt {sym} for dimension {dim_hint}")
         
-        # Collect offset and size SSA values for each dimension
-        # Track which dimensions have static sizes (for size bracket formatting)
-        offsets_ssa = []
-        sizes_ssa = []
-        output_dim_sizes = []  # Store (static_size | None) for each dim
+        # Collect offset and size values for each dimension
+        # Each entry is (value_str, is_static)
+        offsets = []  # list of (str, bool)
+        sizes = []    # list of (str, bool)
+        output_dim_sizes = []  # Store (static_size | None) for type reference
         
         for i, idx in enumerate(indices):
             if isinstance(idx, slice):
-                # Full dimension slice - offset=0, size comes from source tensor dim
-                zero_ssa = self.mlir_output_helper.fresh("zero")
-                self.mlir_output_helper.emit(f'{zero_ssa} = arith.constant 0 : index')
-                offsets_ssa.append(zero_ssa)
+                # Full dimension slice - offset=0 (static), size comes from value tensor dim
+                offsets.append(("0", True))
                 
                 # Check if value tensor's dimension is static
                 src_dim_static = None
@@ -1024,34 +1013,36 @@ class IRVisitor:
                                 except ValueError:
                                     pass
                 
-                # Get dimension size from value tensor
-                dim_ssa = self.mlir_output_helper.fresh("dim")
-                dim_idx_ssa = self.mlir_output_helper.fresh("dim_idx")
-                self.mlir_output_helper.emit(f'{dim_idx_ssa} = arith.constant {i} : index')
-                self.mlir_output_helper.emit(f'{dim_ssa} = tensor.dim {value_ssa}, {dim_idx_ssa} : {value_type}')
-                sizes_ssa.append(dim_ssa)
+                if src_dim_static is not None:
+                    # Static dimension - use inline literal
+                    sizes.append((str(src_dim_static), True))
+                else:
+                    # Dynamic - need tensor.dim
+                    dim_ssa = self.mlir_output_helper.fresh("dim")
+                    self.mlir_output_helper.emit(f'{dim_ssa} = tensor.dim {value_ssa}, %c{i} : {value_type}')
+                    sizes.append((dim_ssa, False))
                 output_dim_sizes.append(src_dim_static)
+                
             elif isinstance(idx, fx.Node):
                 idx_ssa = self.ctx.node_values.get(idx.name, f"%{idx.name}")
                 
                 if 'sym_size' in idx.name:
-                    # Tile index as offset
-                    offsets_ssa.append(idx_ssa)
+                    # Tile index as offset (dynamic)
+                    offsets.append((idx_ssa, False))
                     
                     # Size from the value FakeTensor's shape
                     if value_fake_tensor is not None and i < value_fake_tensor.ndim:
                         dim_size = value_fake_tensor.size(i)
                         if hasattr(dim_size, '_sympy_'):
-                            size_ssa = resolve_symint_to_ssa(dim_size, i)
-                            sizes_ssa.append(size_ssa)
-                            output_dim_sizes.append(None)  # Dynamic
+                            size_val, is_static = resolve_symint(dim_size, i)
+                            sizes.append((size_val, is_static))
+                            output_dim_sizes.append(int(size_val) if is_static else None)
                         else:
-                            size_ssa = self.mlir_output_helper.fresh(f"size_dim{i}")
-                            self.mlir_output_helper.emit(f'{size_ssa} = arith.constant {int(dim_size)} : index')
-                            sizes_ssa.append(size_ssa)
-                            output_dim_sizes.append(int(dim_size))  # Static
+                            # Concrete int - use inline
+                            sizes.append((str(int(dim_size)), True))
+                            output_dim_sizes.append(int(dim_size))
                     else:
-                        sizes_ssa.append(idx_ssa)
+                        sizes.append((idx_ssa, False))
                         output_dim_sizes.append(None)
                         
                 elif 'block_size' in idx.name:
@@ -1063,48 +1054,31 @@ class IRVisitor:
                     
                     offset_ssa = self.mlir_output_helper.fresh("offset")
                     self.mlir_output_helper.emit(f'{offset_ssa} = arith.muli {iv_ssa}, {idx_ssa} : index')
-                    offsets_ssa.append(offset_ssa)
-                    sizes_ssa.append(idx_ssa)
+                    offsets.append((offset_ssa, False))
+                    sizes.append((idx_ssa, False))
                     output_dim_sizes.append(None)  # Dynamic (block sizes are runtime)
                 else:
-                    offsets_ssa.append(idx_ssa)
-                    size_ssa = self.mlir_output_helper.fresh("size")
-                    self.mlir_output_helper.emit(f'{size_ssa} = arith.constant 1 : index')
-                    sizes_ssa.append(size_ssa)
-                    output_dim_sizes.append(1)  # Static size 1
+                    # Generic index
+                    offsets.append((idx_ssa, False))
+                    sizes.append(("1", True))
+                    output_dim_sizes.append(1)
+                    
             elif isinstance(idx, int):
-                offset_ssa = self.mlir_output_helper.fresh("offset")
-                self.mlir_output_helper.emit(f'{offset_ssa} = arith.constant {idx} : index')
-                offsets_ssa.append(offset_ssa)
-                size_ssa = self.mlir_output_helper.fresh("size")
-                self.mlir_output_helper.emit(f'{size_ssa} = arith.constant 1 : index')
-                sizes_ssa.append(size_ssa)
-                output_dim_sizes.append(1)  # Static size 1
+                # Integer literal offset with size 1
+                offsets.append((str(idx), True))
+                sizes.append(("1", True))
+                output_dim_sizes.append(1)
             else:
-                offset_ssa = self.mlir_output_helper.fresh("offset")
-                self.mlir_output_helper.emit(f'{offset_ssa} = arith.constant 0 : index')
-                offsets_ssa.append(offset_ssa)
-                size_ssa = self.mlir_output_helper.fresh("size")
-                self.mlir_output_helper.emit(f'{size_ssa} = arith.constant 1 : index')
-                sizes_ssa.append(size_ssa)
-                output_dim_sizes.append(1)  # Static size 1
+                # Unknown type - default to 0 offset, size 1
+                offsets.append(("0", True))
+                sizes.append(("1", True))
+                output_dim_sizes.append(1)
         
         result = self.mlir_output_helper.fresh("inserted")
         
-        # Format as tensor.insert_slice
-        # For static dimensions, use the concrete value in sizes bracket (not SSA)
-        # For dynamic dimensions, use SSA values
-        sizes_formatted = []
-        for i, dim_size in enumerate(output_dim_sizes):
-            if dim_size is not None:
-                # Static dimension - use integer literal
-                sizes_formatted.append(str(dim_size))
-            else:
-                # Dynamic dimension - use SSA value
-                sizes_formatted.append(sizes_ssa[i])
-        
-        offsets_str = ", ".join(offsets_ssa)
-        sizes_str = ", ".join(sizes_formatted)
+        # Format offsets, sizes, strides - using inline literals or SSA values
+        offsets_str = ", ".join(v for v, _ in offsets)
+        sizes_str = ", ".join(v for v, _ in sizes)
         strides_str = ", ".join(["1"] * len(indices))
         
         # tensor.insert_slice %source into %dest[offsets][sizes][strides] : source_type into dest_type
