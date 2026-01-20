@@ -20,121 +20,6 @@ from torch._ops import OpOverload
 if TYPE_CHECKING:
     from .lowering_context import LoweringContext
 
-
-def synthesize_tensor_meta(val: torch.Tensor) -> dict:
-    """Synthesize tensor_meta dictionary from a tensor value.
-    
-    torch-mlir's FxImporter expects node.meta['tensor_meta'] with shape, dtype, etc.
-    This function creates that metadata from Helion's node.meta['val'].
-    
-    Args:
-        val: A torch.Tensor (may be real tensor, FakeTensor, or symbolic)
-        
-    Returns:
-        Dictionary with shape, dtype, requires_grad, stride, memory_format, is_quantized
-    """
-    # Get basic properties
-    shape = tuple(val.shape)
-    dtype = val.dtype
-    requires_grad = val.requires_grad if hasattr(val, 'requires_grad') else False
-    
-    # Get stride - handle symbolic tensors that may not have concrete strides
-    try:
-        stride = tuple(val.stride()) if val.dim() > 0 else ()
-    except (RuntimeError, NotImplementedError):
-        # Compute default contiguous strides
-        stride = []
-        acc = 1
-        for s in reversed(shape):
-            stride.insert(0, acc)
-            acc *= s if isinstance(s, int) else 1
-        stride = tuple(stride)
-    
-    # Memory format detection
-    is_channels_last = False
-    if val.dim() == 4:
-        try:
-            is_channels_last = val.is_contiguous(memory_format=torch.channels_last)
-        except (RuntimeError, NotImplementedError):
-            pass
-    memory_format = torch.channels_last if is_channels_last else torch.contiguous_format
-    
-    return {
-        'shape': shape,
-        'dtype': dtype,
-        'requires_grad': requires_grad,
-        'stride': stride,
-        'memory_format': memory_format,
-        'is_quantized': False,
-    }
-
-
-def normalize_helion_node(node: fx.Node) -> fx.Node:
-    """Normalize a Helion Device IR node for torch-mlir compatibility.
-    
-    Ensures the node has:
-    - 'val' as a proper meta tensor (not concrete tensor)
-    - 'tensor_meta' synthesized from 'val'
-    
-    Args:
-        node: FX node from Helion Device IR
-        
-    Returns:
-        The same node with normalized metadata (mutated in place)
-    """
-    from torch._subclasses.fake_tensor import FakeTensor
-    
-    if 'val' not in node.meta:
-        return node
-    
-    val = node.meta['val']
-    
-    # Handle tuple outputs (e.g., from max.dim)
-    if isinstance(val, tuple):
-        normalized_vals = []
-        tensor_metas = []
-        for v in val:
-            if isinstance(v, torch.Tensor):
-                if not isinstance(v, FakeTensor):
-                    # Convert to meta tensor
-                    meta_tensor = torch.empty(
-                        tuple(v.shape), 
-                        dtype=v.dtype, 
-                        device='meta'
-                    )
-                    normalized_vals.append(meta_tensor)
-                else:
-                    normalized_vals.append(v)
-                tensor_metas.append(synthesize_tensor_meta(v))
-            else:
-                normalized_vals.append(v)
-                tensor_metas.append(None)
-        node.meta['val'] = tuple(normalized_vals)
-        node.meta['tensor_meta'] = tuple(tensor_metas)
-        return node
-    
-    # Handle single tensor output
-    if isinstance(val, torch.Tensor):
-        # Synthesize tensor_meta if missing
-        if 'tensor_meta' not in node.meta:
-            node.meta['tensor_meta'] = synthesize_tensor_meta(val)
-        
-        # Convert to meta tensor if it's a concrete tensor
-        if not isinstance(val, FakeTensor):
-            try:
-                meta_tensor = torch.empty(
-                    tuple(val.shape),
-                    dtype=val.dtype,
-                    device='meta'
-                )
-                node.meta['val'] = meta_tensor
-            except (RuntimeError, TypeError):
-                # Keep original if conversion fails (e.g., symbolic shapes)
-                pass
-    
-    return node
-
-
 def get_aten_op_info(target: Any) -> tuple[str, str]:
 
     """Extract ATen operation name and overload from target.
@@ -400,8 +285,6 @@ def import_aten_node_to_mlir(
     Raises:
         RuntimeError: If torch-mlir fails to import/lower the node
     """
-    # Normalize the Helion node to have standard FX metadata
-    normalize_helion_node(node)
     
     # Create a fresh importer but use the cached context
     importer = TorchMLIRNodeImporter()
