@@ -40,7 +40,6 @@ from .ir_visitor import IRVisitor
 if TYPE_CHECKING:
     from helion._compiler.device_ir import RootGraphInfo, ForLoopGraphInfo
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 MLIR_OPT_CANDIDATES = [
     Path("/mnt/fast/llvm-mlir/bin/mlir-opt"),
     Path("/usr/bin/mlir-opt"),

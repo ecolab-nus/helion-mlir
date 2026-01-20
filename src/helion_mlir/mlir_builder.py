@@ -13,12 +13,6 @@ import torch
 if TYPE_CHECKING:
     pass
 
-# Import BlockSizeInfo types for symbolic size detection
-try:
-    from helion._compiler.compile_environment import AutoSize
-except ImportError:
-    AutoSize = None  # type: ignore[misc,assignment]
-
 
 class MLIRBuilder:
     """Helper class to manage indentation and SSA name creation for MLIR text emission."""

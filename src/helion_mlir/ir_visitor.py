@@ -69,9 +69,9 @@ class IRVisitor:
         self.loop_depth: int = 0  # Depth tracking for nested loops
         self.current_block_id: int | None = None  # Current loop's block_id for IV reference
         
-    def register_graph(self, graph_id: int, graph_info: "GraphInfo") -> None:
-        """Register a graph for later visitation (e.g., ForLoopGraphInfo)."""
-        self.ctx.graphs[graph_id] = graph_info
+    # def register_graph(self, graph_id: int, graph_info: "GraphInfo") -> None:
+    #     """Register a graph for later visitation (e.g., ForLoopGraphInfo)."""
+    #     self.ctx.graphs[graph_id] = graph_info
     
     def visit_graph(self, graph_info: "GraphInfo") -> None:
         """Visit all nodes in a graph in order."""
@@ -523,7 +523,7 @@ class IRVisitor:
         
         # Build iter_args string
         iter_args_parts = []
-        for (name, ssa, _), type_str in zip(iter_args_info, iter_args_types):
+        for (name, ssa, _), _ in zip(iter_args_info, iter_args_types):
             iter_args_parts.append(f"%{name} = {ssa}")
         iter_args_str = ", ".join(iter_args_parts)
         

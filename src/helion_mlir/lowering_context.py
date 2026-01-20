@@ -8,7 +8,6 @@ metadata, and mappings between FX nodes and MLIR SSA values.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Sequence
 
 from .mlir_builder import (
@@ -97,7 +96,6 @@ class LoweringContext:
                 self.loop_extents[info.block_id] = 1  # fallback
         
         # Mutable state that gets populated during lowering
-        self.symbols: dict[str, str] = {}
         self.host_tensors: dict[str, str] = {}
         
         # SSA Value Tracking (populated during graph walking by IRVisitor)
@@ -262,26 +260,6 @@ class LoweringContext:
 # -----------------------------------------------------------------------------
 # Helper functions
 # -----------------------------------------------------------------------------
-
-# def first_debug_name(names: set[str], *, fallback: str) -> str:
-#     """Get the first debug name from a set, sanitizing for MLIR."""
-#     for name in names:
-#         if name:
-#             return name.replace(".", "_").replace("-", "_")
-#     return fallback
-
-def resolve_extent(name: str, lhs: "Tensor", rhs: "Tensor") -> int:
-    """Resolve the extent for a named dimension."""
-    if name in {"tile_m", "m"}:
-        return int(lhs.size(0))
-    if name in {"tile_b", "b"}:
-        return int(lhs.size(0))
-    if name in {"tile_n", "n"}:
-        return int(rhs.size(1))
-    if name in {"tile_k", "k"}:
-        return int(lhs.size(1))
-    raise ValueError(f"Cannot resolve extent for loop named '{name}'.")
-
 
 def collect_reduction_block_ids(device_ir: "DeviceIR") -> list[int]:
     """Collect all block IDs that are used in reduction loops."""
