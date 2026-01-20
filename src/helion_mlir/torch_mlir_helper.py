@@ -598,18 +598,50 @@ def inline_torch_mlir_output(
             rhs = line[first_eq+1:].strip()
             
             if lhs.startswith("%"):
-                # LHS is SSA definition
+                # LHS is SSA definition - handle multiple results
+                # Cases: "%0 = op", "%0, %1 = op", "%0:2 = op"
                 lhs_vars = [x.strip() for x in lhs.split(",")]
                 new_lhs_vars = []
+                num_results = len(lhs_vars)
+                
                 for v in lhs_vars:
                     if v.startswith("%"):
-                        fresh = builder.fresh("t")
-                        ssa_map[v] = fresh
-                        new_lhs_vars.append(fresh)
+                        # Check for :N suffix (e.g., %0:2)
+                        if ":" in v:
+                            base_var, count_str = v.rsplit(":", 1)
+                            if count_str.isdigit():
+                                # This is a multi-result binding like %0:2
+                                num_results = int(count_str)
+                                fresh = builder.fresh("t")
+                                ssa_map[base_var] = fresh
+                                # Also map the indexed versions %0#0, %0#1, etc.
+                                for idx in range(num_results):
+                                    ssa_map[f"{base_var}#{idx}"] = f"{fresh}#{idx}"
+                                new_lhs_vars.append(f"{fresh}:{num_results}")
+                            else:
+                                # Not a count suffix, treat as regular var with type annotation
+                                fresh = builder.fresh("t")
+                                ssa_map[v.split(":")[0]] = fresh
+                                new_lhs_vars.append(fresh)
+                        else:
+                            fresh = builder.fresh("t")
+                            ssa_map[v] = fresh
+                            new_lhs_vars.append(fresh)
                     else:
                         new_lhs_vars.append(v)
                 
-                new_lhs = ", ".join(new_lhs_vars)
+                # If we have multiple individual result vars, use :N notation
+                if len(lhs_vars) > 1 and not any(":" in v for v in new_lhs_vars):
+                    # Multiple comma-separated results: %0, %1 = op
+                    # Emit as single binding with :N suffix for cleaner MLIR
+                    base_fresh = new_lhs_vars[0]
+                    for idx, orig_var in enumerate(lhs_vars):
+                        if orig_var.startswith("%"):
+                            ssa_map[orig_var] = f"{base_fresh}#{idx}"
+                    new_lhs = f"{base_fresh}:{len(lhs_vars)}"
+                else:
+                    new_lhs = ", ".join(new_lhs_vars)
+                
                 new_rhs = replace_ssas(rhs, ssa_map)
                 new_rhs = replace_affine_maps(new_rhs)
                 

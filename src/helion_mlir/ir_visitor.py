@@ -67,6 +67,7 @@ class IRVisitor:
         self.loop_iter_args: dict[str, str] = {}  # placeholder name → SSA (per loop context)
         self.current_loop_result: str | list[str] | None = None  # Set by inner graph output
         self.loop_depth: int = 0  # Depth tracking for nested loops
+        self.current_block_id: int | None = None  # Current loop's block_id for IV reference
         
     def register_graph(self, graph_id: int, graph_info: "GraphInfo") -> None:
         """Register a graph for later visitation (e.g., ForLoopGraphInfo)."""
@@ -298,13 +299,34 @@ class IRVisitor:
         
         dtype_str = torch_dtype_to_mlir_element_type(dtype) if dtype else "f32"
         
-        # Generate dynamic tensor type with correct number of dimensions
-        dim_wildcards = "x".join(["?"] * len(shape_ssa))
-        tensor_type = f"tensor<{dim_wildcards}x{dtype_str}>"
+        # Use FakeTensor metadata to determine tensor type with correct dimensions
+        # This preserves concrete dimensions (e.g., 128 for head_dim) instead of using '?' for all
+        fake_tensor = node.meta.get("val")
+        if fake_tensor is not None and hasattr(fake_tensor, "shape"):
+            tensor_type = self.ctx.compute_mlir_type_from_fake_tensor(fake_tensor, dtype_str)
+        else:
+            # Fallback: all dynamic dimensions
+            dim_wildcards = "x".join(["?"] * len(shape_ssa))
+            tensor_type = f"tensor<{dim_wildcards}x{dtype_str}>"
         
         # Step 1: Emit tensor.empty
+        # Only include SSA values for dynamic dimensions (?)
+        # Parse tensor_type to find dynamic dimensions
+        if 'tensor<' in tensor_type:
+            type_content = tensor_type[tensor_type.find('<')+1 : tensor_type.rfind('>')]
+            if 'x' in type_content:
+                dims = type_content.split('x')[:-1]  # Exclude element type
+                # Filter shape_ssa to only include values for dynamic dimensions
+                dynamic_shape_ssa = [
+                    ssa for ssa, dim in zip(shape_ssa, dims) if dim == '?'
+                ]
+            else:
+                dynamic_shape_ssa = shape_ssa
+        else:
+            dynamic_shape_ssa = shape_ssa
+        
         empty_ssa = self.builder.fresh("empty")
-        shape_str = ", ".join(shape_ssa)
+        shape_str = ", ".join(dynamic_shape_ssa)
         self.builder.emit(f'{empty_ssa} = tensor.empty({shape_str}) : {tensor_type}')
         
         # Step 2: Emit fill value constant
@@ -372,13 +394,34 @@ class IRVisitor:
         
         dtype_str = torch_dtype_to_mlir_element_type(dtype) if dtype else "f32"
         
-        # Generate dynamic tensor type with correct number of dimensions
-        dim_wildcards = "x".join(["?"] * len(shape_ssa))
-        tensor_type = f"tensor<{dim_wildcards}x{dtype_str}>"
+        # Use FakeTensor metadata to determine tensor type with correct dimensions
+        # This preserves concrete dimensions (e.g., 128 for head_dim) instead of using '?' for all
+        fake_tensor = node.meta.get("val")
+        if fake_tensor is not None and hasattr(fake_tensor, "shape"):
+            tensor_type = self.ctx.compute_mlir_type_from_fake_tensor(fake_tensor, dtype_str)
+        else:
+            # Fallback: all dynamic dimensions
+            dim_wildcards = "x".join(["?"] * len(shape_ssa))
+            tensor_type = f"tensor<{dim_wildcards}x{dtype_str}>"
         
         # Step 1: Emit tensor.empty
+        # Only include SSA values for dynamic dimensions (?)
+        # Parse tensor_type to find dynamic dimensions
+        if 'tensor<' in tensor_type:
+            type_content = tensor_type[tensor_type.find('<')+1 : tensor_type.rfind('>')]
+            if 'x' in type_content:
+                dims = type_content.split('x')[:-1]  # Exclude element type
+                # Filter shape_ssa to only include values for dynamic dimensions
+                dynamic_shape_ssa = [
+                    ssa for ssa, dim in zip(shape_ssa, dims) if dim == '?'
+                ]
+            else:
+                dynamic_shape_ssa = shape_ssa
+        else:
+            dynamic_shape_ssa = shape_ssa
+        
         empty_ssa = self.builder.fresh("empty")
-        shape_str = ", ".join(shape_ssa)
+        shape_str = ", ".join(dynamic_shape_ssa)
         self.builder.emit(f'{empty_ssa} = tensor.empty({shape_str}) : {tensor_type}')
         
         # Step 2: Emit fill value constant
@@ -530,8 +573,15 @@ class IRVisitor:
         
         self.loop_depth += 1
         
+        # Set current block_id for visit_load to reference the correct IV
+        old_block_id = self.current_block_id
+        self.current_block_id = block_id
+        
         # Visit inner graph
         self.visit_graph(for_graph)
+        
+        # Restore old block_id
+        self.current_block_id = old_block_id
         
         self.loop_depth -= 1
         
@@ -738,8 +788,10 @@ class IRVisitor:
             raise ValueError(f"Cannot resolve SymInt {sym} for dimension {dim_hint}")
         
         # Collect offset and size SSA values for each dimension
+        # Track which dimensions have static sizes (for result type construction)
         offsets_ssa = []
         sizes_ssa = []
+        output_dim_sizes = []  # Store (static_size | None) for each dim
         
         for i, idx in enumerate(indices):
             if isinstance(idx, slice):
@@ -749,11 +801,25 @@ class IRVisitor:
                 offsets_ssa.append(zero_ssa)
                 
                 # Get dimension size from tensor
+                # Check if source tensor's dimension is static
+                src_dim_static = None
+                if 'tensor<' in tensor_type:
+                    type_content = tensor_type[tensor_type.find('<')+1 : tensor_type.rfind('>')]
+                    if 'x' in type_content:
+                        src_dims = type_content.split('x')[:-1]
+                        if i < len(src_dims):
+                            if src_dims[i] != '?':
+                                try:
+                                    src_dim_static = int(src_dims[i])
+                                except ValueError:
+                                    pass
+                
                 dim_ssa = self.builder.fresh("dim")
                 dim_idx_ssa = self.builder.fresh("dim_idx")
                 self.builder.emit(f'{dim_idx_ssa} = arith.constant {i} : index')
                 self.builder.emit(f'{dim_ssa} = tensor.dim {tensor_ssa}, {dim_idx_ssa} : {tensor_type}')
                 sizes_ssa.append(dim_ssa)
+                output_dim_sizes.append(src_dim_static)  # Preserve static size
             elif isinstance(idx, fx.Node):
                 # Get the SSA value for this index (offset)
                 idx_ssa = self.ctx.node_values.get(idx.name, f"%{idx.name}")
@@ -770,21 +836,28 @@ class IRVisitor:
                         if hasattr(dim_size, '_sympy_'):
                             # It's a SymInt, resolve via Origin
                             size_ssa = resolve_symint_to_ssa(dim_size, i)
+                            output_dim_sizes.append(None)  # Dynamic
                         else:
                             # Concrete int
                             size_ssa = self.builder.fresh(f"size_dim{i}")
                             self.builder.emit(f'{size_ssa} = arith.constant {int(dim_size)} : index')
+                            output_dim_sizes.append(int(dim_size))  # Static
                         sizes_ssa.append(size_ssa)
                     else:
                         # Fallback: use idx_ssa as size (shouldn't happen with proper metadata)
                         sizes_ssa.append(idx_ssa)
+                        output_dim_sizes.append(None)
                         
                 elif 'block_size' in idx.name:
                     # block_size node indicates the tile size for this dimension
                     # The offset comes from the corresponding loop IV
                     
-                    # Get the current loop IV
-                    if hasattr(self, 'current_loop_ivs') and i < len(self.current_loop_ivs):
+                    # Determine which block_id this index corresponds to
+                    # For reduction loops, use current_block_id; for parallel, use position
+                    if self.current_block_id is not None:
+                        # Inside a reduction loop - use the current block's IV
+                        iv_ssa = f"%iv_block{self.current_block_id}"
+                    elif hasattr(self, 'current_loop_ivs') and i < len(self.current_loop_ivs):
                         iv_ssa = self.current_loop_ivs[i]
                     else:
                         iv_ssa = f"%iv_block{i}"
@@ -796,12 +869,14 @@ class IRVisitor:
                     )
                     offsets_ssa.append(offset_ssa)
                     sizes_ssa.append(idx_ssa)
+                    output_dim_sizes.append(None)  # Dynamic (block sizes are runtime)
                 else:
                     # Generic index - treat as offset with unknown size
                     offsets_ssa.append(idx_ssa)
                     size_ssa = self.builder.fresh("size")
                     self.builder.emit(f'{size_ssa} = arith.constant 1 : index')
                     sizes_ssa.append(size_ssa)
+                    output_dim_sizes.append(1)  # Static size 1
             elif isinstance(idx, int):
                 # Integer literal offset
                 offset_ssa = self.builder.fresh("offset")
@@ -810,6 +885,7 @@ class IRVisitor:
                 size_ssa = self.builder.fresh("size")
                 self.builder.emit(f'{size_ssa} = arith.constant 1 : index')
                 sizes_ssa.append(size_ssa)
+                output_dim_sizes.append(1)  # Static size 1
             else:
                 # Fallback
                 offset_ssa = self.builder.fresh("offset")
@@ -818,35 +894,26 @@ class IRVisitor:
                 size_ssa = self.builder.fresh("size")
                 self.builder.emit(f'{size_ssa} = arith.constant 1 : index')
                 sizes_ssa.append(size_ssa)
+                output_dim_sizes.append(1)  # Static size 1
         
         result = self.builder.fresh("slice")
         
-        # Infer result type based on input tensor type and indexing
-        # For slice(None, None, None), preserve the input's dimension size
-        # For other indices (block_size, sym_size), use dynamic '?'
+        # Construct result type using tracked dimension sizes
+        # Static dimensions use the concrete value, dynamic use '?'
         if 'tensor<' in tensor_type and '>' in tensor_type:
-            # Extract content between <>
+            # Extract dtype from input type
             content = tensor_type[tensor_type.find('<')+1 : tensor_type.rfind('>')]
             if 'x' in content:
-                parts = content.split('x')
-                dtype_str = parts[-1]
-                input_dims = parts[:-1]  # List of dim sizes from input type
+                dtype_str = content.split('x')[-1]
             else:
-                # 0-D tensor
                 dtype_str = content
-                input_dims = []
             
-            # Determine output dimensions based on indices
+            # Build output dimensions
             output_dims = []
-            for i, idx in enumerate(indices):
-                if isinstance(idx, slice) and idx == slice(None, None, None):
-                    # Full slice - preserve input dimension if known
-                    if i < len(input_dims):
-                        output_dims.append(input_dims[i])
-                    else:
-                        output_dims.append("?")
+            for dim_size in output_dim_sizes:
+                if dim_size is not None:
+                    output_dims.append(str(dim_size))
                 else:
-                    # Block size or sym_size index - dimension becomes dynamic
                     output_dims.append("?")
             
             # Construct result type
@@ -860,10 +927,20 @@ class IRVisitor:
         self.ctx.node_types[node.name] = result_type
         
         # Format as tensor.extract_slice
-        rank = len(indices)
+        # For static dimensions, use the concrete value in sizes bracket (not SSA)
+        # For dynamic dimensions, use SSA values
+        sizes_formatted = []
+        for i, dim_size in enumerate(output_dim_sizes):
+            if dim_size is not None:
+                # Static dimension - use integer literal
+                sizes_formatted.append(str(dim_size))
+            else:
+                # Dynamic dimension - use SSA value
+                sizes_formatted.append(sizes_ssa[i])
+        
         offsets_str = ", ".join(offsets_ssa)
-        sizes_str = ", ".join(sizes_ssa)
-        strides_str = ", ".join(["1"] * rank)
+        sizes_str = ", ".join(sizes_formatted)
+        strides_str = ", ".join(["1"] * len(indices))
         
         # Use tensor.extract_slice syntax
         self.builder.emit(
@@ -921,8 +998,10 @@ class IRVisitor:
             raise ValueError(f"Cannot resolve SymInt {sym} for dimension {dim_hint}")
         
         # Collect offset and size SSA values for each dimension
+        # Track which dimensions have static sizes (for size bracket formatting)
         offsets_ssa = []
         sizes_ssa = []
+        output_dim_sizes = []  # Store (static_size | None) for each dim
         
         for i, idx in enumerate(indices):
             if isinstance(idx, slice):
@@ -931,12 +1010,26 @@ class IRVisitor:
                 self.builder.emit(f'{zero_ssa} = arith.constant 0 : index')
                 offsets_ssa.append(zero_ssa)
                 
+                # Check if value tensor's dimension is static
+                src_dim_static = None
+                if 'tensor<' in value_type:
+                    type_content = value_type[value_type.find('<')+1 : value_type.rfind('>')]
+                    if 'x' in type_content:
+                        src_dims = type_content.split('x')[:-1]
+                        if i < len(src_dims):
+                            if src_dims[i] != '?':
+                                try:
+                                    src_dim_static = int(src_dims[i])
+                                except ValueError:
+                                    pass
+                
                 # Get dimension size from value tensor
                 dim_ssa = self.builder.fresh("dim")
                 dim_idx_ssa = self.builder.fresh("dim_idx")
                 self.builder.emit(f'{dim_idx_ssa} = arith.constant {i} : index')
                 self.builder.emit(f'{dim_ssa} = tensor.dim {value_ssa}, {dim_idx_ssa} : {value_type}')
                 sizes_ssa.append(dim_ssa)
+                output_dim_sizes.append(src_dim_static)
             elif isinstance(idx, fx.Node):
                 idx_ssa = self.ctx.node_values.get(idx.name, f"%{idx.name}")
                 
@@ -949,12 +1042,16 @@ class IRVisitor:
                         dim_size = value_fake_tensor.size(i)
                         if hasattr(dim_size, '_sympy_'):
                             size_ssa = resolve_symint_to_ssa(dim_size, i)
+                            sizes_ssa.append(size_ssa)
+                            output_dim_sizes.append(None)  # Dynamic
                         else:
                             size_ssa = self.builder.fresh(f"size_dim{i}")
                             self.builder.emit(f'{size_ssa} = arith.constant {int(dim_size)} : index')
-                        sizes_ssa.append(size_ssa)
+                            sizes_ssa.append(size_ssa)
+                            output_dim_sizes.append(int(dim_size))  # Static
                     else:
                         sizes_ssa.append(idx_ssa)
+                        output_dim_sizes.append(None)
                         
                 elif 'block_size' in idx.name:
                     # block_size indicates the tile size, compute offset
@@ -967,11 +1064,13 @@ class IRVisitor:
                     self.builder.emit(f'{offset_ssa} = arith.muli {iv_ssa}, {idx_ssa} : index')
                     offsets_ssa.append(offset_ssa)
                     sizes_ssa.append(idx_ssa)
+                    output_dim_sizes.append(None)  # Dynamic (block sizes are runtime)
                 else:
                     offsets_ssa.append(idx_ssa)
                     size_ssa = self.builder.fresh("size")
                     self.builder.emit(f'{size_ssa} = arith.constant 1 : index')
                     sizes_ssa.append(size_ssa)
+                    output_dim_sizes.append(1)  # Static size 1
             elif isinstance(idx, int):
                 offset_ssa = self.builder.fresh("offset")
                 self.builder.emit(f'{offset_ssa} = arith.constant {idx} : index')
@@ -979,6 +1078,7 @@ class IRVisitor:
                 size_ssa = self.builder.fresh("size")
                 self.builder.emit(f'{size_ssa} = arith.constant 1 : index')
                 sizes_ssa.append(size_ssa)
+                output_dim_sizes.append(1)  # Static size 1
             else:
                 offset_ssa = self.builder.fresh("offset")
                 self.builder.emit(f'{offset_ssa} = arith.constant 0 : index')
@@ -986,14 +1086,25 @@ class IRVisitor:
                 size_ssa = self.builder.fresh("size")
                 self.builder.emit(f'{size_ssa} = arith.constant 1 : index')
                 sizes_ssa.append(size_ssa)
+                output_dim_sizes.append(1)  # Static size 1
         
         result = self.builder.fresh("inserted")
         
         # Format as tensor.insert_slice
-        rank = len(indices)
+        # For static dimensions, use the concrete value in sizes bracket (not SSA)
+        # For dynamic dimensions, use SSA values
+        sizes_formatted = []
+        for i, dim_size in enumerate(output_dim_sizes):
+            if dim_size is not None:
+                # Static dimension - use integer literal
+                sizes_formatted.append(str(dim_size))
+            else:
+                # Dynamic dimension - use SSA value
+                sizes_formatted.append(sizes_ssa[i])
+        
         offsets_str = ", ".join(offsets_ssa)
-        sizes_str = ", ".join(sizes_ssa)
-        strides_str = ", ".join(["1"] * rank)
+        sizes_str = ", ".join(sizes_formatted)
+        strides_str = ", ".join(["1"] * len(indices))
         
         # tensor.insert_slice %source into %dest[offsets][sizes][strides] : source_type into dest_type
         self.builder.emit(
@@ -1017,12 +1128,17 @@ class IRVisitor:
         source_ssa = self.ctx.node_values.get(source.name, f"%{source.name}") if isinstance(source, fx.Node) else str(source)
         
         # Check if this is extracting from a multi-value loop result
-        if hasattr(self, '_loop_result_values') and isinstance(source, fx.Node):
-            if source.name in self.ctx.loop_result_values:
-                # Multi-value loop result - use #index syntax
-                result_ssa = f"{source_ssa}#{index}"
-                self.ctx.node_values[node.name] = result_ssa
-                return result_ssa
+        if isinstance(source, fx.Node) and source.name in self.ctx.loop_result_values:
+            # Multi-value loop result - use #index syntax
+            result_ssa = f"{source_ssa}#{index}"
+            self.ctx.node_values[node.name] = result_ssa
+            
+            # Also register the tensor type from FakeTensor metadata
+            if 'val' in node.meta:
+                tensor_type = self.ctx.compute_mlir_type_from_fake_tensor(node.meta['val'])
+                self.ctx.node_types[node.name] = tensor_type
+            
+            return result_ssa
         
         # For single-return loops, just use the result directly
         self.ctx.node_values[node.name] = source_ssa
@@ -1205,15 +1321,42 @@ class IRVisitor:
                 
             reassoc_str = "[" + ", ".join(["[" + ", ".join(map(str, grp)) + "]" for grp in reassoc_list]) + "]"
             
-            # Result type
-            res_rank = len(output_dim_types)
-            dims_str = "x".join(["?"] * res_rank)
+            # Result type - use '1' for new dimensions (from None), '?' for real dimensions
+            result_dims = []
+            for dtype in output_dim_types:
+                if dtype == 'new':
+                    result_dims.append("1")  # New dimensions from None are always size 1
+                else:
+                    result_dims.append("?")  # Real dimensions are dynamic
+            dims_str = "x".join(result_dims)
             result_type = f"tensor<{dims_str}xf32>"
             
             result_expand = self.builder.fresh("expand")
             
+            # Compute output_shape for dynamic dimensions
+            # For each output dimension, we need its size as an SSA value
+            output_shape_ssas = []
+            extracted_dim_idx = 0  # Track which dimension of extracted_ssa we're on
+            for i, dtype in enumerate(output_dim_types):
+                if dtype == 'new':
+                    # New dimension from None - always size 1
+                    one_ssa = self.builder.fresh("one")
+                    self.builder.emit(f'{one_ssa} = arith.constant 1 : index')
+                    output_shape_ssas.append(one_ssa)
+                else:
+                    # Real dimension - get from source tensor
+                    dim_idx_ssa = self.builder.fresh("dim_idx")
+                    dim_ssa = self.builder.fresh("dim")
+                    self.builder.emit(f'{dim_idx_ssa} = arith.constant {extracted_dim_idx} : index')
+                    self.builder.emit(f'{dim_ssa} = tensor.dim {extracted_ssa}, {dim_idx_ssa} : {extracted_type}')
+                    output_shape_ssas.append(dim_ssa)
+                    extracted_dim_idx += 1
+            
+            output_shape_str = "[" + ", ".join(output_shape_ssas) + "]"
+            
             self.builder.emit(
-                f'{result_expand} = tensor.expand_shape {extracted_ssa} {reassoc_str} : '
+                f'{result_expand} = tensor.expand_shape {extracted_ssa} {reassoc_str} '
+                f'output_shape {output_shape_str} : '
                 f'{extracted_type} into {result_type}'
             )
             
