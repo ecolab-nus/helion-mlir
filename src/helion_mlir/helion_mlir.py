@@ -206,34 +206,42 @@ def generate_mlir(
         # Emit nested affine.parallel
         
         # Collect loop bounds
-        lower_bounds = []
-        upper_bounds = []
-        steps = []
+        ub_ssas = []
         iv_names = []
         
         for block_id in ctx.parallel_block_ids:
             info = ctx.env.block_sizes[block_id]
             total_extent = ctx.loop_extents[block_id]
             
-            # 0 to total_extent (M/N) with step tile_size
-            lower_bounds.append("0")
-            upper_bounds.append(str(total_extent))
-            
+            # 0 to ceil(total / tile_size)
             if isinstance(info.size, int):
-                 steps.append(str(info.size))
+                val = math.ceil(total_extent / info.size)
+                ssa = builder.fresh("trip_count")
+                builder.emit(f'{ssa} = arith.constant {val} : index')
+                ub_ssas.append(ssa)
             else:
-                 steps.append("1") # fallback step for symbolic (or symbolic constant if we had it)
+                # Symbolic: ceil_div(total, tile_size)
+                size_ssa = ctx.block_size_ssa[block_id]
+                trip_ssa = builder.fresh("trip_count")
+                
+                # Use affine.apply to compute trip count with map
+                builder.emit(
+                    f'{trip_ssa} = affine.apply '
+                    f'affine_map<()[s0] -> ({total_extent} ceildiv s0)>()[{size_ssa}]'
+                )
+                ub_ssas.append(trip_ssa)
                  
             iv_names.append(f"%iv_block{block_id}")
         
         # Format parallel loop
-        lb_str = "(" + ", ".join(lower_bounds) + ")"
-        ub_str = "(" + ", ".join(upper_bounds) + ")"
-        step_str = "(" + ", ".join(steps) + ")"
+        # Lower bound: (0, 0, ...)
+        lb_str = "(" + ", ".join(["0"] * len(iv_names)) + ")"
+        # Upper bound: (%trip0, %trip1, ...)
+        ub_str = "(" + ", ".join(ub_ssas) + ")"
         iv_str = ", ".join(iv_names)
         
         builder.emit(
-            f"affine.parallel ({iv_str}) = {lb_str} to {ub_str} step {step_str} {{"
+            f"affine.parallel ({iv_str}) = {lb_str} to {ub_str} {{"
         )
         builder.push()
         
