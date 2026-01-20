@@ -29,7 +29,6 @@ class TorchMLIRNodeImporter:
     
     def __init__(self):
         """Initialize the importer."""
-        self.output_type = "linalg-on-tensors"
         self._context = None
         self._importer = None
         
@@ -90,7 +89,7 @@ class TorchMLIRNodeImporter:
         # Lower to target dialect (torch backend IR -> linalg/tosa/stablehlo)
         module = lower_mlir_module(
             False,  # verbose
-            OutputType.get(self.output_type),
+            OutputType.get("linalg-on-tensors"),
             module
         )
         
