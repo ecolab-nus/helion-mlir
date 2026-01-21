@@ -113,21 +113,6 @@ def check(m: int, k: int, n: int) -> None:
     # Test without bias
     run_example(matmul, torch.matmul, (x, y))
 
-    # Test addmm forward + backward with different alpha/beta values
-    print("\n\n=== AddMM Forward + Backward Test (Alpha=2.0, Beta=0.5) ===")
-    run_example(
-        addmm_autograd,
-        lambda bias, mat1, mat2, alpha, beta: torch.addmm(
-            bias, mat1, mat2, alpha=alpha, beta=beta
-        ),
-        (input_grad, mat1_grad, mat2_grad, 2.0, 0.5),
-        kernel_name="helion_addmm_autograd_scaled",
-        baseline_name="torch",
-        rtol=1e-2,
-        atol=1e-2,
-        bwd=True,
-    )
-
 
 def main() -> None:
     """
@@ -138,7 +123,7 @@ def main() -> None:
     y = torch.randn([k, n], device="cpu", dtype=torch.float32)
     bound_kernel = matmul.bind((x, y))
 
-    print_debug_info(bound_kernel, cleanup=False)
+    print_debug_info(bound_kernel)
 
 
 

@@ -6,7 +6,7 @@ This document describes the software architecture of the `helion_mlir` package, 
 
 The `helion_mlir` package uses a **visitor pattern** to walk Device IR FX graphs node-by-node. It generates:
 1. **Standard MLIR dialects** (`tensor`, `affine`, `linalg`, `arith`) for Helion-specific operations
-2. **Torch dialect** (`torch.aten.*`) via **torch-mlir** for ATen operations
+2. **Linalg dialect** (`linalg.generic`, `linalg.fill`, etc.) via **torch-mlir** for ATen operations
 
 ### High-Level Architecture
 
@@ -29,10 +29,10 @@ The `helion_mlir` package uses a **visitor pattern** to walk Device IR FX graphs
                                     │
                     ┌───────────────┼───────────────┐
                     ▼               ▼               ▼
-            ┌───────────┐   ┌──────────────┐   ┌──────────────┐
-            │ IRVisitor │   │LoweringContext│  │  MLIRBuilder │
-            │  (Walk)   │   │   (State)     │  │  (Emission)  │
-            └───────────┘   └──────────────┘   └──────────────┘
+            ┌───────────┐   ┌──────────────┐   ┌────────────────┐
+            │ IRVisitor │   │LoweringContext│  │MLIROutputHelper│
+            │  (Walk)   │   │   (State)     │  │  (Emission)    │
+            └───────────┘   └──────────────┘   └────────────────┘
                     │                               │
         ┌───────────┴────────────────────┬──────────┘
         │                                │
@@ -56,11 +56,12 @@ The `helion_mlir` package uses a **visitor pattern** to walk Device IR FX graphs
 ```
 src/helion_mlir/
 ├── __init__.py              # Public API exports
-├── helion_mlir.py           # Main entry: generate_mlir(), validate_with_mlir_opt()
+├── helion_mlir.py           # Main entry: generate_mlir()
 ├── ir_visitor.py            # IRVisitor: walks FX graphs, dispatches to visit_* methods
 ├── lowering_context.py      # LoweringContext: state (loops, args, SSA mappings)
 ├── mlir_utils.py            # MLIROutputHelper: text emission, SSA naming, indentation
-└── torch_mlir_helper.py     # torch-mlir integration for ATen ops
+├── torch_mlir_helper.py     # torch-mlir integration for ATen ops
+└── debug_utils.py           # Debug utilities, MLIR validation (validate_with_mlir_opt)
 ```
 
 ---
@@ -73,7 +74,6 @@ src/helion_mlir/
 
 **Key Functions**:
 - `generate_mlir(bound_kernel, kernel_name)` → MLIR text
-- `validate_with_mlir_opt(mlir_text)` → validates via `mlir-opt -allow-unregistered-dialect`
 - `_collect_host_tensor_names()` → pre-scans graphs for tensor function parameters
 
 ### 2. `ir_visitor.py` — Graph Walker
@@ -155,10 +155,10 @@ class LoweringContext:
 
 **Key Components**:
 - `TorchMLIRNodeImporter`: Wraps FxImporter to import individual nodes
-- `import_aten_node_to_mlir(node)`: Main entry for ATen conversion
+- `import_aten_node_to_mlir(node)`: Main entry for ATen conversion, returns linalg-on-tensors MLIR
 - `inline_torch_mlir_output(mlir_text, operands, builder)`: Extracts ops from torch-mlir module and inlines into current builder with SSA renaming
 
-**Output**: Torch dialect ops (`torch.aten.*`) that can optionally be lowered further via torch-mlir pipelines.
+**Output**: Linalg-on-tensors ops (`linalg.generic`, `linalg.fill`, `linalg.matmul`, etc.) that integrate directly with the tensor dialect.
 
 ---
 
@@ -239,7 +239,7 @@ This section details the information held by `LoweringContext` and how `IRVisito
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `builder` | `MLIRBuilder` | Shared builder for MLIR text emission. IRVisitor accesses this to emit operations via `self.ctx.builder.emit()`, `self.ctx.builder.fresh()`, etc. |
+| `builder` | `MLIROutputHelper` | Shared builder for MLIR text emission. IRVisitor accesses this to emit operations via `self.ctx.mlir_output_helper.emit()`, `self.ctx.mlir_output_helper.fresh()`, etc. |
 | `bound_kernel` | `BoundKernel` | The source Helion kernel containing `fake_args`, `env`, and `host_function`. |
 
 #### Type Information

@@ -311,7 +311,14 @@ def inline_torch_mlir_output(
         The SSA value of the result.
     """
     lines = mlir_text.splitlines()
-    ssa_map = {}
+    ssa_map = {}  # Maps original SSA values to renamed ones
+    
+    # -------------------------------------------------------------------------
+    # PASS 1: Collect and rename affine map aliases
+    # -------------------------------------------------------------------------
+    # Torch-mlir emits affine_map definitions like: #map = affine_map<...>
+    # We inline these definitions directly where they're used to avoid 
+    # namespace collisions when multiple ATen ops are inlined.
     
     # Track affine map aliases to inline them
     affine_map_aliases = {}  # old_alias -> (new_alias, affine_map_def)
@@ -343,7 +350,11 @@ def inline_torch_mlir_output(
             text = re.sub(pattern, affine_map_def, text)
         return text
     
-    # 2. Map function arguments
+    # -------------------------------------------------------------------------
+    # PASS 2: Map function arguments to caller's SSA values
+    # -------------------------------------------------------------------------
+    # torch-mlir's generated function has args like %arg0, %arg1, ...
+    # We need to replace these with the caller's operand SSA values.
     for i, op in enumerate(operands):
         ssa_map[f"%arg{i}"] = op
         
@@ -357,13 +368,18 @@ def inline_torch_mlir_output(
             return mapping.get(full, full)
         return ssa_pattern.sub(repl, text)
     
+    # -------------------------------------------------------------------------
+    # OPTIMIZATION: Deferred arith.constant emission for tensor.dim
+    # -------------------------------------------------------------------------
+    # When dimension_ssa_map is provided, we can replace tensor.dim operations
+    # with pre-existing SSA values. The arith.constant ops that generate the
+    # dimension indices are deferred and only emitted if actually needed.
+    #
     # Track arith.constant values for tensor.dim index resolution
-    # Maps SSA name (e.g., "%0") to integer value
-    const_index_values = {}
+    const_index_values = {}  # SSA name (e.g., "%0") -> integer value
     
-    # Deferred arith.constant emissions - only emit if not consumed by optimized tensor.dim
-    # Maps original SSA name to (fresh_name, rhs_text)
-    deferred_const_emissions = {}
+    # Deferred arith.constant emissions - only emit if not consumed by tensor.dim
+    deferred_const_emissions = {}  # original SSA name -> (fresh_name, rhs_text)
 
     # Find function body start and end
     func_start_idx = 0
@@ -386,7 +402,9 @@ def inline_torch_mlir_output(
             
     result_ssa = None
     
-    # Process lines within the function body
+    # -------------------------------------------------------------------------
+    # PASS 3: Process function body lines and rename SSA values
+    # -------------------------------------------------------------------------
     i = func_start_idx
     while i < func_end_idx:
         line = lines[i].strip()
@@ -444,7 +462,9 @@ def inline_torch_mlir_output(
             mlir_output_helper.emit(new_line)
             continue
 
-        # Handle Assignment (lines with '=' that define SSA values)
+        # =====================================================================
+        # Handle Assignment lines (SSA definitions with '=')
+        # =====================================================================
         if "=" in line and not line.startswith("cf.assert"):
             # Check if the '=' is part of an SSA assignment (not inside attribute syntax like '=')
             # Simple heuristic: if line starts with '%', it's an SSA assignment
@@ -509,7 +529,10 @@ def inline_torch_mlir_output(
                         fresh_name, const_rhs = deferred_const_emissions.pop(const_ssa_ref)
                         mlir_output_helper.emit(f"{fresh_name} = {const_rhs}")
                 
-                # Normal SSA assignment processing
+                # ---------------------------------------------------------
+                # Normal SSA assignment processing: generate fresh names 
+                # and handle multi-result bindings (e.g., %0:2 = op)
+                # ---------------------------------------------------------
                 new_lhs_vars = []
                 num_results = len(lhs_vars)
                 

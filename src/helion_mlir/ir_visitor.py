@@ -4,15 +4,15 @@ This module implements a visitor pattern for converting Helion Device IR
 to MLIR by walking FX graph nodes instruction-by-instruction.
 
 The visitor dispatches to specific handlers based on the node's target:
-- _get_symnode -> loom.get_symbol
+- _get_symnode -> SSA lookup via Origin (BlockSizeOrigin -> block_size_ssa)
 - full -> tensor.empty + linalg.fill
 - _for_loop -> affine.for + recursive visit
-- _phi -> helion.phi
+- _phi -> Loop result SSA (simplified merge pattern detection)
 - _host_tensor -> function argument mapping
-- aten.sym_size.int -> inline concrete value
+- aten.sym_size.int -> inline concrete value or tensor.dim
 - load -> tensor.extract_slice
 - store -> tensor.insert_slice
-- aten.* compute -> torch.aten.* (via torch-mlir dialect)
+- aten.* compute -> linalg-on-tensors (via torch-mlir)
 """
 
 from __future__ import annotations
@@ -535,8 +535,15 @@ class IRVisitor:
             elif output_args is not None:
                 num_loop_outputs = 1
         
-        # Resolve iter_args - only include loop-carried values (those that are yielded)
-        # Read-only values (passed but not yielded) should be handled separately
+        # ---------------------------------------------------------------------
+        # Collect all arguments and classify them:
+        # - Read-only args: passed to the loop but NOT yielded back
+        # - Loop-carried args (iter_args): yielded and updated each iteration
+        # 
+        # Convention: first args are read-only, last args are loop-carried
+        # Example: [tensor_read_only, acc1, acc2] with 2 outputs -> 
+        #          readonly=[tensor_read_only], iter_args=[acc1, acc2]
+        # ---------------------------------------------------------------------
         all_args_info = []
         for i, a in enumerate(args):
             if isinstance(a, fx.Node):
@@ -611,7 +618,13 @@ class IRVisitor:
             # Also map with different naming patterns used in Device IR
             self.loop_iter_args[f"arg0_{num_readonly + i + 1}"] = f"%{iter_name}"
         
-        # For the first placeholder in loops - could be read-only or iter_arg
+        # ---------------------------------------------------------------------
+        # Map placeholder names to SSA values for inner graph visiting.
+        # Device IR uses naming patterns like arg0_1, arg1_1, etc.
+        # We map these to either:
+        # - Read-only: original SSA from outer scope
+        # - iter_args: the loop block argument SSA (%acc_iterN)
+        # ---------------------------------------------------------------------
         if readonly_args_info:
             self.loop_iter_args["arg0_1"] = readonly_args_info[0][1]  # First read-only
         elif iter_args_info:
@@ -1306,7 +1319,21 @@ class IRVisitor:
         has_newaxis = any(idx is None for idx in indices)
         
         if has_newaxis:
-            # Reassociation logic
+            # -----------------------------------------------------------------
+            # Build reassociation map for tensor.expand_shape
+            # -----------------------------------------------------------------
+            # tensor.expand_shape requires a reassociation map that groups
+            # output dimensions back to input dimensions. For newaxis (None):
+            # - Each None adds a size-1 dimension that didn't exist in input
+            # - These new dims must be grouped with real dims from input
+            # 
+            # Strategy: attach each 'new' dimension to the NEXT real dimension
+            # in the output. If no next real dim, attach to the last one.
+            #
+            # Example: indices = [slice, None, slice, None]
+            #   output_dim_types = ['real', 'new', 'real', 'new']
+            #   input_dim_assignments: {0: [0], 1: [1, 2, 3]} (expanded: [[0], [1,2,3]])
+            # -----------------------------------------------------------------
             output_dim_types = [] 
             for idx in indices:
                 if isinstance(idx, slice):

@@ -229,8 +229,12 @@ When generating MLIR:
 
 For MLIR symbol emission:
 ```mlir
+// Symbolic block sizes (autotuned) → loom.get_symbol
 %block_size_0 = "loom.get_symbol"() {name = "block_size_0"} : () -> index
 %block_size_1 = "loom.get_symbol"() {name = "block_size_1"} : () -> index
-// Block 2 might be a constant if size is concrete
-%block_size_3 = "loom.get_symbol"() {name = "block_size_3"} : () -> index
+
+// Concrete block sizes (specialized via hl.specialize() or fixed) → arith.constant
+%block_size_2 = arith.constant 128 : index
 ```
+
+> **Note**: When a block has a concrete `size` (e.g., from `hl.specialize(head_dim)` or `block_size=64`), the MLIR generator emits `arith.constant` instead of `loom.get_symbol`. This enables more optimization opportunities in downstream passes.

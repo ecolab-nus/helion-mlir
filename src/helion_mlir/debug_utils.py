@@ -1,3 +1,14 @@
+"""Debug utilities for Helion MLIR generation.
+
+This module provides helper functions for debugging and validating MLIR output:
+- print_device_ir: Print Device IR graphs (filtered for rolled reductions)
+- print_nodes_with_symbols: Print nodes with symbolic values
+- print_compile_env: Print CompileEnvironment block sizes and shape environment
+- print_debug_info: Combined debug output
+- validate_with_mlir_opt: Validate MLIR with mlir-opt
+- run_dce_cleanup: Run dead code elimination on MLIR
+"""
+
 from typing import Any, Iterable
 import subprocess
 from pathlib import Path

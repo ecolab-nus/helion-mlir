@@ -4,12 +4,12 @@ This module generates MLIR from Helion Device IR by walking FX graph nodes
 instruction-by-instruction. Each Device IR operation is mapped to a
 corresponding MLIR operation:
 
-- _get_symnode -> SSA of loom.get_symbol that is generated at the beginning
+- _get_symnode -> SSA lookup via Origin (BlockSizeOrigin -> block_size_ssa)
 - full -> tensor.empty + linalg.fill
 - _for_loop -> affine.for + recursive visit
-- _phi -> helion.phi
+- _phi -> Loop result SSA (simplified merge pattern detection)
 - _host_tensor -> function argument mapping
-- aten.sym_size.int -> inline concrete value
+- aten.sym_size.int -> inline concrete value or tensor.dim
 - load -> tensor.extract_slice
 - store -> tensor.insert_slice
 

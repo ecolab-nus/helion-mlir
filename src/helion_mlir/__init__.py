@@ -65,7 +65,6 @@ __all__ = [
     "format_attr_dict",
     # Lowering context
     "LoweringContext",
-    "first_debug_name",
     "collect_reduction_block_ids",
     # Debug utilities
     "print_debug_info",
