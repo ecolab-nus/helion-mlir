@@ -1,10 +1,22 @@
 # Helion → MLIR Lowering
 
-This repository provides an instruction-driven lowering path that translates
-[Helion](https://github.com/pytorch-labs/helion) kernels into MLIR. It walks Device IR FX graphs node-by-node,
-mapping each operation to corresponding MLIR dialects.
+This repository provides a tool to lower [Helion](https://github.com/pytorch-labs/helion) kernels into MLIR (Affine + Linalg-on-Tensors). It reuses Helion's front-end, starting from Helion's Device IR FX graphs and translating them into MLIR.
 
-For detailed architecture, FX graph structure, and lowering internals, see [Software Architecture](docs/software_architecture.md).
+## Motivation
+
+Helion lowers to Triton, which is too low-level for our purposes. We want a representation with:
+- **Symbolic shapes** for flexible dimension handling
+- **High-level compute** (`linalg.generic`, `linalg.matmul`, etc.)
+- **Structured control flow** (`affine.for`, `affine.parallel`)
+- **Value semantics** (`tensor`, not `memref`)
+
+This higher-level representation enables analyses that can target diverse architectures.
+
+## Output
+
+The generated MLIR includes custom `loom.*` operations to support symbolic shapes (which MLIR does not natively support). This output is designed to be consumed by our [Loom](https://github.com/ecolab-nus/loom-dataflow) compiler infrastructure for targeting various architectures, especially dataflow architectures.
+
+
 
 ## Quick Start
 
@@ -72,6 +84,9 @@ src/helion_mlir/
 ├── torch_mlir_helper.py     # torch-mlir integration for ATen ops
 └── debug_utils.py           # Debug utilities and MLIR validation
 ```
+
+For detailed architecture, FX graph structure, and lowering internals, see [Software Architecture](docs/software_architecture.md).
+
 
 ## Validation
 
