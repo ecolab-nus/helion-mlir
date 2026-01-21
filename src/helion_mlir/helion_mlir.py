@@ -156,9 +156,8 @@ def generate_mlir(
 
     
     # Pre-compute trip counts for reduction loops (needed for affine.for trip count in IRVisitor)
-    # These are usually constant or symbolic, but here we emit them as constants if possible
-    # or rely on the IRVisitor to compute them if they are complex.
-    reduction_trip_counts = {}
+    # Uses affine.apply with affine_map for consistency with affine.parallel loops
+    for_trip_counts = {}
     
     # Iterate over reduction loops
     reduction_block_ids = collect_reduction_block_ids(device_ir)
@@ -166,43 +165,31 @@ def generate_mlir(
     reduction_block_ids = [bid for bid in reduction_block_ids if bid not in parallel_block_ids_set]
     
     for block_id in reduction_block_ids:
-        # Assuming block_id is the list index as per allocate_block_size implementation.
         info = ctx.env.block_sizes[block_id]
-        
-        # Calculate trip count
         total_extent = ctx.loop_extents[block_id]  # Pre-computed extent
         
         trip_count_ssa = builder.fresh("trip_count")
         
         if isinstance(info.size, int):
+            # Concrete tile size - compute trip count at compile time
             tile_size = info.size
             trip_count = max(1, math.ceil(total_extent / tile_size))
             builder.emit(f'{trip_count_ssa} = arith.constant {trip_count} : index')
-            
         else:
-            # Symbolic trip count logic
+            # Symbolic tile size - use affine.apply to compute trip count
             # Trip count = ceil(total_extent / tile_size)
-            # tile_size is symbolic -> get from block_size_ssa
-            
-            # Block size SSA must exist since we emitted all of them above
             tile_size_ssa = block_size_ssa[block_id]
-            
-            # Generate calculation: ceil(total_extent / tile_size)
-            # Since total_extent is constant here, we can emit it
-            
-            # %total = arith.constant ...
-            total_ssa = builder.fresh("total_extent")
-            builder.emit(f'{total_ssa} = arith.constant {total_extent} : index')
-            
-            # %trip_count = ceildivui total, tile_size
-            builder.emit(f'{trip_count_ssa} = arith.ceildivui {total_ssa}, {tile_size_ssa} : index')
+            builder.emit(
+                f'{trip_count_ssa} = affine.apply '
+                f'affine_map<()[s0] -> ({total_extent} ceildiv s0)>()[{tile_size_ssa}]'
+            )
         
-        # Store in visitor for use in visit_for_loop
-        reduction_trip_counts[block_id] = trip_count_ssa
+        # Store for use in visit_for_loop
+        for_trip_counts[block_id] = trip_count_ssa
     
     # Make block sizes and trip counts available to context
     ctx.block_size_ssa = block_size_ssa
-    ctx.reduction_trip_counts = reduction_trip_counts
+    ctx.reduction_trip_counts = for_trip_counts
     
     # Emit affine.parallel for grid blocks
     if ctx.parallel_block_ids:
