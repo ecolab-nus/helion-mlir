@@ -63,9 +63,9 @@ def attention(
 
 
 def main() -> None:
-    q = torch.randn([256, 512, 128])
-    k = torch.randn([256, 512, 128])
-    v = torch.randn([256, 512, 128])
+    q = torch.randn([32, 4096, 128])
+    k = torch.randn([32, 4096, 128])
+    v = torch.randn([32, 4096, 128])
     bound = attention.bind((q, k, v))
 
     print_debug_info(bound)

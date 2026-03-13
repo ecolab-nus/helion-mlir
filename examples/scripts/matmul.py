@@ -118,7 +118,7 @@ def main() -> None:
     """
     Main function to run autotuning (commented out) and correctness checks.
     """
-    m, k, n = 128, 128, 256
+    m, k, n = 4096, 512, 4096
     x = torch.randn([m, k], device="cpu", dtype=torch.float32)
     y = torch.randn([k, n], device="cpu", dtype=torch.float32)
     bound_kernel = matmul.bind((x, y))
