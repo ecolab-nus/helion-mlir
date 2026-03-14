@@ -147,10 +147,10 @@ def generate_mlir(
             # Concrete size -> no need to emit anything
             pass
         else:
-            # Symbolic size -> emit loom.get_symbol
+            # Symbolic size -> emit loom.get_symbolic_block_size
             builder.emit(
-                f'{ssa} = "loom.get_symbol"() '
-                f'{{name = "block_size_{block_id}"}} : () -> index'
+                f'{ssa} = loom.get_symbolic_block_size '
+                f'@constraints::@block_size_{block_id} : index'
             )
         block_size_ssa[block_id] = ssa
 
