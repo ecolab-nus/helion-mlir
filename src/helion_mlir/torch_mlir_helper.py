@@ -556,6 +556,7 @@ def inline_torch_mlir_output(
     *,
     dimension_ssa_map: dict[str, list[str | None]] | None = None,
     scalar_operand_map: dict[int, str] | None = None,
+    operand_types: dict[str, str] | None = None,
 ) -> str:
     """Inline torch-mlir generated text into the current output helper.
 
@@ -584,6 +585,11 @@ def inline_torch_mlir_output(
             in the body. This matches the pattern where scalar constants are
             captured directly in linalg.generic body rather than passed as
             0-rank tensor ins() operands.
+        operand_types: Optional mapping from operand SSA to its actual MLIR type
+            string (e.g. ``{"%tile28": "tensor<?x?x4096xf32>"}``).
+            When provided, the generated types from torch-mlir are replaced with
+            the actual types so that SSA definitions stay consistent.
+
 
     Returns:
         The SSA value of the result.
@@ -631,21 +637,43 @@ def inline_torch_mlir_output(
     # -------------------------------------------------------------------------
     # PASS 2: Map function arguments to caller's SSA values
     # -------------------------------------------------------------------------
-    # torch-mlir's generated function has args like %arg0, %arg1, ...
-    # We need to replace these with the caller's operand SSA values.
     for i, op in enumerate(operands):
         ssa_map[f"%arg{i}"] = op
-        
+
     # -------------------------------------------------------------------------
     # Track scalar operands for linalg.generic body capture
     # -------------------------------------------------------------------------
-    # When scalar_operand_map is provided, %argN values that correspond to
-    # scalar operands will be removed from linalg.generic ins() and their
-    # block args replaced with direct scalar SSA references in the body.
-    scalar_arg_ssas = {}  # original %argN -> scalar SSA value
+    scalar_arg_ssas = {}
     if scalar_operand_map:
         for idx, scalar_ssa in scalar_operand_map.items():
             scalar_arg_ssas[f"%arg{idx}"] = scalar_ssa
+
+    # -------------------------------------------------------------------------
+    # PASS 2b: Build operand type replacement map (old_type -> new_type)
+    # -------------------------------------------------------------------------
+    type_replace_map: dict[str, str] = {}
+    if operand_types:
+        sig_line = ""
+        for ln in lines:
+            if "func.func @aten_op" in ln:
+                sig_line = ln
+                break
+        if sig_line:
+            arg_pattern = re.compile(r'%arg(\d+)\s*:\s*(tensor<[^>]+>|memref<[^>]+>)')
+            for m in arg_pattern.finditer(sig_line):
+                arg_idx = int(m.group(1))
+                old_type = m.group(2)
+                if arg_idx < len(operands):
+                    op_ssa = operands[arg_idx]
+                    new_type = operand_types.get(op_ssa)
+                    if new_type and new_type != old_type:
+                        type_replace_map[old_type] = new_type
+
+    if type_replace_map:
+        patched = mlir_text
+        for old_t, new_t in type_replace_map.items():
+            patched = patched.replace(old_t, new_t)
+        lines = patched.splitlines()
 
     # Regex to identify SSAs
     ssa_pattern = re.compile(r'%([a-zA-Z0-9_][a-zA-Z0-9_.+-]*)')

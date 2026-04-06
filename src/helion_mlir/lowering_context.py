@@ -276,38 +276,84 @@ class LoweringContext:
     
     @property
     def parallel_block_ids(self) -> list[int]:
-        """Get grid block IDs for parallel loops."""
+        """Get grid block IDs for the first parallel loop (backward compat)."""
         grid_block_groups = self.device_ir.grid_block_ids
         if not grid_block_groups:
             return []
         return list(grid_block_groups[0])
-    
+
+    @property
+    def all_grid_block_ids(self) -> list[list[int]]:
+        """Get block IDs for every grid group."""
+        return [list(g) for g in self.device_ir.grid_block_ids]
+
     @property
     def env(self) -> Any:
         """Get CompileEnvironment from bound_kernel."""
         return self.bound_kernel.env
 
-    
+    def _build_block_id_alias_map(self) -> dict[int, int]:
+        """Detect block IDs across grid groups that tile the same source dimension.
+
+        Two blocks are considered aliases when they share the same
+        ``debug_names`` **and** the same ``numel`` (total extent).  The first
+        block seen (in grid-group order) becomes the *canonical* representative;
+        later blocks map to that canonical ID.
+
+        Returns:
+            Mapping from every block_id to its canonical block_id.
+        """
+        block_info_map = {info.block_id: info for info in self.env.block_sizes}
+        canonical: dict[tuple[frozenset[str], int], int] = {}
+        alias: dict[int, int] = {}
+
+        for grid_group in self.all_grid_block_ids:
+            for bid in grid_group:
+                info = block_info_map.get(bid)
+                if info is None:
+                    alias[bid] = bid
+                    continue
+                key = (frozenset(info.debug_names), info.numel)
+                if key not in canonical:
+                    canonical[key] = bid
+                alias[bid] = canonical[key]
+
+        for info in self.env.block_sizes:
+            if info.block_id not in alias:
+                alias[info.block_id] = info.block_id
+
+        return alias
+
+    @property
+    def block_id_alias(self) -> dict[int, int]:
+        """Lazily computed block-ID alias map (cached)."""
+        if not hasattr(self, "_block_id_alias"):
+            self._block_id_alias = self._build_block_id_alias_map()
+        return self._block_id_alias
+
+    def resolve_block_id(self, block_id: int) -> int:
+        """Resolve a block_id to its canonical (first-seen) equivalent."""
+        return self.block_id_alias.get(block_id, block_id)
+
     def get_module_attributes(self) -> dict[str, tuple[object, str]]:
         """Get block sizes as module attributes.
-        
-        Returns a dict mapping attribute name to (value, type) for module attributes.
-        
-        Only emits attributes for blocks with symbolic (non-concrete) sizes.
-        Blocks with concrete int sizes are skipped since they're known constants.
-        
-        Naming convention:
-        - loom.block_size_0, loom.block_size_1, ... = tile sizes for each block ID
+
+        Only emits attributes for *canonical* blocks with symbolic sizes.
+        Aliased blocks share the same attribute as their canonical block.
         """
-        attrs = {}
-        # Emit block sizes using debug-name-based naming
-        # Only emit for blocks with symbolic sizes (not concrete ints)
+        alias = self.block_id_alias
+        seen_canonical: set[int] = set()
+        attrs: dict[str, tuple[object, str]] = {}
+
         for info in self.env.block_sizes:
-            # Skip blocks with concrete int sizes - they're known constants
             if isinstance(info.size, int):
                 continue
+            canonical_id = alias.get(info.block_id, info.block_id)
+            if canonical_id in seen_canonical:
+                continue
+            seen_canonical.add(canonical_id)
 
-            sym_name = next(iter(info.debug_names), f"block_{info.block_id}")
+            sym_name = next(iter(info.debug_names), f"block_{canonical_id}")
             upper_bound = self.loop_extents[info.block_id]
             is_reduction = str(info.reduction).lower()
             attr_name = f"loom.{sym_name}"

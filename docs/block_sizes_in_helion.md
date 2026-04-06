@@ -238,3 +238,116 @@ For MLIR symbol emission:
 ```
 
 > **Note**: When a block has a concrete `size` (e.g., from `hl.specialize(head_dim)` or `block_size=64`), the MLIR generator emits `arith.constant` instead of `loom.get_symbol`. This enables more optimization opportunities in downstream passes.
+
+---
+
+## Multi-Grid Kernels and Block Size Aliasing
+
+When a kernel uses `hl.barrier()` to separate two stages, Helion creates
+**multiple grid groups** — each with its own set of block IDs.  The same
+logical dimension (e.g. *M*) appears as a different `block_id` in each grid,
+even though both blocks tile the same source dimension.
+
+### How Grid Groups Are Formed
+
+```python
+# Stage 1 — grid group 0
+for tile_m, tile_n, tile_k in hl.tile([m, n, k]):   # block_ids [0, 1, 2]
+    ...
+
+hl.barrier()
+
+# Stage 2 — grid group 1
+for tile_m, tile_n in hl.tile([m, n]):               # block_ids [3, 4]
+    ...
+```
+
+Helion exposes these groups via `device_ir.grid_block_ids`:
+
+```
+grid_block_ids: [[0, 1, 2], [3, 4]]
+root_ids:       [0, 1]
+```
+
+### Identifying the Source of a Block Size
+
+Each `BlockSizeInfo` carries a `debug_names` set that records which user-level
+tile variable the block originated from:
+
+| block_id | debug_names   | numel | grid group |
+|----------|---------------|-------|------------|
+| 0        | `{'tile_m'}`  | s97   | 0          |
+| 1        | `{'tile_n'}`  | s20   | 0          |
+| 2        | `{'tile_k'}`  | s98   | 0          |
+| 3        | `{'tile_m'}`  | s97   | 1          |
+| 4        | `{'tile_n'}`  | s20   | 1          |
+
+Blocks **0 and 3** both have `debug_names={'tile_m'}` and the same `numel`.
+Blocks **1 and 4** both have `debug_names={'tile_n'}` and the same `numel`.
+This tells us they tile the same logical dimension and should share the same
+MLIR symbol.
+
+### Building the Alias Map
+
+`LoweringContext._build_block_id_alias_map()` walks the grid groups in order
+and builds a canonical mapping.  Two blocks are aliased when they share the
+same `(frozenset(debug_names), numel)` key:
+
+```python
+# Pseudocode
+canonical = {}   # (frozenset(debug_names), numel) → first block_id
+alias    = {}    # every block_id → its canonical block_id
+
+for grid_group in grid_block_ids:
+    for bid in grid_group:
+        info = block_sizes[bid]
+        key  = (frozenset(info.debug_names), info.numel)
+        if key not in canonical:
+            canonical[key] = bid      # first occurrence is canonical
+        alias[bid] = canonical[key]
+```
+
+Result for the split-K example:
+
+```
+alias = {0: 0, 1: 1, 2: 2, 3: 0, 4: 1}
+        ──────────────  ──────────────
+        grid 0 (self)   grid 1 → canonical
+```
+
+### Effect on MLIR Generation
+
+1. **Module attributes** — only canonical blocks emit `loom.block_size_*`:
+
+   ```mlir
+   module attributes {
+     loom.block_size_0 = -1 : index,   // tile_m (canonical)
+     loom.block_size_1 = -1 : index,   // tile_n (canonical)
+     loom.block_size_2 = -1 : index    // tile_k
+   } {
+   ```
+
+2. **Block size SSAs** — aliased blocks reuse the canonical SSA:
+
+   ```mlir
+   %block_size_0 = "loom.get_symbol"() {name = "block_size_0"} : () -> index
+   %block_size_1 = "loom.get_symbol"() {name = "block_size_1"} : () -> index
+   // block_size_3 and block_size_4 are NOT emitted —
+   // any reference to them resolves to %block_size_0 / %block_size_1
+   ```
+
+3. **Parallel loop IVs** — both grids use the same IV names for shared
+   dimensions:
+
+   ```mlir
+   // Grid 0: three parallel dims (M, N, K)
+   affine.parallel (%iv_block_0, %iv_block_1, %iv_block_2) = ...
+
+   // Grid 1: two parallel dims (M, N) — reuses iv_block_0, iv_block_1
+   affine.parallel (%iv_block_0, %iv_block_1) = ...
+   ```
+
+4. **IRVisitor resolution** — every method that looks up a block ID
+   (`visit_get_symnode`, `visit_load`, `visit_store`, `resolve_dimension`,
+   etc.) calls `ctx.resolve_block_id(raw_id)` to get the canonical ID before
+   accessing `block_size_ssa` or constructing `%iv_block_*` names.

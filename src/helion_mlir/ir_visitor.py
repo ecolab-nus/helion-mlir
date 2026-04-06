@@ -27,6 +27,7 @@ import helion.language.memory_ops as hl_memory_ops
 import helion.language._tracing_ops as hl_tracing_ops
 import helion.language.creation_ops as hl_creation_ops
 import helion.language.view_ops as hl_view_ops
+import helion.language.tile_ops as hl_tile_ops
 
 from .mlir_utils import (
     format_attr_dict,
@@ -71,49 +72,38 @@ class IRVisitor:
     
     def resolve_dimension(self, dim_size, dim_hint: int = 0) -> tuple[str, bool]:
         """Resolve a dimension size to an SSA value or inline literal.
-        
-        Args:
-            dim_size: Either an int (concrete) or a SymInt (symbolic) from FakeTensor.size()
-            dim_hint: Optional hint for naming SSA variables
-            
-        Returns:
-            (value_str, is_static) where:
-            - is_static=True means value_str is an inline integer literal (e.g., "128")
-            - is_static=False means value_str is an SSA value (e.g., "%block_size_0")
+
+        Block IDs are resolved through the alias map so that dimensions
+        coming from the same source across grids share the same SSA.
         """
         from helion._compiler.variable_origin import BlockSizeOrigin
-        
+
         if not hasattr(dim_size, '_sympy_'):
-            # Concrete int - return inline literal
             return (str(int(dim_size)), True)
-        
-        # SymInt - look up its origin
+
         sym = dim_size._sympy_()
         host_function = self.ctx.bound_kernel.host_function
         shape_env = self.ctx.bound_kernel.env.shape_env
-        
+
         origin_info = host_function.expr_to_origin.get(sym)
         origin = origin_info.origin if origin_info else None
-        
+
         if isinstance(origin, BlockSizeOrigin):
-            block_id = origin.block_id
-            block_info = self.ctx.env.block_sizes[block_id]
-            
-            # If concrete int size, return inline literal
+            raw_id = origin.block_id
+            canonical_id = self.ctx.resolve_block_id(raw_id)
+            block_info = self.ctx.env.block_sizes[raw_id]
+
             if isinstance(block_info.size, int):
                 return (str(block_info.size), True)
-            
-            # Symbolic - use pre-emitted block_size SSA
-            ssa = self.ctx.block_size_ssa.get(block_id)
+
+            ssa = self.ctx.block_size_ssa.get(canonical_id)
             if ssa:
                 return (ssa, False)
-        
-        # Not a BlockSizeOrigin - check shape_env for concrete value
+
         if sym in shape_env.var_to_val:
             concrete_val = int(shape_env.var_to_val[sym])
             return (str(concrete_val), True)
-        
-        # Unknown - return None to signal fallback to tensor.dim
+
         return (None, False)
         
     # def register_graph(self, graph_id: int, graph_info: "GraphInfo") -> None:
@@ -198,6 +188,14 @@ class IRVisitor:
         if target is hl_memory_ops.store:
             return self.visit_store(node)
         
+        # tile_id / tile_begin / tile_end -> IV-based SSA
+        if target is hl_tile_ops.tile_id:
+            return self.visit_tile_id(node)
+        if target is hl_tile_ops.tile_begin:
+            return self.visit_tile_begin(node)
+        if target is hl_tile_ops.tile_end:
+            return self.visit_tile_end(node)
+
         # _mask_to -> shortcircuit (pass through input, boundary check placeholder)
         if target is hl_tracing_ops._mask_to:
             return self.visit_mask_to(node)
@@ -270,77 +268,70 @@ class IRVisitor:
     # -------------------------------------------------------------------------
     
     def _try_get_block_id_from_node(self, node: fx.Node) -> int | None:
-        """Try to extract block_id from a node's BlockSizeOrigin.
-        
-        This is used to determine which loop induction variable corresponds
-        to a given index, ensuring correct offset computation for tile loading/storing.
-        
-        Args:
-            node: FX node that may represent a block_size (e.g., block_size_0 or sym_size_int)
-            
-        Returns:
-            The block_id associated with this node's BlockSizeOrigin, or None if not found
+        """Try to extract the *canonical* block_id from a node's BlockSizeOrigin.
+
+        The returned ID is resolved through the alias map so that blocks
+        from different grids that tile the same source dimension share the
+        same IV / block-size SSA.
         """
         import re
         from helion._compiler.variable_origin import BlockSizeOrigin
-        
-        # Try to get block_id from BlockSizeOrigin in node metadata
+
+        raw_id: int | None = None
+
         sym_val = node.meta.get("val")
         if sym_val is not None and hasattr(sym_val, '_sympy_'):
             sym = sym_val._sympy_()
             host_function = self.ctx.bound_kernel.host_function
             origin_info = host_function.expr_to_origin.get(sym)
             if origin_info and isinstance(origin_info.origin, BlockSizeOrigin):
-                return origin_info.origin.block_id
-        
-        # Fallback: parse block_id from node name (e.g., "block_size_0" → 0)
-        match = re.search(r'block_size_(\d+)', node.name)
-        if match:
-            return int(match.group(1))
-        
+                raw_id = origin_info.origin.block_id
+
+        if raw_id is None:
+            match = re.search(r'block_size_(\d+)', node.name)
+            if match:
+                raw_id = int(match.group(1))
+
+        if raw_id is not None:
+            return self.ctx.resolve_block_id(raw_id)
         return None
     
     def visit_get_symnode(self, node: fx.Node) -> str:
         """Look up pre-emitted SSA for symnode references.
-        
+
         Resolution strategy based on Origin type:
-        1. BlockSizeOrigin -> Use pre-emitted ctx.block_size_ssa[block_id]
+        1. BlockSizeOrigin -> Use pre-emitted ctx.block_size_ssa[canonical_block_id]
         2. Other origins -> Use shape_env.var_to_val for concrete value -> arith.constant
         """
         from helion._compiler.variable_origin import BlockSizeOrigin
-        
-        # Get sympy expression from node metadata
+
         sym_val = node.meta.get("val")
         if sym_val is None:
             raise ValueError(f"No meta['val'] for symnode {node.name}")
-        
+
         sym = sym_val._sympy_()
-        
-        # Look up origin info from the host_function
+
         host_function = self.ctx.bound_kernel.host_function
         origin_info = host_function.expr_to_origin.get(sym)
         origin = origin_info.origin if origin_info else None
-        
-        # 1. BlockSizeOrigin -> check if concrete int size, otherwise use pre-emitted block_size_ssa
+
         if isinstance(origin, BlockSizeOrigin):
-            block_id = origin.block_id
-            block_info = self.ctx.env.block_sizes[block_id]
-            
-            # If size is a concrete int, emit arith.constant instead of looking up SSA
+            raw_block_id = origin.block_id
+            canonical_id = self.ctx.resolve_block_id(raw_block_id)
+            block_info = self.ctx.env.block_sizes[raw_block_id]
+
             if isinstance(block_info.size, int):
                 ssa = self.mlir_output_helper.fresh(node.name.replace(".", "_"))
                 self.mlir_output_helper.emit(f'{ssa} = arith.constant {block_info.size} : index')
                 self.ctx.node_values[node.name] = ssa
                 return ssa
-            
-            # Symbolic size -> use pre-emitted block_size_ssa
-            ssa = self.ctx.block_size_ssa.get(block_id)
+
+            ssa = self.ctx.block_size_ssa.get(canonical_id)
             if ssa is None:
-                raise ValueError(f"No block_size_ssa for block_id={block_id}")
+                raise ValueError(f"No block_size_ssa for block_id={canonical_id}")
             self.ctx.node_values[node.name] = ssa
             return ssa
-        
-        # 2. Other origins -> use shape_env for concrete value
+
         shape_env = self.ctx.bound_kernel.env.shape_env
         if sym in shape_env.var_to_val:
             concrete_val = int(shape_env.var_to_val[sym])
@@ -348,7 +339,7 @@ class IRVisitor:
             self.mlir_output_helper.emit(f'{ssa} = arith.constant {concrete_val} : index')
             self.ctx.node_values[node.name] = ssa
             return ssa
-        
+
         raise ValueError(
             f"Cannot resolve symbol {sym} for {node.name}. "
             f"Origin: {origin}, not in shape_env.var_to_val"
@@ -550,9 +541,9 @@ class IRVisitor:
         if for_graph is None:
             raise ValueError(f"ForLoopGraphInfo with graph_id={graph_id} not registered")
         
-        # Get block_ids from the graph
+        # Get block_ids from the graph (resolve through alias map)
         block_ids = getattr(for_graph, 'block_ids', [self.loop_depth])
-        block_id = block_ids[0] if block_ids else 2
+        block_id = self.ctx.resolve_block_id(block_ids[0] if block_ids else 2)
         
         # Use pre-computed trip count (computed outside affine.parallel)
         trip_count_ssa = self.ctx.reduction_trip_counts.get(block_id)
@@ -873,48 +864,39 @@ class IRVisitor:
         host_function = self.ctx.bound_kernel.host_function
         shape_env = self.ctx.bound_kernel.env.shape_env
         
-        # Helper: resolve a SymInt to SSA or inline literal
-        # Returns (value_str, is_static) where is_static=True means it's an inline literal
         def resolve_symint(sym_int, dim_hint: int) -> tuple[str, bool]:
-            """Resolve a SymInt to its value. Returns (str_value, is_static)."""
+            """Resolve a SymInt to its value (uses canonical block IDs)."""
             sym = sym_int._sympy_()
             origin_info = host_function.expr_to_origin.get(sym)
             origin = origin_info.origin if origin_info else None
             
-            # BlockSizeOrigin -> check if concrete int size
             if isinstance(origin, BlockSizeOrigin):
-                block_id = origin.block_id
-                block_info = self.ctx.env.block_sizes[block_id]
+                raw_id = origin.block_id
+                canonical_id = self.ctx.resolve_block_id(raw_id)
+                block_info = self.ctx.env.block_sizes[raw_id]
                 
-                # If size is concrete int, return inline literal
                 if isinstance(block_info.size, int):
                     return (str(block_info.size), True)
                 
-                # Symbolic size -> use pre-emitted block_size_ssa
-                ssa = self.ctx.block_size_ssa.get(block_id)
+                ssa = self.ctx.block_size_ssa.get(canonical_id)
                 if ssa is not None:
                     return (ssa, False)
             
-            # Other origins -> use shape_env for concrete value
             if sym in shape_env.var_to_val:
                 concrete_val = int(shape_env.var_to_val[sym])
                 return (str(concrete_val), True)
             
             raise ValueError(f"Cannot resolve SymInt {sym} for dimension {dim_hint}")
         
-        # Collect offset and size values for each dimension
-        # Each entry is (value_str, is_static) where is_static determines if it's an inline literal
-        offsets = []  # list of (str, bool) 
-        sizes = []    # list of (str, bool)
-        output_dim_sizes = []  # Store (static_size | None) for type construction
+        offsets = []
+        sizes = []
+        output_dim_sizes = []
         
-        # Helper to extract dimensions from memref type string
         def parse_memref_dimensions(type_str: str) -> list[str]:
-            """Extract dimension strings from a memref type like 'memref<256x128xf32>'."""
             if 'memref<' in type_str and '>' in type_str:
                 content = type_str[type_str.find('<')+1 : type_str.rfind('>')]
                 if 'x' in content:
-                    return content.split('x')[:-1]  # Exclude dtype
+                    return content.split('x')[:-1]
             return []
         
         src_dims = parse_memref_dimensions(memref_type)
@@ -1087,47 +1069,39 @@ class IRVisitor:
         host_function = self.ctx.bound_kernel.host_function
         shape_env = self.ctx.bound_kernel.env.shape_env
         
-        # Helper: resolve a SymInt to SSA or inline literal
         def resolve_symint(sym_int, dim_hint: int) -> tuple[str, bool]:
-            """Resolve a SymInt to its value. Returns (str_value, is_static)."""
+            """Resolve a SymInt to its value (uses canonical block IDs)."""
             sym = sym_int._sympy_()
             origin_info = host_function.expr_to_origin.get(sym)
             origin = origin_info.origin if origin_info else None
             
-            # BlockSizeOrigin -> check if concrete int size
             if isinstance(origin, BlockSizeOrigin):
-                block_id = origin.block_id
-                block_info = self.ctx.env.block_sizes[block_id]
+                raw_id = origin.block_id
+                canonical_id = self.ctx.resolve_block_id(raw_id)
+                block_info = self.ctx.env.block_sizes[raw_id]
                 
-                # If size is concrete int, return inline literal
                 if isinstance(block_info.size, int):
                     return (str(block_info.size), True)
                 
-                # Symbolic size -> use pre-emitted block_size_ssa
-                ssa = self.ctx.block_size_ssa.get(block_id)
+                ssa = self.ctx.block_size_ssa.get(canonical_id)
                 if ssa is not None:
                     return (ssa, False)
             
-            # Other origins -> use shape_env for concrete value
             if sym in shape_env.var_to_val:
                 concrete_val = int(shape_env.var_to_val[sym])
                 return (str(concrete_val), True)
             
             raise ValueError(f"Cannot resolve SymInt {sym} for dimension {dim_hint}")
         
-        # Collect offset and size values for each dimension
-        # Each entry is (value_str, is_static)
-        offsets = []  # list of (str, bool)
-        sizes = []    # list of (str, bool)
-        output_dim_sizes = []  # Store (static_size | None) for type reference
+        offsets = []
+        sizes = []
+        output_dim_sizes = []
         
-        # Helper to extract dimensions from type string
         def parse_type_dimensions(type_str: str) -> list[str]:
-            """Extract dimension strings from a type like 'tensor<256x128xf32>' or 'memref<...>'."""
             if ('<' in type_str and '>' in type_str):
                 content = type_str[type_str.find('<')+1 : type_str.rfind('>')]
                 if 'x' in content:
-                    return content.split('x')[:-1]  # Exclude dtype
+                    return content.split('x')[:-1]
             return []
         
         src_dims = parse_type_dimensions(value_type)
@@ -1244,33 +1218,38 @@ class IRVisitor:
         
         src_strides = compute_strides_from_dims(memref_dims)
         has_dynamic_offset = any(not is_static for _, is_static in offsets)
-        
-        # Construct subview result type (memref) with strided layout if needed
-        if output_dims:
+
+        # Rank-reducing subview: drop size-1 dims that come from scalar indices
+        # so the subview rank matches the value tensor rank.
+        reduced_dims = []
+        reduced_strides = []
+        for i, dim in enumerate(output_dims):
+            if dim == "1" and output_dim_sizes[i] == 1:
+                continue  # scalar index → drop this dimension
+            reduced_dims.append(dim)
+            if src_strides is not None:
+                reduced_strides.append(src_strides[i])
+
+        if reduced_dims:
             if src_strides is not None and has_dynamic_offset:
-                # Need strided layout with offset: ? for dynamic offsets from static source
-                strides_layout_str = ", ".join(str(s) for s in src_strides)
-                subview_type = f"memref<{'x'.join(output_dims)}x{dtype_str}, strided<[{strides_layout_str}], offset: ?>>"
+                strides_layout_str = ", ".join(str(s) for s in reduced_strides)
+                subview_type = f"memref<{'x'.join(reduced_dims)}x{dtype_str}, strided<[{strides_layout_str}], offset: ?>>"
             else:
-                subview_type = f"memref<{'x'.join(output_dims)}x{dtype_str}>"
+                subview_type = f"memref<{'x'.join(reduced_dims)}x{dtype_str}>"
         else:
             subview_type = f"memref<{dtype_str}>"
-        
-        # Emit memref.subview to get destination view
+
         subview_ssa = self.mlir_output_helper.fresh("subview")
         self.mlir_output_helper.emit(
             f'{subview_ssa} = memref.subview {memref_ssa}[{offsets_str}][{sizes_str}][{strides_str}] : '
             f'{memref_type} to {subview_type}'
         )
-        
-        # Convert value tensor to memref using bufferization.to_buffer
-        # Syntax: %memref = bufferization.to_buffer %tensor : tensor_type to memref_type
+
         value_memref_ssa = self.mlir_output_helper.fresh("value_memref")
         self.mlir_output_helper.emit(
             f'{value_memref_ssa} = bufferization.to_buffer {value_ssa} : {value_type} to {subview_type}'
         )
-        
-        # Copy data from value memref to destination subview (in-place mutation)
+
         self.mlir_output_helper.emit(
             f'memref.copy {value_memref_ssa}, {subview_ssa} : {subview_type} to {subview_type}'
         )
@@ -1309,6 +1288,48 @@ class IRVisitor:
         return source_ssa
 
     
+    def visit_tile_id(self, node: fx.Node) -> str:
+        """Map tile_id(block_size_X) to the corresponding parallel loop IV."""
+        block_size_node = node.args[0]
+        block_id = self._try_get_block_id_from_node(block_size_node)
+        if block_id is None:
+            raise ValueError(f"Cannot determine block_id for tile_id node {node.name}")
+        iv_ssa = f"%iv_block_{block_id}"
+        self.ctx.node_values[node.name] = iv_ssa
+        return iv_ssa
+
+    def visit_tile_begin(self, node: fx.Node) -> str:
+        """Map tile_begin(block_size_X) to IV * block_size."""
+        block_size_node = node.args[0]
+        block_id = self._try_get_block_id_from_node(block_size_node)
+        if block_id is None:
+            raise ValueError(f"Cannot determine block_id for tile_begin node {node.name}")
+        canonical_id = self.ctx.resolve_block_id(block_id)
+        iv_ssa = f"%iv_block_{canonical_id}"
+        bs_ssa = self.ctx.block_size_ssa[canonical_id]
+        result = self.mlir_output_helper.fresh("tile_begin")
+        self.mlir_output_helper.emit(f'{result} = arith.muli {iv_ssa}, {bs_ssa} : index')
+        self.ctx.node_values[node.name] = result
+        return result
+
+    def visit_tile_end(self, node: fx.Node) -> str:
+        """Map tile_end(block_size_X) to (IV + 1) * block_size."""
+        block_size_node = node.args[0]
+        block_id = self._try_get_block_id_from_node(block_size_node)
+        if block_id is None:
+            raise ValueError(f"Cannot determine block_id for tile_end node {node.name}")
+        canonical_id = self.ctx.resolve_block_id(block_id)
+        iv_ssa = f"%iv_block_{canonical_id}"
+        bs_ssa = self.ctx.block_size_ssa[canonical_id]
+        one = self.mlir_output_helper.fresh("one")
+        self.mlir_output_helper.emit(f'{one} = arith.constant 1 : index')
+        iv_plus_one = self.mlir_output_helper.fresh("iv_plus_one")
+        self.mlir_output_helper.emit(f'{iv_plus_one} = arith.addi {iv_ssa}, {one} : index')
+        result = self.mlir_output_helper.fresh("tile_end")
+        self.mlir_output_helper.emit(f'{result} = arith.muli {iv_plus_one}, {bs_ssa} : index')
+        self.ctx.node_values[node.name] = result
+        return result
+
     def visit_mask_to(self, node: fx.Node) -> str:
         """Shortcircuit _mask_to by passing through the input tensor.
         
@@ -1655,21 +1676,19 @@ class IRVisitor:
                     origin = origin_info.origin if origin_info else None
                     
                     if isinstance(origin, BlockSizeOrigin):
-                        block_id = origin.block_id
-                        block_info = self.ctx.env.block_sizes[block_id]
+                        raw_id = origin.block_id
+                        canonical_id = self.ctx.resolve_block_id(raw_id)
+                        block_info = self.ctx.env.block_sizes[raw_id]
                         
-                        # If concrete int, use inline literal (represented as str)
                         if isinstance(block_info.size, int):
                             dim_ssas.append(str(block_info.size))
                         else:
-                            # Symbolic - use pre-emitted block_size SSA
-                            ssa = self.ctx.block_size_ssa.get(block_id)
+                            ssa = self.ctx.block_size_ssa.get(canonical_id)
                             if ssa:
                                 dim_ssas.append(ssa)
                             else:
                                 dim_ssas.append(None)
                     else:
-                        # Not a BlockSizeOrigin - check shape_env for concrete value
                         if sym in shape_env.var_to_val:
                             concrete_val = int(shape_env.var_to_val[sym])
                             dim_ssas.append(str(concrete_val))
@@ -1685,14 +1704,22 @@ class IRVisitor:
         # Identify scalar (non-tensor) operands so inline_torch_mlir_output
         # can capture them directly in linalg.generic body instead of as
         # ins() tensor operands.
-        scalar_operand_map = {}  # operand index -> scalar SSA value
+        scalar_operand_map = {}
         for i, op_node in enumerate(tensor_operand_nodes):
             if isinstance(op_node, fx.Node):
                 node_type = self.ctx.node_types.get(op_node.name, "")
                 if node_type and not node_type.startswith("tensor<") and not node_type.startswith("memref<"):
                     scalar_operand_map[i] = tensor_operands[i]
 
-        # Inline the generated MLIR with dimension optimization
+        # Build operand_types map for type consistency
+        op_types: dict[str, str] = {}
+        for op_ssa, op_node in zip(tensor_operands, tensor_operand_nodes):
+            if isinstance(op_node, fx.Node):
+                try:
+                    op_types[op_ssa] = self._get_tensor_type(op_node)
+                except RuntimeError:
+                    pass
+
         from .torch_mlir_helper import inline_torch_mlir_output
         result = inline_torch_mlir_output(
             mlir_text,
@@ -1700,6 +1727,7 @@ class IRVisitor:
             self.mlir_output_helper,
             dimension_ssa_map=dimension_ssa_map if dimension_ssa_map else None,
             scalar_operand_map=scalar_operand_map if scalar_operand_map else None,
+            operand_types=op_types if op_types else None,
         )
         
         self.ctx.node_values[node.name] = result
