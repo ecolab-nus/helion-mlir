@@ -3,28 +3,28 @@ Graph 0: ForLoopGraphInfo
 opcode         name            target                                     args                                             kwargs
 -------------  --------------  -----------------------------------------  -----------------------------------------------  --------
 placeholder    arg0_1          arg0_1                                     ()                                               {}
-call_function  _new_var        <function _new_var at 0x7f4cf0167a30>      (arg0_1,)                                        {}
-call_function  x               <function _host_tensor at 0x7f4cf0166170>  ('x',)                                           {}
+call_function  _new_var        <function _new_var at 0x733b78ef9260>      (arg0_1,)                                        {}
+call_function  x               <function _host_tensor at 0x733b78eef6a0>  ('x',)                                           {}
 call_function  sym_size_int    aten.sym_size.int                          (arg0_1, 0)                                      {}
-call_function  block_size_2    <function _get_symnode at 0x7f4cf0165510>  ('block_size_2',)                                {}
-call_function  load            <function load at 0x7f4cdd169cf0>          (x, [sym_size_int, block_size_2], None, None)    {}
-call_function  y               <function _host_tensor at 0x7f4cf0166170>  ('y',)                                           {}
+call_function  block_size_2    <function _get_symnode at 0x733b78eee5c0>  ('block_size_2',)                                {}
+call_function  load            <function load at 0x733ad39b2b60>          (x, [sym_size_int, block_size_2], None, None)    {}
+call_function  y               <function _host_tensor at 0x733b78eef6a0>  ('y',)                                           {}
 call_function  sym_size_int_1  aten.sym_size.int                          (arg0_1, 1)                                      {}
-call_function  load_1          <function load at 0x7f4cdd169cf0>          (y, [block_size_2, sym_size_int_1], None, None)  {}
+call_function  load_1          <function load at 0x733ad39b2b60>          (y, [block_size_2, sym_size_int_1], None, None)  {}
 call_function  acc             aten.addmm.default                         (_new_var, load, load_1)                         {}
 output         output          output                                     ([acc],)                                         {}
 Graph 1: RootGraphInfo
 opcode         name          target                                     args                                                      kwargs
 -------------  ------------  -----------------------------------------  --------------------------------------------------------  --------
-call_function  block_size_0  <function _get_symnode at 0x7f4cf0165510>  ('block_size_0',)                                         {}
-call_function  block_size_1  <function _get_symnode at 0x7f4cf0165510>  ('block_size_1',)                                         {}
-call_function  acc           <function full at 0x7f4cdd151510>          ([block_size_0, block_size_1], 0.0, torch.float16, None)  {}
-call_function  x_size1       <function _get_symnode at 0x7f4cf0165510>  ('x_size1',)                                              {}
-call_function  _for_loop     <function _for_loop at 0x7f4cf01664d0>     (0, [0], [x_size1], [acc])                                {}
+call_function  block_size_0  <function _get_symnode at 0x733b78eee5c0>  ('block_size_0',)                                         {}
+call_function  block_size_1  <function _get_symnode at 0x733b78eee5c0>  ('block_size_1',)                                         {}
+call_function  acc           <function full at 0x733ad3996340>          ([block_size_0, block_size_1], 0.0, torch.float16, None)  {}
+call_function  x_size1       <function _get_symnode at 0x733b78eee5c0>  ('x_size1',)                                              {}
+call_function  _for_loop     <function _for_loop at 0x733b78eefa60>     (0, [0], [x_size1], [acc])                                {}
 call_function  getitem       <built-in function getitem>                (_for_loop, 0)                                            {}
-call_function  _phi          <function _phi at 0x7f4cf01669e0>          (acc, getitem)                                            {}
-call_function  out           <function _host_tensor at 0x7f4cf0166170>  ('out',)                                                  {}
-call_function  store         <function store at 0x7f4cdd1680d0>         (out, [block_size_0, block_size_1], _phi, None)           {}
+call_function  _phi          <function _phi at 0x733b78ef8040>          (acc, getitem)                                            {}
+call_function  out           <function _host_tensor at 0x733b78eef6a0>  ('out',)                                                  {}
+call_function  store         <function store at 0x733ad39b2700>         (out, [block_size_0, block_size_1], _phi, None)           {}
 output         output        output                                     (None,)                                                   {}
 
 
@@ -67,12 +67,12 @@ Shape Env (7):
 === MLIR Dump ===
 #map = affine_map<()[s0] -> (512 ceildiv s0)>
 #map1 = affine_map<(d0, d1) -> (d0, d1)>
-module attributes {loom.block_size_0 = -1 : index, loom.block_size_1 = -1 : index, loom.block_size_2 = -1 : index} {
+module attributes {loom.tile_k = {is_reduction = false, upper_bound = 512 : index}, loom.tile_m = {is_reduction = false, upper_bound = 4096 : index}, loom.tile_n = {is_reduction = false, upper_bound = 4096 : index}} {
   func.func @matmul(%arg0: memref<4096x512xf16>, %arg1: memref<512x4096xf16>, %arg2: memref<4096x4096xf16>) {
     %cst = arith.constant 0.000000e+00 : f16
-    %0 = "loom.sym"() {symbol_ref = @block_size_0} : () -> index
-    %1 = "loom.sym"() {symbol_ref = @block_size_1} : () -> index
-    %2 = "loom.sym"() {symbol_ref = @block_size_2} : () -> index
+    %0 = "loom.sym"() {is_reduction = false, symbol_ref = @tile_m, upper_bound = 4096 : index} : () -> index
+    %1 = "loom.sym"() {is_reduction = false, symbol_ref = @tile_n, upper_bound = 4096 : index} : () -> index
+    %2 = "loom.sym"() {is_reduction = false, symbol_ref = @tile_k, upper_bound = 512 : index} : () -> index
     affine.parallel (%arg3, %arg4) = (0, 0) to (4096 ceildiv symbol(%0), 4096 ceildiv symbol(%1)) {
       %3 = tensor.empty(%0, %1) : tensor<?x?xf16>
       %4 = linalg.fill ins(%cst : f16) outs(%3 : tensor<?x?xf16>) -> tensor<?x?xf16>
