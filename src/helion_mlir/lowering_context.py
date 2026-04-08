@@ -131,21 +131,13 @@ class LoweringContext:
         """Return resolved block extent, if available."""
         return self.loop_extents.get(block_id)
 
-    def get_loop_extent_or_hint(self, block_id: int, default: int = 1) -> int:
-        """Return resolved block extent, or a conservative hint."""
+    def get_loop_extent_or_default(self, block_id: int, default: int = 1) -> int:
+        """Return the resolved block extent, or the provided default."""
         extent = self.get_loop_extent(block_id)
         if extent is not None:
             return extent
 
-        info = self.block_sizes.get(block_id)
-        if info is None:
-            return default
-
-        with self.env:
-            try:
-                return int(info.size_hint())
-            except Exception:
-                return default
+        return default
     
     def _precompute_host_tensor_types(self) -> None:
         """Pre-compute MLIR types for all _host_tensor nodes by scanning all graphs.

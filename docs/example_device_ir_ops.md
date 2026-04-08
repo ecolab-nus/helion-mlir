@@ -67,7 +67,13 @@ Parameters:
 Notes:
 
 - If the symbol came from a registered block size, Helion can resolve it to a `BlockSizeOrigin`.
-- In this repo's MLIR lowering, `_get_symnode` usually becomes either an `arith.constant` or a pre-emitted `loom.sym`-derived SSA value.
+
+Current lowering in `src/helion_mlir/ir_visitor.py`:
+
+- If the symbol has `BlockSizeOrigin` and the block size is static, lower to `arith.constant ... : index`.
+- If the symbol has `BlockSizeOrigin` and the block size is dynamic, reuse the pre-emitted block-size SSA from the `loom.sym` setup done before graph walking.
+- If the symbol is otherwise concretized in Helion's `shape_env`, lower to `arith.constant ... : index`.
+- If none of those cases apply, the lowering currently errors out instead of emitting a generic symbolic MLIR op.
 
 ### `_host_tensor(debug_name: str) -> torch.Tensor`
 
@@ -88,7 +94,12 @@ Parameters:
 Notes:
 
 - Helion validates that scalar `_host_tensor` nodes only feed ops that explicitly allow host tensors.
-- In this repo's MLIR lowering, `_host_tensor` is mapped to a function argument SSA value.
+
+Current lowering in `src/helion_mlir/ir_visitor.py`:
+
+- No dedicated MLIR op is emitted.
+- The node is resolved directly to a pre-registered function argument SSA from `ctx.host_tensors`.
+- For this repo, those host tensors are represented as `memref` function parameters.
 
 ### `_new_var(value) -> same type as value`
 
@@ -109,6 +120,11 @@ Notes:
 
 - This does not change the mathematical value.
 - It is purely a "fresh name / fresh identity" node in the traced IR.
+
+Current lowering in `src/helion_mlir/ir_visitor.py`:
+
+- No dedicated MLIR op is emitted.
+- The lowering simply forwards the operand SSA to the `_new_var` result.
 
 ### `_for_loop(graph_id: int, begin: list[int], end: list[int], args: list[object]) -> list[object]`
 
@@ -143,7 +159,17 @@ Notes:
 
 - The loop's tiled dimensions are not encoded directly in the op operands.
   They live in the associated `ForLoopGraphInfo.block_ids`.
-- In this repo's MLIR lowering, `_for_loop` becomes `scf.for` or `affine.parallel`/`scf.for` structure, depending on context.
+
+Current lowering in `src/helion_mlir/ir_visitor.py`:
+
+- Lowered to `scf.for`, not to a custom loop op.
+- The trip count is derived primarily as `arith.ceildivui(upper_bound, block_size)`.
+- The lowering emits explicit `%c0` and `%c1` index constants for loop bounds and step.
+- The induction variable is named `%iv_block_<block_id>`.
+- Only values proven to participate in the `_phi(acc, getitem(_for_loop, i))` pattern become `iter_args`.
+- The body is lowered by recursively visiting the referenced `ForLoopGraphInfo`.
+- The loop terminates with `scf.yield`.
+- Multi-result loops use MLIR's multiple-result form, for example `%res:2 = scf.for ...`.
 
 ### `_if(test: object, graph_id: int, args: list[object]) -> list[object]`
 
@@ -171,6 +197,13 @@ Notes:
 
 - An `else` is represented by tracing the other branch separately, commonly using `_not(test)` and another `_if`-style subgraph construction internally.
 
+Current lowering in `src/helion_mlir/ir_visitor.py`:
+
+- Lowered to `scf.if <cond> { ... }`.
+- The current lowering only emits a side-effect-only `scf.if` with no result values.
+- Branch placeholders are bound to outer SSA values before the inner `IfGraphInfo` is visited.
+- No explicit `else` region is emitted by `visit_if`; the traced graphs already decide what body is represented by a given `_if`.
+
 ### `_phi(lhs: object, rhs: object) -> object`
 
 Represents SSA merge at control-flow join points.
@@ -195,7 +228,14 @@ Type constraints enforced by Helion:
 Notes:
 
 - `_phi` is marked side-effecting in the traced IR so it is not dropped too aggressively.
-- In this repo's MLIR lowering, `_phi` becomes the merge point for loop iter args / yielded values.
+
+Current lowering in `src/helion_mlir/ir_visitor.py`:
+
+- No `helion.phi`-like MLIR op is emitted.
+- The only supported lowering pattern is:
+  `_phi(init, getitem(_for_loop(...), i))`
+- In that case, the lowering just forwards the loop-result SSA because `scf.for iter_args` already encode the merge semantics.
+- Any other `_phi` pattern is currently rejected.
 
 ### `_mask_to(tensor: torch.Tensor, other: float | bool) -> torch.Tensor`
 
@@ -216,7 +256,12 @@ Parameters:
 Notes:
 
 - This is not normally written by users directly.
-- In this repo's MLIR lowering it is usually just treated as a boundary-mask normalization step.
+
+Current lowering in `src/helion_mlir/ir_visitor.py`:
+
+- No masking MLIR is currently emitted.
+- The lowering simply forwards the input tensor SSA unchanged.
+- The file explicitly marks this as incomplete and leaves proper masking as future work.
 
 ## Memory and Tensor-View Ops
 
@@ -247,8 +292,17 @@ Parameters:
 
 Notes:
 
-- In this repo's MLIR lowering, `load` becomes a slice/subview load path such as `memref.subview` plus `bufferization.to_tensor`.
-- `tile.index`-based loads may be recognized as index materialization rather than real memory access.
+Current lowering in `src/helion_mlir/ir_visitor.py`:
+
+- Lowered to:
+  `memref.subview` followed by `bufferization.to_tensor`.
+- Scalar integer/scalar SSA indices are treated as rank-reducing indices with subview size `1`.
+- Full slices use offset `0`, stride `1`, and use either a static dimension or a generated `memref.dim`.
+- Tile/block indices are lowered as range accesses:
+  offset = `%iv_block_<id> * block_size`
+  size = `block_size`
+- `tile.index + base` patterns are recognized specially as contiguous ranges.
+- The result type is constructed as a tensor type matching the retained sliced dimensions.
 
 ### `store(tensor, index, value, extra_mask=None) -> None`
 
@@ -273,7 +327,14 @@ Parameters:
 
 Notes:
 
-- In this repo's MLIR lowering, `store` becomes a writeback path such as `bufferization.to_buffer` plus `memref.copy`.
+Current lowering in `src/helion_mlir/ir_visitor.py`:
+
+- Lowered to:
+  `memref.subview`
+  `bufferization.to_buffer`
+  `memref.copy`
+- The destination subview indexing rules mirror `visit_load`.
+- The source tensor value is converted to a buffer with the same subview memref type before the copy.
 
 ### `subscript(tensor: torch.Tensor, index: list[object]) -> torch.Tensor`
 
@@ -295,7 +356,12 @@ Parameters:
 Notes:
 
 - In the examples, this appears in broadcast patterns such as `scale[:, None]`.
-- In this repo's MLIR lowering, it becomes tensor rank reshaping such as `tensor.extract_slice` or `tensor.expand_shape`.
+
+Current lowering in `src/helion_mlir/ir_visitor.py`:
+
+- First lowered through `tensor.extract_slice` for ordinary slicing and integer indexing.
+- Then, if `None` is present, lowered through `tensor.expand_shape` to reinsert size-1 dimensions.
+- Dynamic extents are resolved from Helion metadata when possible, otherwise with `tensor.dim`.
 
 ### `full(shape, value, dtype=torch.float32, device=None) -> torch.Tensor`
 
@@ -321,7 +387,15 @@ Parameters:
 Notes:
 
 - `hl.zeros(shape, dtype, device)` is lowered to this op with `value = 0` or `0.0`.
-- In this repo's MLIR lowering, `full` usually becomes `tensor.empty` plus `linalg.fill`.
+
+Current lowering in `src/helion_mlir/ir_visitor.py`:
+
+- Rank-0 `full([] , value, ...)` lowers directly to `arith.constant`.
+- Higher-rank `full(...)` lowers to:
+  `tensor.empty`
+  `arith.constant` for the fill value
+  `linalg.fill`
+- Dynamic dimensions are passed as operands to `tensor.empty`; static dimensions stay in the result type.
 
 ## Tile-Property Ops
 
@@ -380,7 +454,13 @@ Notes for all three tile ops:
 
 - They are tied to Helion's block-id metadata.
 - Helion uses origin metadata so these values can be reconstructed later during codegen.
-- In this repo's MLIR lowering, `tile_begin` and `tile_id` usually become index arithmetic, while `tile_index` becomes a contiguous range tensor.
+
+Current lowering in `src/helion_mlir/ir_visitor.py`:
+
+- `tile_begin(tile)` lowers to `arith.muli %iv_block_<id>, <block_size_ssa> : index`.
+- `tile_id(tile)` lowers directly to the loop IV `%iv_block_<id>`.
+- `tile_index(tile)` does not lower to a real tensor-producing MLIR op by itself in this repo.
+  It is recorded as a range-producing marker, initialized with a placeholder `arith.constant 0 : index`, and later consumed by the special `tile.index + base` pattern handling used by `load`, `store`, and `atomic_add`.
 
 ## Math / Reduction-Like Helion Ops
 
@@ -415,7 +495,12 @@ Key constraints enforced by Helion:
 
 Notes:
 
-- In this repo's MLIR lowering, `hl.dot` is recognized specially and lowered as `linalg.matmul`.
+Current lowering in `src/helion_mlir/ir_visitor.py`:
+
+- Lowered directly to `linalg.matmul`.
+- The first two operands become `ins(...)`.
+- The accumulator becomes the `outs(...)` operand.
+- The result type is the accumulator tensor type.
 
 ### `atomic_add(target, index, value, sem="relaxed") -> torch.Tensor`
 
@@ -442,7 +527,14 @@ Parameters:
 Notes:
 
 - In the current `split_k_matmul` example, this is used as the reduction writeback.
-- In this repo's MLIR lowering, `atomic_add` is currently represented as a `loom.sum` operation.
+
+Current lowering in `src/helion_mlir/ir_visitor.py`:
+
+- The destination is first lowered exactly like a tiled host-tensor access:
+  `memref.subview`
+- The update itself is then lowered as:
+  `"loom.sum"(%subview, %value) : (<subview memref type>, <value tensor type>) -> ()`
+- So the current backend does not emit a generic MLIR atomic op here; it emits the project-specific `loom.sum`.
 
 ## What Is Not Covered Here
 

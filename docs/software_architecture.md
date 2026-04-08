@@ -270,7 +270,8 @@ This section details the information held by `LoweringContext` and how `IRVisito
 **Usage in IRVisitor**:
 - `visit_get_symnode`: Uses Origin-based lookup:
   - `BlockSizeOrigin` → Use pre-emitted `ctx.block_size_ssa[block_id]`
-  - Other origins → Use `shape_env.var_to_val` for concrete value → `arith.constant`
+  - Other origins → Use a directly resolved `shape_env.var_to_val` entry when
+    present → `arith.constant`
 - `visit_host_tensor`: Looks up tensor names in `ctx.host_tensors`:
   ```python
   ssa = self.ctx.host_tensors.get(tensor_name)  # e.g., "x" → "%x"
