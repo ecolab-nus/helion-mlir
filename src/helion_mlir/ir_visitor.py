@@ -110,6 +110,68 @@ class IRVisitor:
             return (str(concrete_val), True)
 
         return (None, False)
+
+    @staticmethod
+    def _split_top_level_commas(text: str) -> list[str]:
+        """Split a type payload on commas that are not nested inside delimiters."""
+        parts: list[str] = []
+        current: list[str] = []
+        angle_depth = 0
+        square_depth = 0
+        paren_depth = 0
+
+        for ch in text:
+            if ch == "<":
+                angle_depth += 1
+            elif ch == ">":
+                angle_depth = max(0, angle_depth - 1)
+            elif ch == "[":
+                square_depth += 1
+            elif ch == "]":
+                square_depth = max(0, square_depth - 1)
+            elif ch == "(":
+                paren_depth += 1
+            elif ch == ")":
+                paren_depth = max(0, paren_depth - 1)
+
+            if ch == "," and angle_depth == 0 and square_depth == 0 and paren_depth == 0:
+                parts.append("".join(current).strip())
+                current = []
+                continue
+
+            current.append(ch)
+
+        if current:
+            parts.append("".join(current).strip())
+        return parts
+
+    @classmethod
+    def _parse_plain_memref_dimensions(cls, memref_type: str, op_name: str) -> list[str]:
+        """Extract dimensions from a memref type supported by current subview lowering."""
+        if not (memref_type.startswith("memref<") and memref_type.endswith(">")):
+            raise RuntimeError(f"{op_name} expects a memref type, got {memref_type}")
+
+        content = memref_type[memref_type.find("<") + 1 : memref_type.rfind(">")]
+        top_level_parts = cls._split_top_level_commas(content)
+        if len(top_level_parts) != 1:
+            raise RuntimeError(
+                f"{op_name} only supports implicit identity-layout memrefs without "
+                f"extra layout annotations, got {memref_type}"
+            )
+
+        shape_and_dtype = top_level_parts[0]
+        if "x" not in shape_and_dtype:
+            return []
+        return shape_and_dtype.split("x")[:-1]
+
+    @staticmethod
+    def _validate_full_unit_slice(idx: slice, op_name: str, dim: int) -> None:
+        """Reject slices that the current lowering does not model correctly."""
+        if idx.start is not None or idx.stop is not None or idx.step not in (None, 1):
+            raise RuntimeError(
+                f"{op_name} only supports full-dimension unit-step slices (:). "
+                f"Unsupported slice at dim {dim}: slice({idx.start}, {idx.stop}, {idx.step})"
+            )
         
     # def register_graph(self, graph_id: int, graph_info: "GraphInfo") -> None:
     #     """Register a graph for later visitation (e.g., ForLoopGraphInfo)."""
@@ -1150,17 +1212,11 @@ class IRVisitor:
         output_dim_sizes = []
         retained_dim_positions = []
         
-        def parse_memref_dimensions(type_str: str) -> list[str]:
-            if 'memref<' in type_str and '>' in type_str:
-                content = type_str[type_str.find('<')+1 : type_str.rfind('>')]
-                if 'x' in content:
-                    return content.split('x')[:-1]
-            return []
-        
-        src_dims = parse_memref_dimensions(memref_type)
+        src_dims = self._parse_plain_memref_dimensions(memref_type, "load")
         
         for i, idx in enumerate(indices):
             if isinstance(idx, slice):
+                self._validate_full_unit_slice(idx, "load", i)
                 # Full dimension slice - offset=0 (static), size comes from memref dim
                 offsets.append(("0", True))
                 
@@ -1393,6 +1449,7 @@ class IRVisitor:
         
         for i, idx in enumerate(indices):
             if isinstance(idx, slice):
+                self._validate_full_unit_slice(idx, "store", i)
                 # Full dimension slice - offset=0 (static), size comes from value tensor dim
                 offsets.append(("0", True))
                 
@@ -1488,19 +1545,7 @@ class IRVisitor:
             else:
                 output_dims.append("?")
         
-        # Helper to extract dimensions from memref type string
-        def parse_memref_dimensions(type_str: str) -> list[str]:
-            """Extract dimension strings from a memref type like 'memref<256x128xf32>'."""
-            if 'memref<' in type_str and '>' in type_str:
-                content = type_str[type_str.find('<')+1 : type_str.rfind('>')]
-                # Handle optional layout info by splitting on comma first
-                if ',' in content:
-                    content = content.split(',')[0]
-                if 'x' in content:
-                    return content.split('x')[:-1]  # Exclude dtype
-            return []
-        
-        memref_dims = parse_memref_dimensions(memref_type)
+        memref_dims = self._parse_plain_memref_dimensions(memref_type, "store")
         
         # Compute strides from source memref dimensions (row-major)
         # For source memref<D0xD1xD2xf32>, strides are [D1*D2, D2, 1]
@@ -1599,19 +1644,11 @@ class IRVisitor:
         output_dim_sizes = []
         retained_dim_positions = []
 
-        def parse_memref_dimensions(type_str: str) -> list[str]:
-            if "memref<" in type_str and ">" in type_str:
-                content = type_str[type_str.find("<") + 1 : type_str.rfind(">")]
-                if "," in content:
-                    content = content.split(",")[0]
-                if "x" in content:
-                    return content.split("x")[:-1]
-            return []
-
-        src_dims = parse_memref_dimensions(memref_type)
+        src_dims = self._parse_plain_memref_dimensions(memref_type, "atomic_add")
 
         for i, idx in enumerate(indices):
             if isinstance(idx, slice):
+                self._validate_full_unit_slice(idx, "atomic_add", i)
                 offsets.append(("0", True))
 
                 src_dim_static = None
@@ -1968,6 +2005,7 @@ class IRVisitor:
             
             for idx in slice_indices:
                 if isinstance(idx, slice):
+                    self._validate_full_unit_slice(idx, "subscript", input_dim_idx)
                     # Handle slice(None) aka [:]
                     # Offset 0 - use inline literal
                     offsets_ssa.append("0")
