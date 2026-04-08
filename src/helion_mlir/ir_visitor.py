@@ -238,6 +238,23 @@ class IRVisitor:
         if target is operator.getitem:
             return self.visit_getitem(node)
         
+        # _if -> scf.if + recursive visit
+        if target is hl_tracing_ops._if:
+            return self.visit_if(node)
+
+        # Comparison operators -> arith.cmpi
+        import operator as _operator
+        _COMPARISON_OPS = {
+            _operator.eq: "eq",
+            _operator.ne: "ne",
+            _operator.lt: "slt",
+            _operator.le: "sle",
+            _operator.gt: "sgt",
+            _operator.ge: "sge",
+        }
+        if target in _COMPARISON_OPS:
+            return self.visit_comparison(node, _COMPARISON_OPS[target])
+
         # aten.full.default -> tensor.empty + linalg.fill
         if target is aten.full.default:
             return self.visit_aten_full(node)
@@ -247,7 +264,7 @@ class IRVisitor:
             'aten' in str(target) or 'prims.' in str(target)
         ):
             return self.visit_aten_compute(node)
-        
+
         # Unsupported target
         raise RuntimeError(f"Unsupported target: {target}")
 
@@ -1814,6 +1831,81 @@ class IRVisitor:
         self.mlir_output_helper.emit(f'{result} = arith.muli {iv_plus_one}, {bs_ssa} : index')
         self.ctx.node_values[node.name] = result
         return result
+
+    def visit_comparison(self, node: fx.Node, predicate: str) -> str:
+        """Emit arith.cmpi for integer/index comparisons (eq, ne, slt, etc.)."""
+        lhs_node = node.args[0]
+        rhs_val = node.args[1]
+
+        # Resolve LHS
+        if isinstance(lhs_node, fx.Node):
+            lhs_ssa = self.ctx.node_values.get(lhs_node.name, f"%{lhs_node.name}")
+        else:
+            lhs_ssa = self.mlir_output_helper.fresh("cmp_lhs")
+            self.mlir_output_helper.emit(
+                f'{lhs_ssa} = arith.constant {int(lhs_node)} : index'
+            )
+
+        # Resolve RHS
+        if isinstance(rhs_val, fx.Node):
+            rhs_ssa = self.ctx.node_values.get(rhs_val.name, f"%{rhs_val.name}")
+        elif isinstance(rhs_val, (int, float)):
+            rhs_ssa = self.mlir_output_helper.fresh("cmp_rhs")
+            self.mlir_output_helper.emit(
+                f'{rhs_ssa} = arith.constant {int(rhs_val)} : index'
+            )
+        else:
+            raise RuntimeError(f"Unsupported comparison RHS: {rhs_val}")
+
+        result = self.mlir_output_helper.fresh("cmp")
+        self.mlir_output_helper.emit(
+            f'{result} = arith.cmpi {predicate}, {lhs_ssa}, {rhs_ssa} : index'
+        )
+        self.ctx.node_values[node.name] = result
+        return result
+
+    def visit_if(self, node: fx.Node) -> str | None:
+        """Generate scf.if and visit the IfGraphInfo body."""
+        test_node = node.args[0]       # The i1 condition
+        graph_id = node.args[1]        # IfGraphInfo graph_id
+        args = node.args[2]            # Values passed to the if-body
+
+        # Resolve condition SSA
+        if isinstance(test_node, fx.Node):
+            cond_ssa = self.ctx.node_values.get(test_node.name, f"%{test_node.name}")
+        else:
+            raise RuntimeError(f"Unsupported _if condition: {test_node}")
+
+        # Get the IfGraphInfo
+        if_graph = self.ctx.graphs.get(graph_id)
+        if if_graph is None:
+            raise ValueError(f"IfGraphInfo with graph_id={graph_id} not registered")
+
+        # Emit scf.if (no results for side-effect-only body)
+        self.mlir_output_helper.emit(f'scf.if {cond_ssa} {{')
+        self.mlir_output_helper.push()
+
+        # Map if-body placeholders to outer-scope SSA values
+        old_loop_iter_args = self.loop_iter_args.copy()
+        for i, a in enumerate(args):
+            placeholder_name = f"arg{i}_1"
+            if isinstance(a, fx.Node):
+                ssa = self.ctx.node_values.get(a.name, f"%{a.name}")
+                self.loop_iter_args[placeholder_name] = ssa
+                if a.name in self.ctx.node_types:
+                    self.ctx.node_types[placeholder_name] = self.ctx.node_types[a.name]
+
+        # Visit inner graph
+        self.visit_graph(if_graph)
+
+        # Restore
+        self.loop_iter_args = old_loop_iter_args
+
+        self.mlir_output_helper.pop()
+        self.mlir_output_helper.emit("}")
+
+        self.ctx.node_values[node.name] = None
+        return None
 
     def visit_mask_to(self, node: fx.Node) -> str:
         """Shortcircuit _mask_to by passing through the input tensor.

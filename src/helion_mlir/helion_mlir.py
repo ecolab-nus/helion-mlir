@@ -67,6 +67,7 @@ def generate_mlir(
         RootGraphInfo,
         ForLoopGraphInfo,
         ReductionLoopGraphInfo,
+        IfGraphInfo,
     )
 
     # ------------------------------------------------------------------
@@ -93,7 +94,7 @@ def generate_mlir(
             continue
         if isinstance(graph_info, RootGraphInfo):
             root_graphs[graph_info.graph_id] = graph_info
-        elif isinstance(graph_info, (ForLoopGraphInfo, ReductionLoopGraphInfo)):
+        elif isinstance(graph_info, (ForLoopGraphInfo, ReductionLoopGraphInfo, IfGraphInfo)):
             inner_graphs[graph_info.graph_id] = graph_info
 
     if not root_graphs:
@@ -122,9 +123,14 @@ def generate_mlir(
             continue
 
         for node in ginfo.graph.nodes:
-            if node.op != "call_function" or node.target is not hl_tracing_ops._for_loop:
+            if node.op != "call_function":
                 continue
-            nested_gid = node.args[0]
+            if node.target is hl_tracing_ops._for_loop:
+                nested_gid = node.args[0]
+            elif node.target is hl_tracing_ops._if:
+                nested_gid = node.args[1]  # _if(test, graph_id, args)
+            else:
+                continue
             if isinstance(nested_gid, int) and nested_gid in inner_graphs:
                 if nested_gid not in reachable_inner_ids:
                     reachable_inner_ids.add(nested_gid)

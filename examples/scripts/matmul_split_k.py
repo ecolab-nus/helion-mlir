@@ -55,8 +55,8 @@ def split_k_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
     for tile_m, tile_n, tile_k in hl.tile([m, n, k]):
         acc = torch.mm(a[tile_m, tile_k], b[tile_k, tile_n])
-        hl.atomic_add(out, [tile_m, tile_n], acc)
-
+        if tile_k.begin == 0:
+            hl.atomic_add(out, [tile_m, tile_n], acc)
     return out
 
 
