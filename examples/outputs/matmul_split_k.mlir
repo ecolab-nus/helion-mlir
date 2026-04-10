@@ -3,26 +3,26 @@ Graph 0: IfGraphInfo
 opcode         name            target                                     args                                                        kwargs
 -------------  --------------  -----------------------------------------  ----------------------------------------------------------  --------
 placeholder    arg0_1          arg0_1                                     ()                                                          {}
-call_function  _new_var        <function _new_var at 0x7f50297c80d0>      (arg0_1,)                                                   {}
-call_function  out             <function _host_tensor at 0x7f50297967a0>  ('out',)                                                    {}
+call_function  _new_var        <function _new_var at 0x7fecb3ecc0d0>      (arg0_1,)                                                   {}
+call_function  out             <function _host_tensor at 0x7fecb3e9e7a0>  ('out',)                                                    {}
 call_function  sym_size_int    aten.sym_size.int                          (arg0_1, 0)                                                 {}
 call_function  sym_size_int_1  aten.sym_size.int                          (arg0_1, 1)                                                 {}
-call_function  atomic_add      <function atomic_add at 0x7f50341c1e10>    (out, [sym_size_int, sym_size_int_1], _new_var, 'relaxed')  {}
+call_function  atomic_add      <function atomic_add at 0x7fecb4869e10>    (out, [sym_size_int, sym_size_int_1], _new_var, 'relaxed')  {}
 output         output          output                                     ([],)                                                       {}
 Graph 1: RootGraphInfo
 opcode         name          target                                     args                                           kwargs
 -------------  ------------  -----------------------------------------  ---------------------------------------------  --------
-call_function  a             <function _host_tensor at 0x7f50297967a0>  ('a',)                                         {}
-call_function  block_size_0  <function _get_symnode at 0x7f5029795b40>  ('block_size_0',)                              {}
-call_function  block_size_2  <function _get_symnode at 0x7f5029795b40>  ('block_size_2',)                              {}
-call_function  load          <function load at 0x7f501aa52320>          (a, [block_size_0, block_size_2], None, None)  {}
-call_function  b             <function _host_tensor at 0x7f50297967a0>  ('b',)                                         {}
-call_function  block_size_1  <function _get_symnode at 0x7f5029795b40>  ('block_size_1',)                              {}
-call_function  load_1        <function load at 0x7f501aa52320>          (b, [block_size_2, block_size_1], None, None)  {}
+call_function  a             <function _host_tensor at 0x7fecb3e9e7a0>  ('a',)                                         {}
+call_function  block_size_0  <function _get_symnode at 0x7fecb3e9db40>  ('block_size_0',)                              {}
+call_function  block_size_2  <function _get_symnode at 0x7fecb3e9db40>  ('block_size_2',)                              {}
+call_function  load          <function load at 0x7feca5126320>          (a, [block_size_0, block_size_2], None, None)  {}
+call_function  b             <function _host_tensor at 0x7fecb3e9e7a0>  ('b',)                                         {}
+call_function  block_size_1  <function _get_symnode at 0x7fecb3e9db40>  ('block_size_1',)                              {}
+call_function  load_1        <function load at 0x7feca5126320>          (b, [block_size_2, block_size_1], None, None)  {}
 call_function  acc           aten.mm.default                            (load, load_1)                                 {}
-call_function  tile_begin    <function tile_begin at 0x7f501aa6dea0>    (block_size_2,)                                {}
-call_function  eq_2          <built-in function eq>                     (tile_begin, 0)                                {}
-call_function  _if           <function _if at 0x7f5029796e60>           (eq_2, 0, [acc])                               {}
+call_function  tile_id       <function tile_id at 0x7feca51427a0>       (block_size_2,)                                {}
+call_function  eq_2          <built-in function eq>                     (tile_id, 0)                                   {}
+call_function  _if           <function _if at 0x7fecb3e9ee60>           (eq_2, 0, [acc])                               {}
 output         output        output                                     (None,)                                        {}
 
 
@@ -41,7 +41,7 @@ Node b : FakeTensor(..., size=(s52, s20))
 Node block_size_1 : u1
 Node load_1 : FakeTensor(..., size=(u2, u1))
 Node acc : FakeTensor(..., size=(u0, u1))
-Node tile_begin : u3
+Node tile_id : u3
 Node eq_2 : Eq(u3, 0)
 Node _if : []
 
@@ -86,7 +86,7 @@ module attributes {loom.tile_k = {is_reduction = false, upper_bound = 4096 : ind
       %11 = tensor.empty(%0, %1) : tensor<?x?xf32>
       %12 = linalg.fill ins(%cst : f32) outs(%11 : tensor<?x?xf32>) -> tensor<?x?xf32>
       %13 = linalg.matmul ins(%8, %10 : tensor<?x?xf32>, tensor<?x?xf32>) outs(%12 : tensor<?x?xf32>) -> tensor<?x?xf32>
-      %14 = arith.cmpi eq, %7, %c0 : index
+      %14 = arith.cmpi eq, %arg5, %c0 : index
       scf.if %14 {
         %subview_1 = memref.subview %arg0[%6, %9] [%0, %1] [1, 1] : memref<256x256xf32> to memref<?x?xf32, strided<[256, 1], offset: ?>>
         "loom.sum"(%subview_1, %13) : (memref<?x?xf32, strided<[256, 1], offset: ?>>, tensor<?x?xf32>) -> ()
