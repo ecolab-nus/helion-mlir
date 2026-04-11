@@ -155,7 +155,7 @@ def main() -> None:
     """
     Main function to run MLIR generation and validation.
     """
-    batch = 1
+    batch = 2
     seqlen = 2048
     nheads = 16
     headdim = 64
