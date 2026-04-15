@@ -199,8 +199,9 @@ class LoweringContext:
         host_function = self.bound_kernel.host_function
         shape_env = self.bound_kernel.env.shape_env
         
-        # Determine shape: ? for BlockSizeOrigin, concrete otherwise
+        # Determine shape: ? for dynamic BlockSizeOrigin, concrete otherwise
         shape = []
+        block_sizes = self.bound_kernel.env.block_sizes
         ndim = len(fake_tensor.shape)
         for dim_idx in range(ndim):
             dim_size = fake_tensor.shape[dim_idx]
@@ -209,10 +210,23 @@ class LoweringContext:
                 sym = dim_size._sympy_()
                 origin_info = host_function.expr_to_origin.get(sym)
                 origin = origin_info.origin if origin_info else None
-                
+
                 if isinstance(origin, BlockSizeOrigin):
-                    # Dynamic dimension
-                    shape.append(None)
+                    # Only mark as dynamic if the block size is not a static integer.
+                    # hl.specialize and reduction-loop blocks have a concrete int size
+                    # (e.g. head_dim=128, num_heads=32); those should be emitted as
+                    # static dimensions, matching the behaviour of resolve_dimension().
+                    block_info = block_sizes[origin.block_id]
+                    if isinstance(block_info.size, int):
+                        shape.append(block_info.size)
+                    else:
+                        shape.append(None)
+                elif sym.is_number:
+                    # The sympy expression reduced to a concrete integer constant
+                    # (e.g. hl.specialize resolves head_dim to Integer(128)).
+                    # shape_env.var_to_val only holds symbolic variables so this
+                    # case must be caught explicitly before the var_to_val lookup.
+                    shape.append(int(sym))
                 elif sym in shape_env.var_to_val:
                     # Concrete value from shape_env
                     shape.append(int(shape_env.var_to_val[sym]))
@@ -225,7 +239,7 @@ class LoweringContext:
             else:
                 # Unknown type - use dynamic
                 shape.append(None)
-        
+
         return format_tensor_type(shape, dtype_str)
     
     def compute_mlir_memref_type_from_fake_tensor(self, fake_tensor) -> str:
@@ -253,8 +267,9 @@ class LoweringContext:
         host_function = self.bound_kernel.host_function
         shape_env = self.bound_kernel.env.shape_env
         
-        # Determine shape: ? for BlockSizeOrigin, concrete otherwise
+        # Determine shape: ? for dynamic BlockSizeOrigin, concrete otherwise
         shape = []
+        block_sizes = self.bound_kernel.env.block_sizes
         ndim = len(fake_tensor.shape)
         for dim_idx in range(ndim):
             dim_size = fake_tensor.shape[dim_idx]
@@ -263,10 +278,21 @@ class LoweringContext:
                 sym = dim_size._sympy_()
                 origin_info = host_function.expr_to_origin.get(sym)
                 origin = origin_info.origin if origin_info else None
-                
+
                 if isinstance(origin, BlockSizeOrigin):
-                    # Dynamic dimension
-                    shape.append(None)
+                    # Only mark as dynamic if the block size is not a static integer.
+                    # hl.specialize and reduction-loop blocks have a concrete int size;
+                    # those should appear as static dimensions in the memref type.
+                    block_info = block_sizes[origin.block_id]
+                    if isinstance(block_info.size, int):
+                        shape.append(block_info.size)
+                    else:
+                        shape.append(None)
+                elif sym.is_number:
+                    # The sympy expression reduced to a concrete integer constant.
+                    # Must be caught before the var_to_val lookup since concrete
+                    # integers are not stored as symbolic variables.
+                    shape.append(int(sym))
                 elif sym in shape_env.var_to_val:
                     # Concrete value from shape_env
                     shape.append(int(shape_env.var_to_val[sym]))

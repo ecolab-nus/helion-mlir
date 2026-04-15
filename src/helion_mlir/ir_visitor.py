@@ -1910,14 +1910,22 @@ class IRVisitor:
         return subview_ssa
 
     def visit_gather(self, node: fx.Node) -> str:
-        """Emit a ``loom.gather`` placeholder op for the custom gather op.
+        """Emit a linalg-style ``loom.gather`` op for the custom gather op.
 
-        gather(tile, src) → tensor<?x*src_shape>
+        Lowering pattern for ``gathered = gather(tile_k, src)``:
 
-        The leading ``?`` dimension represents the tile-count (trip count of the
-        gathered loop axis).  The op is registered as an *unregistered* dialect
-        op in MLIR; pass ``--allow-unregistered-dialect`` to mlir-opt for
-        validation.
+          %empty    = tensor.empty(%trip_count, d0, d1, ...) : tensor<?x*src_shape>
+          %gathered = "loom.gather"(%src, %empty, %iv_block_N)
+                        : (tensor<*src_shape>, tensor<?x*src_shape>, index)
+                        -> tensor<?x*src_shape>
+
+        Operand convention (mirrors linalg ins/outs/across):
+          arg 0  – ins:    source tile tensor
+          arg 1  – outs:   output buffer (tensor.empty with leading trip-count dim)
+          arg 2  – across: loop IV of the gathered axis (runtime index)
+
+        The op is an unregistered-dialect placeholder; pass
+        ``--allow-unregistered-dialect`` to mlir-opt for validation.
         """
         tile_node = node.args[0]
         src_node = node.args[1]
@@ -1931,7 +1939,7 @@ class IRVisitor:
                 f"gather: second arg (src) must be an fx.Node, got {type(src_node)}"
             )
 
-        # Recover the block_id from the tile node.
+        # Recover the canonical block_id from the tile node.
         block_id = self._try_get_block_id_from_node(tile_node)
         if block_id is None:
             raise RuntimeError(
@@ -1939,10 +1947,11 @@ class IRVisitor:
                 "Make sure the first argument is a Tile / block-size symnode."
             )
 
-        # Trip-count SSA for this reduction/parallel axis.
+        # ------------------------------------------------------------------
+        # Trip-count SSA for this gathered axis.
+        # ------------------------------------------------------------------
         trip_count_ssa = self.ctx.reduction_trip_counts.get(block_id)
         if trip_count_ssa is None:
-            # Fall back: compute trip count inline.
             import math
             info = self.ctx.env.block_sizes[block_id]
             total_extent = self.ctx.get_loop_extent(block_id)
@@ -1963,22 +1972,94 @@ class IRVisitor:
                     f"{trip_count_ssa} = arith.ceildivui {extent_ssa}, {tile_size_ssa} : index"
                 )
 
+        # ------------------------------------------------------------------
+        # Loop IV SSA of the gathered axis  (the "across" operand).
+        # ------------------------------------------------------------------
+        canonical_block_id = self.ctx.resolve_block_id(block_id)
+        iv_ssa = self._get_block_loop_iv(canonical_block_id)
+
+        # ------------------------------------------------------------------
+        # Source tensor SSA and type.
+        # ------------------------------------------------------------------
         src_ssa = self.ctx.node_values.get(src_node.name, f"%{src_node.name}")
         src_type = self._get_tensor_type(src_node)
 
         # Build result type: tensor<?x*src_inner_dims>.
-        # src_type is something like tensor<?x?xf16> or tensor<64x64xf16>.
         if src_type.startswith("tensor<") and src_type.endswith(">"):
-            inner = src_type[len("tensor<"):-1]  # e.g. "?x?xf16"
+            inner = src_type[len("tensor<"):-1]  # e.g. "?x?xf16" or "64x64xf16"
             result_type = f"tensor<?x{inner}>"
         else:
-            # Unexpected type — best-effort fallback.
             result_type = f"tensor<?x{src_type}>"
 
+        # ------------------------------------------------------------------
+        # Resolve per-dimension SSAs for tensor.empty(%trip_count, d0, d1, …).
+        # Use FakeTensor metadata when available so that static dims
+        # (e.g. from hl.specialize) appear as literals rather than tensor.dim
+        # calls, keeping the empty type consistent with result_type.
+        # ------------------------------------------------------------------
+        src_fake_tensor = src_node.meta.get("val") if isinstance(src_node, fx.Node) else None
+
+        empty_shape_ssas: list[str] = [trip_count_ssa]  # leading trip-count dim
+        result_inner_dims: list[str] = []               # dims for result_type (after '?x')
+
+        ndim = src_fake_tensor.ndim if src_fake_tensor is not None else 0
+        for dim_idx in range(ndim):
+            dim_resolved = None
+            is_static = False
+            if src_fake_tensor is not None:
+                dim_size = src_fake_tensor.size(dim_idx)
+                value_str, is_static = self.resolve_dimension(dim_size, dim_idx)
+                if value_str is not None:
+                    dim_resolved = value_str
+
+            if dim_resolved is None:
+                # Fallback: emit tensor.dim at runtime.
+                dim_idx_ssa = self.mlir_output_helper.fresh("dim_idx")
+                dim_ssa = self.mlir_output_helper.fresh("dim")
+                self.mlir_output_helper.emit(
+                    f"{dim_idx_ssa} = arith.constant {dim_idx} : index"
+                )
+                self.mlir_output_helper.emit(
+                    f"{dim_ssa} = tensor.dim {src_ssa}, {dim_idx_ssa} : {src_type}"
+                )
+                dim_resolved = dim_ssa
+
+            empty_shape_ssas.append(dim_resolved)
+            result_inner_dims.append(dim_resolved if is_static else "?")
+
+        # Re-derive result_type using the statically-resolved inner dims so that
+        # tensor.empty's result type matches what downstream consumers expect.
+        dtype_suffix = src_type[src_type.rfind("x") + 1:-1]  # e.g. "f16"
+        if result_inner_dims:
+            inner_dims_str = "x".join(result_inner_dims)
+            result_type = f"tensor<?x{inner_dims_str}x{dtype_suffix}>"
+        else:
+            result_type = f"tensor<?x{dtype_suffix}>"
+
+        # ------------------------------------------------------------------
+        # Emit tensor.empty for the output buffer.
+        # ------------------------------------------------------------------
+        empty_shape_str = ", ".join(
+            s for s in empty_shape_ssas if s.startswith("%")
+        )
+        empty_ssa = self.mlir_output_helper.fresh("gather_out")
+        self.mlir_output_helper.emit(
+            f"{empty_ssa} = tensor.empty({empty_shape_str}) : {result_type}"
+        )
+
+        # ------------------------------------------------------------------
+        # Emit loom.gather in linalg-style (registered op).
+        # GatherOp uses AttrSizedOperandSegments; the attribute name in this
+        # MLIR version is camelCase "operandSegmentSizes" (not snake_case).
+        # The four optional MeshBoundsArgs are absent (size = 0 each).
+        # Segment order: ins(1), init(1), across(1), ul_x(0), ul_y(0),
+        #                lr_x(0), lr_y(0)
+        # ------------------------------------------------------------------
         result_ssa = self.mlir_output_helper.fresh("gathered")
         self.mlir_output_helper.emit(
-            f'{result_ssa} = "loom.gather"({src_ssa}, {trip_count_ssa}) '
-            f': ({src_type}, index) -> {result_type}'
+            f'{result_ssa} = "loom.gather"({src_ssa}, {empty_ssa}, {iv_ssa}) '
+            f'{{operandSegmentSizes = array<i32: 1, 1, 1, 0, 0, 0, 0>}} '
+            f': ({src_type}, {result_type}, index) -> {result_type}'
         )
 
         self.ctx.node_values[node.name] = result_ssa
@@ -2251,14 +2332,23 @@ class IRVisitor:
                     
                     input_dim_idx += 1
             
-            res_rank = 0
+            # Build result dims: static literal when the size is known at compile
+            # time (resolve_dimension returned a non-SSA value), '?' otherwise.
+            # Using '?' for a dimension whose size_ssa is a static literal causes
+            # a type mismatch when downstream ops (expand_shape, linalg) infer the
+            # static size from the literal.
+            result_dims = []
+            sizes_iter = iter(sizes_ssa)
             for idx in slice_indices:
+                size_val = next(sizes_iter)
                 if isinstance(idx, slice):
-                    res_rank += 1
-            
+                    # Keep this dimension; use the literal when static.
+                    result_dims.append(size_val if not size_val.startswith("%") else "?")
+                # Integer-indexed dimensions are rank-reduced (dropped from result).
+
             # Derive dtype from source FakeTensor
             source_dtype = self._get_element_type_from_node(tensor_node)
-            dims_str = "x".join(["?"] * res_rank)
+            dims_str = "x".join(result_dims)
             result_type = f"tensor<{dims_str}x{source_dtype}>"
             extracted_type = result_type
             
@@ -2346,29 +2436,23 @@ class IRVisitor:
                 
             reassoc_str = "[" + ", ".join(["[" + ", ".join(map(str, grp)) + "]" for grp in reassoc_list]) + "]"
             
-            # Result type - use '1' for new dimensions (from None), '?' for real dimensions
-            result_dims = []
-            for dtype in output_dim_types:
-                if dtype == 'new':
-                    result_dims.append("1")  # New dimensions from None are always size 1
-                else:
-                    result_dims.append("?")  # Real dimensions are dynamic
-            
             source_dtype = self._get_element_type_from_node(tensor_node)
-            dims_str = "x".join(result_dims)
-            result_type = f"tensor<{dims_str}x{source_dtype}>"
-            
             result_expand = self.mlir_output_helper.fresh("expand")
-            
-            # Compute output_shape for dynamic dimensions
-            # For each output dimension, we need its size as an SSA value or literal
-            # We use the source tensor's FakeTensor to resolve dimensions
+
+            # Compute output_shape and result_dims in a single pass so that
+            # static dimensions resolved via resolve_dimension (e.g. from
+            # hl.specialize) are reflected consistently in both the
+            # output_shape operand list and the result tensor type.
+            # Previously result_dims was built separately and always used '?'
+            # for real dimensions, causing a type mismatch when output_shape
+            # contained a static literal (e.g. '32' vs '?').
             output_shape_ssas = []
+            result_dims = []
             extracted_dim_idx = 0  # Track which dimension of extracted_ssa we're on
-            
+
             # Get source FakeTensor for dimension resolution
             source_fake_tensor = tensor_node.meta.get("val") if isinstance(tensor_node, fx.Node) else None
-            
+
             # Build mapping from extracted dims to source dims (accounting for integer indexing)
             # slice_indices already excludes None, so:
             # - Each slice contributes one dim (maps to source dim)
@@ -2383,14 +2467,16 @@ class IRVisitor:
                     # Integer indexing - size is 1, but still consumes a source dim
                     source_dim_for_extracted.append(src_dim)
                     src_dim += 1
-            
+
             for i, dtype in enumerate(output_dim_types):
                 if dtype == 'new':
                     # New dimension from None - always size 1 (inline literal)
                     output_shape_ssas.append("1")
+                    result_dims.append("1")
                 else:
                     # Real dimension - try to resolve from source FakeTensor
                     dim_resolved = None
+                    is_static = False
                     if source_fake_tensor is not None and extracted_dim_idx < len(source_dim_for_extracted):
                         source_dim = source_dim_for_extracted[extracted_dim_idx]
                         if source_dim < source_fake_tensor.ndim:
@@ -2398,7 +2484,7 @@ class IRVisitor:
                             value_str, is_static = self.resolve_dimension(dim_size, source_dim)
                             if value_str is not None:
                                 dim_resolved = value_str
-                    
+
                     if dim_resolved is None:
                         # Fallback to tensor.dim
                         dim_idx_ssa = self.mlir_output_helper.fresh("dim_idx")
@@ -2406,9 +2492,17 @@ class IRVisitor:
                         self.mlir_output_helper.emit(f'{dim_idx_ssa} = arith.constant {extracted_dim_idx} : index')
                         self.mlir_output_helper.emit(f'{dim_ssa} = tensor.dim {extracted_ssa}, {dim_idx_ssa} : {extracted_type}')
                         dim_resolved = dim_ssa
-                    
+                        result_dims.append("?")
+                    else:
+                        # Use static value in type when the dimension is known at
+                        # compile time; otherwise keep it dynamic ('?').
+                        result_dims.append(dim_resolved if is_static else "?")
+
                     output_shape_ssas.append(dim_resolved)
                     extracted_dim_idx += 1
+
+            dims_str = "x".join(result_dims)
+            result_type = f"tensor<{dims_str}x{source_dtype}>"
             
             output_shape_str = "[" + ", ".join(output_shape_ssas) + "]"
             
