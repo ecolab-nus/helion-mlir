@@ -74,7 +74,7 @@ def helion_mamba2_chunk_scan_kernel(
     assert D.shape == (nheads,)
 
     dtype = cb.dtype
-    accum_dtype = torch.float32
+    accum_dtype = torch.float16
     assert (
         x.dtype
         == dt.dtype
@@ -87,14 +87,13 @@ def helion_mamba2_chunk_scan_kernel(
 
     out = torch.empty_like(x)
 
-    p = 1.44269504
-
     for tile_h, tile_m, tile_n, tile_b, tile_c in hl.tile(
         [nheads, chunk_size, headdim, batch, nchunks],
         block_size=[1, block_m, block_n, 1, 1],
     ):
+        p = hl.full([], 1.44269504, dtype=torch.float16)
         acc_o = hl.zeros([tile_m, tile_n], dtype=accum_dtype)
-        dA_cumsum_local_m = dA_cumsum[tile_b.begin, tile_h.begin, tile_c.begin, tile_m].to(torch.float32)
+        dA_cumsum_local_m = dA_cumsum[tile_b.begin, tile_h.begin, tile_c.begin, tile_m]
         scale_m_local = torch.exp2(dA_cumsum_local_m * p)
 
         C_local = C[
@@ -119,13 +118,11 @@ def helion_mamba2_chunk_scan_kernel(
             ]
             dA_cumsum_local_k = dA_cumsum[
                 tile_b.begin, tile_h.begin, tile_c.begin, tile_k
-            ].to(torch.float32)
+            ]
             cb_local *= torch.exp2(
                 dA_cumsum_local_m[:, None] * p - dA_cumsum_local_k[None, :] * p
             )
-            dt_local = dt[tile_b.begin, tile_h.begin, tile_c.begin, tile_k].to(
-                torch.float32
-            )
+            dt_local = dt[tile_b.begin, tile_h.begin, tile_c.begin, tile_k]
             cb_local = (cb_local * dt_local[None, :]).to(dtype)
             # Yet not support sparse matmul
             # pred = (tile_m.index + 0)[:, None] >= (tile_k.index + 0)[None, :]
@@ -138,10 +135,10 @@ def helion_mamba2_chunk_scan_kernel(
             ]
             acc_o = hl.dot(cb_local, x_local, acc=acc_o)
 
-        D_local = D[tile_h.begin].to(torch.float32)
+        D_local = D[tile_h.begin]
         x_residual = x[
             tile_b.begin, tile_c.begin * chunk_size + tile_m.index, tile_h.begin, tile_n
-        ].to(torch.float32)
+        ]
         acc_o += x_residual * D_local
         out[
             tile_b.begin, tile_c.begin * chunk_size + tile_m.index, tile_h.begin, tile_n
@@ -157,11 +154,11 @@ def main() -> None:
     """
     batch = 2
     seqlen = 2048
-    nheads = 16
+    nheads = 64
     headdim = 64
     chunk_size = 256
     ngroups = 1
-    dstate = 16
+    dstate = 64
     nchunks = (seqlen + chunk_size - 1) // chunk_size
 
     cb = torch.randn([batch, nchunks, ngroups, chunk_size, chunk_size], dtype=torch.float16)
@@ -177,7 +174,7 @@ def main() -> None:
 
     print_debug_info(bound_kernel)
 
-    mlir_text = generate_mlir(bound_kernel)
+    mlir_text = generate_mlir(bound_kernel, assume_divisible_tiles=True)
     print("=== MLIR Dump ===")
     print(mlir_text)
 
