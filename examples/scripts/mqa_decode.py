@@ -108,7 +108,7 @@ def flash_decode(
 
 
 def main() -> None:
-    B, H, L, D = 4, 32, 8192, 128
+    B, H, L, D = 16, 32, 8192, 128
     # [batch, seq_len, num_q_heads, head_dim]
     q = torch.randn([B, 1, H, D], dtype=torch.float16)
     # [batch, num_kv_head, kvseq_len, head_dim]
@@ -118,7 +118,7 @@ def main() -> None:
 
     print_debug_info(bound)
 
-    mlir_text = generate_mlir(bound, cleanup=True)
+    mlir_text = generate_mlir(bound, cleanup=True, assume_divisible_tiles=True)
     print("=== MLIR Dump ===")
     print(mlir_text)
 
