@@ -93,7 +93,9 @@ class TorchMLIRNodeImporter:
             module
         )
         
-        return _rewrite_batch_matmul_f16_accumulation(str(module))
+        text = _rewrite_batch_matmul_f16_accumulation(str(module))
+        text = _rewrite_amax_keepdim_from_expand_shape(text)
+        return text
 
     def import_node(
         self,
@@ -446,6 +448,333 @@ def _rewrite_batch_matmul_f16_accumulation(mlir_text: str) -> str:
 
         # Recurse to handle any additional batch_matmuls
         return _rewrite_batch_matmul_f16_accumulation('\n'.join(result))
+
+    return mlir_text
+
+
+def _rewrite_amax_keepdim_from_expand_shape(mlir_text: str) -> str:
+    """Rewrite torch-mlir's argmax-style amax lowering to a clean keepdim reduction.
+
+    torch-mlir lowers aten.amax(..., keepdim=True) as:
+      1. A dual-output linalg.generic producing (max_value: f16, argmax: i64)
+         with rank-reduced outs (the reduction axis is dropped).
+      2. A tensor.expand_shape that restores the size-1 reduced dim.
+
+    This rewrites that pattern into a single-output linalg.generic whose outs
+    indexing map directly keeps the reduced axis as a literal 0
+    (e.g. affine_map<(d0, d1, d2) -> (d0, d1, 0)>), matching the form that
+    torch-mlir correctly emits for aten.sum(..., keepdim=True).
+
+    Limitations:
+      - Only handles single-axis reductions (one "reduction" iterator_type).
+      - Only handles maximumf/ogt pattern (amax). amin is not handled.
+      - If the argmax result (%R#1) is actually used downstream, the rewrite
+        is skipped (e.g. torch.max.dim which returns both values and indices).
+    """
+    if 'tensor.expand_shape' not in mlir_text:
+        return mlir_text
+    if ':2' not in mlir_text or 'linalg.generic' not in mlir_text:
+        return mlir_text
+
+    lines = mlir_text.splitlines()
+
+    # ----------------------------------------------------------------
+    # Pre-pass: collect affine_map alias definitions from the module header.
+    # e.g. "#map1 = affine_map<(d0, d1, d2) -> (d0, d1)>"
+    # These are needed to resolve alias references inside indexing_maps.
+    # ----------------------------------------------------------------
+    affine_alias_re = re.compile(r'^(#\w+)\s*=\s*(affine_map<.+>)\s*$')
+    alias_to_map: dict[str, str] = {}
+    for ln in lines:
+        am = affine_alias_re.match(ln.strip())
+        if am:
+            alias_to_map[am.group(1)] = am.group(2)
+
+    def resolve_map(map_str: str) -> str:
+        """Expand a #mapN alias to its inline affine_map<...> form."""
+        map_str = map_str.strip()
+        return alias_to_map.get(map_str, map_str)
+
+    def extract_dims_from_map(map_str: str):
+        """Return (domain_dims, range_exprs) from an affine_map string or #alias."""
+        map_str = resolve_map(map_str).strip()
+        # Strip "affine_map<...>" wrapper — avoid [^>]+ which stops at "->"
+        if map_str.startswith('affine_map<') and map_str.endswith('>'):
+            map_str = map_str[len('affine_map<'):-1].strip()
+        domain_match = re.match(r'\(([^)]*)\)\s*->', map_str)
+        range_match = re.search(r'->\s*\(([^)]*)\)', map_str)
+        if not domain_match or not range_match:
+            return None, None
+        domain_dims = [d.strip() for d in domain_match.group(1).split(',') if d.strip()]
+        range_exprs = [e.strip() for e in range_match.group(1).split(',') if e.strip()]
+        return domain_dims, range_exprs
+
+    # Regex to match the dual-output linalg.generic header line.
+    generic_re = re.compile(
+        r'^(\s*)(%[\w.+-]+):2\s*=\s*linalg\.generic\s*\{'
+        r'indexing_maps\s*=\s*\[([^\]]+)\]'
+        r',\s*iterator_types\s*=\s*\[([^\]]+)\]\}'
+        r'\s*ins\(([^)]+)\)'
+        r'\s*outs\(([^)]+)\)'
+        r'\s*\{\s*$'
+    )
+
+    result = list(lines)
+
+    for gen_idx, line in enumerate(result):
+        m = generic_re.match(line)
+        if not m:
+            continue
+
+        indent = m.group(1)
+        result_ssa = m.group(2)
+        maps_content = m.group(3)
+        iter_content = m.group(4)
+        ins_content = m.group(5)
+        outs_content = m.group(6)
+
+        # Step 1: Exactly one "reduction" iterator_type.
+        iter_types = [t.strip().strip('"') for t in iter_content.split(',')]
+        if iter_types.count('reduction') != 1:
+            continue
+
+        # Step 2: Exactly two outs, second is i64.
+        if ':' not in outs_content:
+            continue
+        outs_ops_part, outs_types_part = outs_content.split(':', 1)
+        outs_op_names = [o.strip() for o in outs_ops_part.split(',')]
+        outs_type_strs = _split_mlir_types(outs_types_part.strip())
+        if len(outs_op_names) != 2 or len(outs_type_strs) != 2:
+            continue
+
+        val_fill_ssa = outs_op_names[0]
+        idx_fill_ssa = outs_op_names[1]
+        val_type_rank_reduced = outs_type_strs[0]
+        idx_type_str = outs_type_strs[1]
+
+        if 'xi64' not in idx_type_str:
+            continue
+
+        # Step 3: Scan body – validate amax pattern.
+        body_start = gen_idx + 1
+        depth = 1
+        body_end = body_start
+        for j in range(body_start, len(result)):
+            body_end = j
+            depth += result[j].count('{') - result[j].count('}')
+            if depth == 0:
+                break
+
+        body_text = '\n'.join(result[body_start:body_end + 1])
+        required_ops = ['linalg.index', 'arith.index_cast', 'arith.maximumf',
+                        'arith.cmpf ogt', 'arith.select']
+        if not all(op in body_text for op in required_ops):
+            continue
+        if 'i64' not in body_text:
+            continue
+
+        yield_match = re.search(
+            r'linalg\.yield\s+%[\w.+-]+,\s*%[\w.+-]+\s*:\s*(\w+),\s*i64', body_text)
+        if not yield_match:
+            continue
+        elem_type = yield_match.group(1)
+
+        # Step 4: %R#1 must have no downstream users.
+        r1_ref = result_ssa + '#1'
+        if r1_ref in '\n'.join(result[body_end + 1:]):
+            continue
+
+        # Step 5: Locate tensor.expand_shape consuming %R#0.
+        r0_ref = result_ssa + '#0'
+        expand_idx = None
+        expand_result_ssa = None
+        keepdim_type = None
+        expand_re = re.compile(
+            r'^\s*(%[\w.+-]+)\s*=\s*tensor\.expand_shape\s+'
+            + re.escape(r0_ref) +
+            r'\s+\[([^\]]*(?:\[[^\]]*\][^\]]*)*)\]\s+output_shape\s+\[([^\]]+)\]\s*'
+            r':\s*([^\s]+)\s+into\s+([^\s]+)\s*$'
+        )
+        for j in range(body_end + 1, len(result)):
+            em = expand_re.match(result[j])
+            if em:
+                expand_result_ssa = em.group(1)
+                keepdim_type = em.group(5)
+                expand_idx = j
+                break
+            stripped = result[j].strip()
+            if stripped.startswith('func.func') or (stripped == '}' and result[j][0] == '}'):
+                break
+
+        if expand_idx is None:
+            continue
+
+        # Step 6: Derive reduction axis from indexing maps (resolving #aliases).
+        all_maps = _split_affine_maps(maps_content)
+        if len(all_maps) < 3:
+            continue
+
+        ins_domain, ins_range = extract_dims_from_map(all_maps[0])
+        _, outs_range = extract_dims_from_map(all_maps[1])
+
+        if ins_domain is None or ins_range is None or outs_range is None:
+            continue
+
+        outs_range_set = set(outs_range)
+        reduction_dims = [d for d in ins_range if d not in outs_range_set]
+        if len(reduction_dims) != 1:
+            continue
+        reduction_dim_id = reduction_dims[0]
+
+        if reduction_dim_id not in ins_domain:
+            continue
+        reduction_axis = ins_domain.index(reduction_dim_id)
+
+        # Step 7: Build keepdim outs indexing map.
+        new_outs_range = list(outs_range)
+        new_outs_range.insert(reduction_axis, '0')
+        new_outs_map = (
+            f'affine_map<({", ".join(ins_domain)}) -> ({", ".join(new_outs_range)})>'
+        )
+
+        # Step 8: Build ins map string (resolve alias to inline form for the new header).
+        ins_map_inline = resolve_map(all_maps[0].strip())
+        new_indexing_maps = f'[{ins_map_inline}, {new_outs_map}]'
+
+        # Step 9: Locate i64 producers (tensor.empty + linalg.fill).
+        idx_empty_ssa = None
+        idx_fill_idx = None
+        idx_empty_idx = None
+
+        fill_re_i64 = re.compile(
+            r'^\s*' + re.escape(idx_fill_ssa) + r'\s*=\s*linalg\.fill\s+'
+            r'ins\((%[\w.+-]+)\s*:\s*i64\)\s+'
+            r'outs\((%[\w.+-]+)\s*:\s*' + re.escape(idx_type_str) + r'\)\s*->\s*'
+            + re.escape(idx_type_str) + r'\s*$'
+        )
+        for j in range(gen_idx - 1, -1, -1):
+            fm = fill_re_i64.match(result[j])
+            if fm:
+                idx_fill_idx = j
+                idx_empty_ssa = fm.group(2)
+                break
+
+        if idx_fill_idx is not None and idx_empty_ssa is not None:
+            empty_re_i64 = re.compile(
+                r'^\s*' + re.escape(idx_empty_ssa)
+                + r'\s*=\s*tensor\.empty\([^)]*\)\s*:\s*' + re.escape(idx_type_str) + r'\s*$'
+            )
+            for j in range(idx_fill_idx - 1, -1, -1):
+                if empty_re_i64.match(result[j]):
+                    idx_empty_idx = j
+                    break
+
+        full_text_check = '\n'.join(r for r in result if r is not None)
+        can_drop_i64_fill = (
+            idx_fill_idx is not None
+            and full_text_check.count(idx_fill_ssa) == 2
+        )
+        can_drop_i64_empty = (
+            idx_empty_idx is not None and idx_empty_ssa is not None
+            and full_text_check.count(idx_empty_ssa) == 2
+        )
+
+        # Step 10: Locate value-side empty/fill producers.
+        val_fill_idx = None
+        val_empty_ssa = None
+        val_empty_idx = None
+
+        fill_re_val = re.compile(
+            r'^\s*' + re.escape(val_fill_ssa) + r'\s*=\s*linalg\.fill\s+'
+            r'ins\((%[\w.+-]+)\s*:\s*' + re.escape(elem_type) + r'\)\s+'
+            r'outs\((%[\w.+-]+)\s*:\s*' + re.escape(val_type_rank_reduced) + r'\)\s*->\s*'
+            + re.escape(val_type_rank_reduced) + r'\s*$'
+        )
+        for j in range(gen_idx - 1, -1, -1):
+            fm = fill_re_val.match(result[j])
+            if fm:
+                val_fill_idx = j
+                val_empty_ssa = fm.group(2)
+                break
+
+        if val_fill_idx is not None and val_empty_ssa is not None:
+            empty_re_val = re.compile(
+                r'^\s*' + re.escape(val_empty_ssa)
+                + r'\s*=\s*tensor\.empty\([^)]*\)\s*:\s*' + re.escape(val_type_rank_reduced) + r'\s*$'
+            )
+            for j in range(val_fill_idx - 1, -1, -1):
+                if empty_re_val.match(result[j]):
+                    val_empty_idx = j
+                    break
+
+        # Step 11: Apply all mutations.
+
+        # 11a. Retype value-side tensor.empty and linalg.fill.
+        if val_empty_idx is not None:
+            result[val_empty_idx] = result[val_empty_idx].replace(
+                val_type_rank_reduced, keepdim_type, 1)
+        if val_fill_idx is not None:
+            result[val_fill_idx] = result[val_fill_idx].replace(
+                val_type_rank_reduced, keepdim_type)
+
+        # 11b. Rewrite the linalg.generic header (single output, inline maps).
+        result[gen_idx] = (
+            f'{indent}{result_ssa} = linalg.generic {{'
+            f'indexing_maps = {new_indexing_maps}, '
+            f'iterator_types = [{iter_content}]}} '
+            f'ins({ins_content}) '
+            f'outs({val_fill_ssa} : {keepdim_type}) {{'
+        )
+
+        # 11c. Rewrite body: strip i64 tracking, simplify block args and yield.
+        for j in range(body_start, body_end + 1):
+            stripped = result[j].strip()
+            if stripped.startswith('^bb0'):
+                bb_m = re.match(r'(\^bb0\()(.*)(\):)', stripped)
+                if bb_m:
+                    new_args = [a.strip() for a in bb_m.group(2).split(',')
+                                if 'i64' not in a]
+                    result[j] = (result[j][:result[j].index('^')]
+                                 + f'^bb0({", ".join(new_args)}):')
+            elif 'linalg.index' in stripped:
+                result[j] = None
+            elif 'arith.index_cast' in stripped and 'index to i64' in stripped:
+                result[j] = None
+            elif 'arith.cmpf ogt' in stripped:
+                result[j] = None
+            elif 'arith.select' in stripped and 'i64' in stripped:
+                result[j] = None
+            elif stripped.startswith('linalg.yield'):
+                ym = re.search(
+                    r'linalg\.yield\s+(%[\w.+-]+),\s*%[\w.+-]+\s*:\s*\w+,\s*i64', stripped)
+                if ym:
+                    result[j] = (result[j][:result[j].index('linalg.yield')]
+                                 + f'linalg.yield {ym.group(1)} : {elem_type}')
+            elif stripped.startswith('}') and '->' in result[j]:
+                result[j] = result[j][:result[j].index('}')+1] + f' -> {keepdim_type}'
+
+        # 11d. Drop i64 producers if safe.
+        if can_drop_i64_fill:
+            result[idx_fill_idx] = None
+        if can_drop_i64_empty:
+            result[idx_empty_idx] = None
+
+        # 11e. Drop expand_shape.
+        result[expand_idx] = None
+
+        # 11f. Rename expand_shape result -> result_ssa; normalise %R#0 -> %R.
+        ssa_rename = re.compile(re.escape(expand_result_ssa) + r'(?![\w.+-])')
+        r0_rename = re.compile(re.escape(r0_ref) + r'(?![\w.+-])')
+        for j in range(len(result)):
+            if result[j] is None:
+                continue
+            if expand_result_ssa in result[j]:
+                result[j] = ssa_rename.sub(result_ssa, result[j])
+            if r0_ref in result[j]:
+                result[j] = r0_rename.sub(result_ssa, result[j])
+
+        result = [l for l in result if l is not None]
+        return _rewrite_amax_keepdim_from_expand_shape('\n'.join(result))
 
     return mlir_text
 

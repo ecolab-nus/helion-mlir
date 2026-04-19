@@ -62,9 +62,8 @@ def flash_decode(
     for tile_b, tile_s in hl.tile([batch, kvseq_len]):
         qk_scale = hl.full([], sm_scale, dtype=torch.float16)
 
-        # States are Rank 1 and 2 for maximum stability
-        m_i = hl.full([tile_b, num_q_head], float("-inf"), dtype=torch.float16)
-        l_i = hl.full([tile_b, num_q_head], 1.0, dtype=torch.float16)
+        m_i = hl.full([tile_b, num_q_head, 1], float("-inf"), dtype=torch.float16)
+        l_i = hl.full([tile_b, num_q_head, 1], 1.0, dtype=torch.float16)
         acc = hl.zeros([tile_b, num_q_head, head_dim], dtype=torch.float16)
         q = q_view[tile_b, :, :]
 
@@ -76,15 +75,18 @@ def flash_decode(
             # Compute QK -> [tile_b, num_q_head, tile_n]
             qk = torch.bmm(q, k)
             
-            m_ij = torch.maximum(m_i, torch.amax(qk, -1) * qk_scale)
-            qk = qk * qk_scale - m_ij[:, :, None] 
+            m_qk = torch.amax(qk, -1, keepdim=True)
+            # m_ij: [tile_b, num_q_head, 1]
+            m_ij = torch.maximum(m_i, m_qk * qk_scale)
+            qk = qk * qk_scale - m_ij # broadcast tile_n pieces along -1 axis
             
             p = torch.exp(qk)
-            l_ij = torch.sum(p, -1)
+            l_ij = torch.sum(p, -1, keepdim=True)
             alpha = torch.exp(m_i - m_ij)
             
             l_i = l_i * alpha + l_ij
-            acc = acc * alpha[:, :, None]
+            # alpha = alpha.repeat(1, 1, head_dim)
+            acc = acc * alpha # broadcast head_dim pieces along -1 axis
             
             v = v_view[tile_b, tile_n, :] # [tile_h, tile_n, head_dim]
             acc = torch.baddbmm(acc, p, v)
@@ -93,16 +95,19 @@ def flash_decode(
         split_lse = torch.log(l_i) + m_i
 
         # Gather split_lse and acc across all tile_s
-        gathered_lse = gather(tile_s, split_lse) # [N, tile_b, num_q_head]
+        gathered_lse = gather(tile_s, split_lse) # [N, tile_b, num_q_head, 1]
         gathered_acc = gather(tile_s, acc) # [N, tile_b, num_q_head, head_dim]
 
         # (2) Inter-block softmax merge
         if tile_s.id == 0:
-            max_lse = torch.amax(gathered_lse, 0)
-            weights = torch.exp(gathered_lse - max_lse)
-            lse_sum = torch.sum(weights, 0)
-            norm_scale = weights / lse_sum
-            weighted_acc = torch.sum(gathered_acc * norm_scale[:, :, :, None], 0)
+            max_lse = torch.amax(gathered_lse, 0) # [tile_b, num_q_head, 1]
+            # broadcast N pieces of max_lse along axis 0
+            weights = torch.exp(gathered_lse - max_lse) # [N, tile_b, num_q_head, 1]
+            lse_sum = torch.sum(weights, 0) # [tile_b, num_q_head, 1]
+            # [N, tile_b, num_q_head, 1]
+            norm_scale = weights / lse_sum # [N, tile_b, num_q_head, 1]
+            # broadcast head_dim pieces of norm_scale along axis -1
+            weighted_acc = torch.sum(gathered_acc * norm_scale, 0)
             out[tile_b, :, :] = weighted_acc
 
     return out.view(q_in.size())
