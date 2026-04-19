@@ -2167,11 +2167,28 @@ class IRVisitor:
         
         # Filter out None (newaxis) to check for slicing requirements
         slice_indices = [idx for idx in indices if idx is not None]
+        source_fake_tensor = tensor_node.meta.get("val") if isinstance(tensor_node, fx.Node) else None
         
         needs_slicing = False
-        # Always slice to resolve dynamic dimensions or if explicit indices provided
+        # Default behavior: slice when explicit indices are provided.
         if slice_indices:
-             needs_slicing = True
+            needs_slicing = True
+
+        # Optimization: skip identity extract_slice for pure full-range slicing
+        # (e.g. t[:, :, None]) when rank is unchanged by indexing.
+        if slice_indices and source_fake_tensor is not None:
+            has_non_slice_index = any(isinstance(idx, (int, fx.Node)) for idx in slice_indices)
+            is_full_range_slice = (
+                isinstance(idx, slice)
+                and idx.start is None
+                and idx.stop is None
+                and idx.step is None
+                for idx in slice_indices
+            )
+            all_full_range_slices = all(is_full_range_slice)
+            rank_preserving_slice = len(slice_indices) == source_fake_tensor.ndim
+            if all_full_range_slices and (not has_non_slice_index) and rank_preserving_slice:
+                needs_slicing = False
         
         extracted_ssa = current_ssa
         # Default intermediate type is source type
@@ -2185,9 +2202,6 @@ class IRVisitor:
             strides_ssa = []
             
             input_dim_idx = 0
-            
-            # Get FakeTensor from source node for dimension resolution
-            source_fake_tensor = tensor_node.meta.get("val") if isinstance(tensor_node, fx.Node) else None
             
             for idx in slice_indices:
                 if isinstance(idx, slice):
@@ -2391,6 +2405,11 @@ class IRVisitor:
         """
         from helion._compiler.variable_origin import BlockSizeOrigin
         target = node.target
+
+        # Fast path: lower broadcast-compatible repeat directly to linalg.broadcast.
+        repeat_result = self._try_lower_repeat_as_linalg_broadcast(node)
+        if repeat_result is not None:
+            return repeat_result
         
         # Resolve all operands to SSA values
         operand_ssas = []
@@ -2544,6 +2563,157 @@ class IRVisitor:
                     self.ctx.gather_dim_overrides[node.name] = output_overrides
                     
         return result
+
+    def _try_lower_repeat_as_linalg_broadcast(self, node: fx.Node) -> str | None:
+        """Lower aten.repeat.default directly to linalg.broadcast when valid.
+
+        This is intentionally conservative and only handles rank-preserving
+        repeat where each repeated dimension is either:
+        - repeat factor 1, or
+        - source extent statically 1 (broadcastable expansion).
+        """
+        target = node.target
+        if str(target) != "aten.repeat.default":
+            return None
+
+        if len(node.args) < 2:
+            return None
+
+        tensor_node = node.args[0]
+        repeats = node.args[1]
+        if not isinstance(tensor_node, fx.Node):
+            return None
+        if not isinstance(repeats, (list, tuple)):
+            return None
+        if not all(isinstance(r, int) and r >= 1 for r in repeats):
+            return None
+
+        src_val = tensor_node.meta.get("val")
+        out_val = node.meta.get("val")
+        if src_val is None or out_val is None:
+            return None
+        if not hasattr(src_val, "shape") or not hasattr(out_val, "shape"):
+            return None
+
+        src_rank = len(src_val.shape)
+        out_rank = len(out_val.shape)
+        if src_rank != out_rank or len(repeats) != src_rank:
+            return None
+
+        expanded_dims = [i for i, rep in enumerate(repeats) if rep != 1]
+        if not expanded_dims:
+            # No-op repeat.
+            input_ssa = self.ctx.node_values.get(tensor_node.name, f"%{tensor_node.name}")
+            input_type = self._get_tensor_type(tensor_node)
+            self.ctx.node_values[node.name] = input_ssa
+            self.ctx.node_types[node.name] = input_type
+            return input_ssa
+
+        # Guard: all expanded dims must come from static-one dimensions.
+        for dim_idx in expanded_dims:
+            src_dim = src_val.shape[dim_idx]
+            if not (isinstance(src_dim, int) and src_dim == 1):
+                return None
+
+        # Conservative shape: only support suffix expansion dims (common case:
+        # keepdim=True then repeat on trailing axis).
+        expanded_start = expanded_dims[0]
+        if expanded_dims != list(range(expanded_start, src_rank)):
+            return None
+        if expanded_start == 0:
+            return None
+
+        input_ssa = self.ctx.node_values.get(tensor_node.name, f"%{tensor_node.name}")
+        input_type = self._get_tensor_type(tensor_node)
+        source_dtype = self._get_element_type_from_node(tensor_node)
+
+        # Collapse trailing singleton expanded dims into the preceding kept dim.
+        collapse_reassoc_groups: list[list[int]] = []
+        for i in range(expanded_start - 1):
+            collapse_reassoc_groups.append([i])
+        collapse_reassoc_groups.append(list(range(expanded_start - 1, src_rank)))
+
+        collapsed_dim_tokens: list[str] = []
+        src_overrides = self.ctx.gather_dim_overrides.get(tensor_node.name, {})
+        for i in range(expanded_start):
+            dim_size = src_val.shape[i]
+            value_str, is_static = self.resolve_dimension(
+                dim_size,
+                i,
+                overrides=src_overrides if src_overrides else None,
+            )
+            if value_str is None:
+                collapsed_dim_tokens.append("?")
+            else:
+                collapsed_dim_tokens.append(value_str if is_static else "?")
+
+        collapsed_dims_str = "x".join(collapsed_dim_tokens)
+        collapsed_type = f"tensor<{collapsed_dims_str}x{source_dtype}>"
+        collapse_reassoc_str = "[" + ", ".join(
+            "[" + ", ".join(str(v) for v in grp) + "]" for grp in collapse_reassoc_groups
+        ) + "]"
+        collapsed_ssa = self.mlir_output_helper.fresh("collapse")
+        self.mlir_output_helper.emit(
+            f"{collapsed_ssa} = tensor.collapse_shape {input_ssa} {collapse_reassoc_str} : "
+            f"{input_type} into {collapsed_type}"
+        )
+
+        # Build output tensor type and dynamic shape operands.
+        output_shape_ssas: list[str] = []
+        output_dim_tokens: list[str] = []
+
+        # Preserve dynamic dim overrides for dimensions unchanged by repeat=1.
+        out_overrides: dict[int, str] = {}
+
+        for dim_idx, rep in enumerate(repeats):
+            src_dim = src_val.shape[dim_idx]
+            if rep == 1:
+                value_str, is_static = self.resolve_dimension(
+                    src_dim,
+                    dim_idx,
+                    overrides=src_overrides if src_overrides else None,
+                )
+                if value_str is None:
+                    dim_idx_ssa = self.mlir_output_helper.fresh("dim_idx")
+                    dim_ssa = self.mlir_output_helper.fresh("dim")
+                    self.mlir_output_helper.emit(f"{dim_idx_ssa} = arith.constant {dim_idx} : index")
+                    self.mlir_output_helper.emit(f"{dim_ssa} = tensor.dim {input_ssa}, {dim_idx_ssa} : {input_type}")
+                    output_shape_ssas.append(dim_ssa)
+                    output_dim_tokens.append("?")
+                else:
+                    output_shape_ssas.append(value_str)
+                    output_dim_tokens.append(value_str if is_static else "?")
+                    if dim_idx in src_overrides:
+                        out_overrides[dim_idx] = src_overrides[dim_idx]
+            else:
+                # rep > 1 and source extent is statically 1: output extent is rep.
+                output_shape_ssas.append(str(rep))
+                output_dim_tokens.append(str(rep))
+
+        output_dims_str = "x".join(output_dim_tokens)
+        output_type = f"tensor<{output_dims_str}x{source_dtype}>"
+
+        dynamic_shape_ssas = [s for s in output_shape_ssas if s.startswith("%")]
+        empty_ssa = self.mlir_output_helper.fresh("empty")
+        if dynamic_shape_ssas:
+            self.mlir_output_helper.emit(
+                f"{empty_ssa} = tensor.empty({', '.join(dynamic_shape_ssas)}) : {output_type}"
+            )
+        else:
+            self.mlir_output_helper.emit(f"{empty_ssa} = tensor.empty() : {output_type}")
+
+        dims_attr = ", ".join(str(i) for i in expanded_dims)
+        result_ssa = self.mlir_output_helper.fresh("broadcast")
+        self.mlir_output_helper.emit(
+            f"{result_ssa} = linalg.broadcast ins({collapsed_ssa} : {collapsed_type}) "
+            f"outs({empty_ssa} : {output_type}) dimensions = [{dims_attr}]"
+        )
+
+        self.ctx.node_values[node.name] = result_ssa
+        self.ctx.node_types[node.name] = output_type
+        if out_overrides:
+            self.ctx.gather_dim_overrides[node.name] = out_overrides
+        return result_ssa
 
     def _get_element_type_from_node(self, node: fx.Node) -> str:
         """Extract MLIR element type string from a node's FakeTensor dtype."""

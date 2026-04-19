@@ -679,11 +679,12 @@ def inline_torch_mlir_output(
         return ssa_pattern.sub(repl, text)
 
     # -------------------------------------------------------------------------
-    # OPTIMIZATION: Deferred arith.constant emission for tensor.dim
+    # OPTIMIZATION SUPPORT: Track arith.constant index values for tensor.dim
     # -------------------------------------------------------------------------
-    # When dimension_ssa_map is provided, we can replace tensor.dim operations
-    # with pre-existing SSA values. The arith.constant ops that generate the
-    # dimension indices are deferred and only emitted if actually needed.
+    # When dimension_ssa_map is provided, tensor.dim can be replaced by
+    # pre-existing dimension SSAs. We still track integer index constants to
+    # decode the tensor.dim index, but we must emit constants eagerly because
+    # they may also be used by non-tensor.dim ops (e.g. repeat lowering).
     #
     # Track arith.constant values for tensor.dim index resolution
     const_index_values = {}  # SSA name (e.g., "%0") -> integer value
@@ -808,21 +809,23 @@ def inline_torch_mlir_output(
                 lhs_vars = [x.strip() for x in lhs.split(",")]
                 
                 # -----------------------------------------------------------------
-                # Optimization: Track arith.constant index values for tensor.dim
+                # Track arith.constant index values for tensor.dim.
                 # Pattern: %0 = arith.constant 0 : index
-                # We DEFER emission - only emit if not consumed by optimized tensor.dim
+                #
+                # IMPORTANT:
+                # Do not defer emission of index constants. They can be used by
+                # non-tensor.dim operations (seen in repeat lowering), and
+                # deferring can produce undefined SSA references.
                 # -----------------------------------------------------------------
                 arith_const_match = re.match(r'arith\.constant\s+(\d+)\s*:\s*index', rhs)
                 if arith_const_match and len(lhs_vars) == 1:
                     const_val = int(arith_const_match.group(1))
                     ssa_name = lhs_vars[0]
                     const_index_values[ssa_name] = const_val
-                    # Create a fresh name mapping but DON'T emit yet
+                    # Create a fresh name mapping and emit eagerly.
                     fresh = mlir_output_helper.fresh("t")
                     ssa_map[ssa_name] = fresh
-                    # Store the deferred emission info
-                    # Format: (fresh_name, rhs_text)
-                    deferred_const_emissions[ssa_name] = (fresh, rhs)
+                    mlir_output_helper.emit(f"{fresh} = {rhs}")
                     continue
                 
                 # -----------------------------------------------------------------
