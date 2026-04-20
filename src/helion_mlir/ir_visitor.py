@@ -49,10 +49,10 @@ def _get_custome_ops() -> dict:
     Returns a dict mapping handler name -> function object.
     Returns an empty dict if the package is not available.
 
-    Note: ``custome_op/__init__.py`` re-exports ``gather`` from the submodule,
-    which shadows ``custome_op.gather`` (the module) with the function in the
-    package namespace.  We use ``importlib.import_module`` to access the real
-    submodule and retrieve the decorated function object.
+    Note: ``custome_op/__init__.py`` re-exports ops from submodules, which can
+    shadow module names in the package namespace. We use
+    ``importlib.import_module`` to access real submodules and retrieve the
+    decorated function objects.
     """
     global _custome_ops_cache
     if _custome_ops_cache is not None:
@@ -63,8 +63,12 @@ def _get_custome_ops() -> dict:
     if custome_op_dir not in sys.path:
         sys.path.insert(0, custome_op_dir)
     try:
-        mod = importlib.import_module("custome_op.gather")
-        _custome_ops_cache = {"gather": mod.gather}
+        gather_mod = importlib.import_module("custome_op.gather")
+        broadcast_mod = importlib.import_module("custome_op.broadcast")
+        _custome_ops_cache = {
+            "gather": gather_mod.gather,
+            "broadcast": broadcast_mod.broadcast,
+        }
     except Exception:
         _custome_ops_cache = {}
     return _custome_ops_cache
@@ -267,6 +271,8 @@ class IRVisitor:
         _custom = _get_custome_ops()
         if target is _custom.get("gather"):
             return self.visit_gather(node)
+        if target is _custom.get("broadcast"):
+            return self.visit_broadcast(node)
 
         if target is aten.add.Tensor:
             maybe_index_base = self.visit_tile_index_add(node)
@@ -1973,6 +1979,87 @@ class IRVisitor:
         self.ctx.node_types[node.name] = result_type
         # Register that dim-0 of the gathered result is the trip count, not block_size.
         self.ctx.gather_dim_overrides[node.name] = {0: trip_count_ssa}
+        return result_ssa
+
+    def visit_broadcast(self, node: fx.Node) -> str:
+        """Emit a placeholder ``loom.broadcast`` op for the custom broadcast op.
+
+        Lowering pattern for ``out = broadcast(src, dim, out_shape)``:
+
+          %empty = tensor.empty(...) : tensor<out_shape>
+          %out   = "loom.broadcast"(%src, %empty, %dim)
+                     {operandSegmentSizes = array<i32: 1, 1, 1, 0, 0, 0, 0>}
+                     : (tensor<src_shape>, tensor<out_shape>, index)
+                       -> tensor<out_shape>
+        """
+        if len(node.args) != 3:
+            raise RuntimeError(
+                f"broadcast expects 3 arguments (src, dim, out_shape), got {len(node.args)}"
+            )
+
+        src_node = node.args[0]
+        dim_arg = node.args[1]
+        out_shape_arg = node.args[2]
+
+        if not isinstance(src_node, fx.Node):
+            raise RuntimeError(
+                f"broadcast: first arg (src) must be an fx.Node, got {type(src_node)}"
+            )
+        if not isinstance(out_shape_arg, (list, tuple)):
+            raise RuntimeError(
+                f"broadcast: third arg (out_shape) must be list/tuple, got {type(out_shape_arg)}"
+            )
+
+        src_ssa = self.ctx.node_values.get(src_node.name, f"%{src_node.name}")
+        src_type = self._get_tensor_type(src_node)
+        dim_ssa = self._as_index_ssa(dim_arg)
+
+        resolved_dims: list[str] = []
+        dynamic_shape_ssas: list[str] = []
+        for dim_idx, dim_size in enumerate(out_shape_arg):
+            if isinstance(dim_size, fx.Node):
+                shape_dim_ssa = self._as_index_ssa(dim_size)
+                resolved_dims.append("?")
+                dynamic_shape_ssas.append(shape_dim_ssa)
+                continue
+            value_str, is_static = self.resolve_dimension(dim_size, dim_idx)
+            if value_str is None:
+                raise RuntimeError(
+                    f"broadcast: unable to resolve out_shape[{dim_idx}]={dim_size}"
+                )
+            resolved_dims.append(value_str if is_static else "?")
+            if value_str.startswith("%"):
+                dynamic_shape_ssas.append(value_str)
+
+        result_type = ""
+        fake_val = node.meta.get("val")
+        if fake_val is not None and hasattr(fake_val, "shape"):
+            result_type = self.ctx.compute_mlir_type_from_fake_tensor(fake_val)
+
+        if not result_type:
+            src_dtype = self._get_element_type_from_node(src_node)
+            if resolved_dims:
+                result_type = f"tensor<{'x'.join(resolved_dims)}x{src_dtype}>"
+            else:
+                result_type = f"tensor<{src_dtype}>"
+
+        empty_ssa = self.mlir_output_helper.fresh("broadcast_out")
+        if dynamic_shape_ssas:
+            self.mlir_output_helper.emit(
+                f"{empty_ssa} = tensor.empty({', '.join(dynamic_shape_ssas)}) : {result_type}"
+            )
+        else:
+            self.mlir_output_helper.emit(f"{empty_ssa} = tensor.empty() : {result_type}")
+
+        result_ssa = self.mlir_output_helper.fresh("broadcasted")
+        self.mlir_output_helper.emit(
+            f'{result_ssa} = "loom.broadcast"({src_ssa}, {empty_ssa}, {dim_ssa}) '
+            f'{{operandSegmentSizes = array<i32: 1, 1, 1, 0, 0, 0, 0>}} '
+            f': ({src_type}, {result_type}, index) -> {result_type}'
+        )
+
+        self.ctx.node_values[node.name] = result_ssa
+        self.ctx.node_types[node.name] = result_type
         return result_ssa
 
     def visit_getitem(self, node: fx.Node) -> str:
