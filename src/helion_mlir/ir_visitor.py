@@ -830,10 +830,19 @@ class IRVisitor:
 
         block_id, base = extracted
         base_ssa = self._as_index_ssa(base)
+        block_size_ssa, block_size_is_static = self._get_block_size_value(block_id)
+        if block_size_is_static:
+            block_size_ssa = self._emit_index_constant(int(block_size_ssa))
+
+        # Preserve tile-start contribution when rewriting range indexing.
+        # Dropping tile_start is incorrect for multi-iteration tiled dims.
+        tile_start_ssa = self._emit_block_offset(block_id, block_size_ssa, hint="tile_idx_start")
+        combined_base_ssa = self._emit_index_addi(tile_start_ssa, base_ssa, hint="tile_idx_base")
+
         self.range_index_block_ids[node.name] = block_id
-        self.ctx.node_values[node.name] = base_ssa
+        self.ctx.node_values[node.name] = combined_base_ssa
         self.ctx.node_types[node.name] = "index"
-        return base_ssa
+        return combined_base_ssa
 
     def _derive_loop_trip_info_from_for_loop_args(
         self, node: fx.Node, canonical_block_id: int
