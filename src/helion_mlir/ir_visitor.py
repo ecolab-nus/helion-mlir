@@ -1986,10 +1986,9 @@ class IRVisitor:
 
         Lowering pattern for ``out = broadcast(src, dim, out_shape)``:
 
-          %empty = tensor.empty(...) : tensor<out_shape>
+          %empty = tensor.empty(...) : tensor<outs_shape>
           %out   = "loom.broadcast"(%src, %empty, %dim)
-                     {operandSegmentSizes = array<i32: 1, 1, 1, 0, 0, 0, 0>}
-                     : (tensor<src_shape>, tensor<out_shape>, index)
+                     : (tensor<src_shape>, tensor<outs_shape>, index)
                        -> tensor<out_shape>
         """
         if len(node.args) != 3:
@@ -2013,14 +2012,15 @@ class IRVisitor:
         src_ssa = self.ctx.node_values.get(src_node.name, f"%{src_node.name}")
         src_type = self._get_tensor_type(src_node)
         dim_ssa = self._as_index_ssa(dim_arg)
+        src_dtype = self._get_element_type_from_node(src_node)
 
         resolved_dims: list[str] = []
-        dynamic_shape_ssas: list[str] = []
+        resolved_dim_ssas: list[str | None] = []
         for dim_idx, dim_size in enumerate(out_shape_arg):
             if isinstance(dim_size, fx.Node):
                 shape_dim_ssa = self._as_index_ssa(dim_size)
                 resolved_dims.append("?")
-                dynamic_shape_ssas.append(shape_dim_ssa)
+                resolved_dim_ssas.append(shape_dim_ssa)
                 continue
             value_str, is_static = self.resolve_dimension(dim_size, dim_idx)
             if value_str is None:
@@ -2028,8 +2028,7 @@ class IRVisitor:
                     f"broadcast: unable to resolve out_shape[{dim_idx}]={dim_size}"
                 )
             resolved_dims.append(value_str if is_static else "?")
-            if value_str.startswith("%"):
-                dynamic_shape_ssas.append(value_str)
+            resolved_dim_ssas.append(value_str if value_str.startswith("%") else None)
 
         result_type = ""
         fake_val = node.meta.get("val")
@@ -2037,25 +2036,48 @@ class IRVisitor:
             result_type = self.ctx.compute_mlir_type_from_fake_tensor(fake_val)
 
         if not result_type:
-            src_dtype = self._get_element_type_from_node(src_node)
             if resolved_dims:
                 result_type = f"tensor<{'x'.join(resolved_dims)}x{src_dtype}>"
             else:
                 result_type = f"tensor<{src_dtype}>"
 
+        # Build outs tensor shape independently from result type:
+        # keep full result rank/shape, but force the broadcast axis extent to 32.
+        outs_dim_tokens = list(resolved_dims)
+        outs_dynamic_shape_ssas: list[str] = []
+        broadcast_dim: int | None = dim_arg if isinstance(dim_arg, int) else None
+        if isinstance(broadcast_dim, int):
+            rank = len(outs_dim_tokens)
+            if broadcast_dim < 0:
+                broadcast_dim += rank
+            if not (0 <= broadcast_dim < rank):
+                broadcast_dim = None
+        if broadcast_dim is not None:
+            outs_dim_tokens[broadcast_dim] = "32"
+            resolved_dim_ssas[broadcast_dim] = None
+
+        if outs_dim_tokens:
+            outs_type = f"tensor<{'x'.join(outs_dim_tokens)}x{src_dtype}>"
+        else:
+            outs_type = f"tensor<{src_dtype}>"
+
+        # Fallback for non-literal dim: keep previous behavior (outs == result shape).
+        if broadcast_dim is None:
+            outs_type = result_type
+        outs_dynamic_shape_ssas = [ssa for ssa in resolved_dim_ssas if ssa is not None]
+
         empty_ssa = self.mlir_output_helper.fresh("broadcast_out")
-        if dynamic_shape_ssas:
+        if outs_dynamic_shape_ssas:
             self.mlir_output_helper.emit(
-                f"{empty_ssa} = tensor.empty({', '.join(dynamic_shape_ssas)}) : {result_type}"
+                f"{empty_ssa} = tensor.empty({', '.join(outs_dynamic_shape_ssas)}) : {outs_type}"
             )
         else:
-            self.mlir_output_helper.emit(f"{empty_ssa} = tensor.empty() : {result_type}")
+            self.mlir_output_helper.emit(f"{empty_ssa} = tensor.empty() : {outs_type}")
 
         result_ssa = self.mlir_output_helper.fresh("broadcasted")
         self.mlir_output_helper.emit(
             f'{result_ssa} = "loom.broadcast"({src_ssa}, {empty_ssa}, {dim_ssa}) '
-            f'{{operandSegmentSizes = array<i32: 1, 1, 1, 0, 0, 0, 0>}} '
-            f': ({src_type}, {result_type}, index) -> {result_type}'
+            f': ({src_type}, {outs_type}, index) -> {result_type}'
         )
 
         self.ctx.node_values[node.name] = result_ssa
