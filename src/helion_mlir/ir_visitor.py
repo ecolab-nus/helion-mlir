@@ -1987,8 +1987,8 @@ class IRVisitor:
         Lowering pattern for ``out = broadcast(src, dim, out_shape)``:
 
           %empty = tensor.empty(...) : tensor<outs_shape>
-          %out   = "loom.broadcast"(%src, %empty, %dim)
-                     : (tensor<src_shape>, tensor<outs_shape>, index)
+          %out   = "loom.broadcast"(%src, %empty) {dim = <static i64>}
+                     : (tensor<src_shape>, tensor<outs_shape>)
                        -> tensor<out_shape>
         """
         if len(node.args) != 3:
@@ -2011,7 +2011,6 @@ class IRVisitor:
 
         src_ssa = self.ctx.node_values.get(src_node.name, f"%{src_node.name}")
         src_type = self._get_tensor_type(src_node)
-        dim_ssa = self._as_index_ssa(dim_arg)
         src_dtype = self._get_element_type_from_node(src_node)
 
         resolved_dims: list[str] = []
@@ -2041,29 +2040,50 @@ class IRVisitor:
             else:
                 result_type = f"tensor<{src_dtype}>"
 
+        # `dim` must be a compile-time integer so it can be encoded as an op
+        # attribute in the textual IR.
+        if isinstance(dim_arg, bool):
+            raise RuntimeError("broadcast: dim must be an integer axis, got bool")
+        if isinstance(dim_arg, int):
+            broadcast_dim = int(dim_arg)
+        elif isinstance(dim_arg, fx.Node) and hasattr(dim_arg.meta.get("val"), "_sympy_"):
+            resolved_dim, is_static = self.resolve_dimension(dim_arg.meta["val"], 0)
+            if resolved_dim is None or not is_static or resolved_dim.startswith("%"):
+                raise RuntimeError(
+                    f"broadcast: dim must be statically resolvable, got node '{dim_arg.name}'"
+                )
+            broadcast_dim = int(resolved_dim)
+        elif hasattr(dim_arg, "_sympy_"):
+            resolved_dim, is_static = self.resolve_dimension(dim_arg, 0)
+            if resolved_dim is None or not is_static or resolved_dim.startswith("%"):
+                raise RuntimeError(
+                    f"broadcast: dim must be statically resolvable, got {dim_arg}"
+                )
+            broadcast_dim = int(resolved_dim)
+        else:
+            raise RuntimeError(
+                f"broadcast: dim must be a static integer, got {type(dim_arg)}"
+            )
+
         # Build outs tensor shape independently from result type:
         # keep full result rank/shape, but force the broadcast axis extent to 32.
         outs_dim_tokens = list(resolved_dims)
         outs_dynamic_shape_ssas: list[str] = []
-        broadcast_dim: int | None = dim_arg if isinstance(dim_arg, int) else None
-        if isinstance(broadcast_dim, int):
-            rank = len(outs_dim_tokens)
-            if broadcast_dim < 0:
-                broadcast_dim += rank
-            if not (0 <= broadcast_dim < rank):
-                broadcast_dim = None
-        if broadcast_dim is not None:
-            outs_dim_tokens[broadcast_dim] = "32"
-            resolved_dim_ssas[broadcast_dim] = None
+        rank = len(outs_dim_tokens)
+        if broadcast_dim < 0:
+            broadcast_dim += rank
+        if not (0 <= broadcast_dim < rank):
+            raise RuntimeError(
+                f"broadcast: dim {dim_arg} resolves to {broadcast_dim}, out of range for rank {rank}"
+            )
+        outs_dim_tokens[broadcast_dim] = "32"
+        resolved_dim_ssas[broadcast_dim] = None
 
         if outs_dim_tokens:
             outs_type = f"tensor<{'x'.join(outs_dim_tokens)}x{src_dtype}>"
         else:
             outs_type = f"tensor<{src_dtype}>"
 
-        # Fallback for non-literal dim: keep previous behavior (outs == result shape).
-        if broadcast_dim is None:
-            outs_type = result_type
         outs_dynamic_shape_ssas = [ssa for ssa in resolved_dim_ssas if ssa is not None]
 
         empty_ssa = self.mlir_output_helper.fresh("broadcast_out")
@@ -2076,8 +2096,9 @@ class IRVisitor:
 
         result_ssa = self.mlir_output_helper.fresh("broadcasted")
         self.mlir_output_helper.emit(
-            f'{result_ssa} = "loom.broadcast"({src_ssa}, {empty_ssa}, {dim_ssa}) '
-            f': ({src_type}, {outs_type}, index) -> {result_type}'
+            f'{result_ssa} = "loom.broadcast"({src_ssa}, {empty_ssa}) '
+            f'{{dim = {broadcast_dim} : i64}} '
+            f': ({src_type}, {outs_type}) -> {result_type}'
         )
 
         self.ctx.node_values[node.name] = result_ssa

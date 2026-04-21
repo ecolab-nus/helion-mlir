@@ -19,7 +19,7 @@ from helion.language import _decorators
 @_decorators.api(allow_host_tensor=False, tiles_as_sizes=True)
 def broadcast(
     src: torch.Tensor,
-    dim: int | torch.SymInt,
+    dim: int,
     out_shape: Sequence[int | torch.SymInt],
 ) -> torch.Tensor:
     """Broadcast ``src`` to ``out_shape``.
@@ -33,7 +33,7 @@ def broadcast(
 
 
 @_decorators.register_fake(broadcast)
-def _(src: torch.Tensor, dim: int | torch.SymInt, out_shape: Sequence[int | torch.SymInt]) -> torch.Tensor:
+def _(src: torch.Tensor, dim: int, out_shape: Sequence[int | torch.SymInt]) -> torch.Tensor:
     # Minimal fake implementation: shape is entirely dictated by `out_shape`.
     _ = dim
     return src.new_empty(tuple(out_shape))
