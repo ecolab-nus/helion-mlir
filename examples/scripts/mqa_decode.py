@@ -96,6 +96,8 @@ def flash_decode(
             m_i = m_ij
         
         split_lse = torch.log(l_i) + m_i
+        l_i_bc = broadcast(l_i, 2, [l_i.size(0), l_i.size(1), head_dim])
+        acc /= l_i_bc
 
         # Gather split_lse and acc across all tile_s
         gathered_lse = gather(tile_s, split_lse) # [N, tile_b, num_q_head, 1]
