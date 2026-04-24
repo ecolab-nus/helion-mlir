@@ -24,14 +24,13 @@ import helion.language as hl
 # ---------------------------------------------------------------------------
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SRC_ROOT = _REPO_ROOT / "src"
-_CUSTOME_OP_ROOT = _REPO_ROOT / "custome_op"
 
 for path in [str(_SRC_ROOT), str(_REPO_ROOT)]:
     if path not in sys.path:
         sys.path.insert(0, path)
 
 from helion_mlir import generate_mlir, validate_with_mlir_opt, print_debug_info
-from custome_op import broadcast # registers the op with Helion's decorator API
+from helion_mlir.custome_op import gather, broadcast  # registers the op with Helion's decorator API
 
 
 # %%
@@ -159,7 +158,7 @@ def helion_mamba2_chunk_scan_kernel(
                 tile_n,
             ]
             # hl.dot([tile_m, tile_k], [tile_k, tile_n]) -> [tile_m, tile_n]
-            acc_o = hl.dot(cb_local, x_local, acc=acc_o)
+            acc_o = torch.addmm(acc_o, cb_local, x_local)
 
         # D_local: scalar
         D_local = D[tile_h.begin]
