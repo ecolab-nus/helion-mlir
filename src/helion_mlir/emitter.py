@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 
 from .debug_utils import run_dce_cleanup
 from .session import LoweringSession
@@ -86,6 +87,21 @@ class ModuleEmitter:
         if cleanup:
             try:
                 mlir_text = run_dce_cleanup(mlir_text)
+                mlir_text = self._restore_host_arg_names(mlir_text)
             except (FileNotFoundError, RuntimeError):
                 pass
         return mlir_text
+
+    def _restore_host_arg_names(self, mlir_text: str) -> str:
+        """Restore user-facing host tensor names after mlir-opt canonicalizes args."""
+        host_names = list(self.session.host_tensor_types.keys())
+        if not host_names:
+            return mlir_text
+
+        def repl(match: re.Match[str]) -> str:
+            idx = int(match.group(1))
+            if idx < len(host_names):
+                return f"%{host_names[idx]}"
+            return match.group(0)
+
+        return re.sub(r"%arg([0-9]+)\b", repl, mlir_text)

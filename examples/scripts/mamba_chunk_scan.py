@@ -90,7 +90,7 @@ def helion_mamba2_chunk_scan_kernel(
     )
     prev_states_T = prev_states.transpose(3, 4)
 
-    out = torch.empty_like(x)
+    out_ = torch.empty_like(x)
 
     for tile_h, tile_m, tile_n, tile_b, tile_c in hl.tile(
         [nheads, chunk_size, headdim, batch, nchunks],
@@ -169,11 +169,11 @@ def helion_mamba2_chunk_scan_kernel(
         # D_local scalar broadcasts to [tile_m, tile_n]
         acc_o += x_residual * D_local
         # out[...] tile: [tile_m, tile_n]
-        out[
+        out_[
             tile_b.begin, tile_c.begin * chunk_size + tile_m.index, tile_h.begin, tile_n
         ] = acc_o.to(dtype=dtype)
 
-    return out
+    return out_
 
 
 # %%
