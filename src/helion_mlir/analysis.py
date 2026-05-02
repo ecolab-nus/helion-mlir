@@ -9,6 +9,71 @@ from .mlir_utils import format_memref_type, format_tensor_type, torch_dtype_to_m
 from .models import BlockInfoSummary, GraphInventory, HostTensorInfo, KernelAnalysis
 
 
+def _direct_host_tensor_name(node: Any, host_tensor_target: Any) -> str | None:
+    if (
+        getattr(node, "op", None) != "call_function"
+        or getattr(node, "target", None) is not host_tensor_target
+        or not getattr(node, "args", None)
+    ):
+        return None
+    name = node.args[0]
+    return name if isinstance(name, str) else None
+
+
+def _collect_stored_tensor_names(
+    graph_infos: list[Any],
+    rolled_ids: set[int],
+    *,
+    host_tensor_target: Any,
+    store_target: Any,
+) -> tuple[str, ...]:
+    stored_names: list[str] = []
+    seen_stored_names: set[str] = set()
+
+    for graph_info in graph_infos:
+        if graph_info.graph_id in rolled_ids:
+            continue
+        for node in graph_info.graph.nodes:
+            if (
+                getattr(node, "op", None) != "call_function"
+                or getattr(node, "target", None) is not store_target
+            ):
+                continue
+            if not getattr(node, "args", None):
+                continue
+            tensor_node = node.args[0]
+            name = _direct_host_tensor_name(tensor_node, host_tensor_target)
+            if name is None or name in seen_stored_names:
+                continue
+            seen_stored_names.add(name)
+            stored_names.append(name)
+
+    return tuple(stored_names)
+
+
+def _order_host_tensor_names(
+    host_tensor_types: dict[str, str],
+    arg_types: dict[str, str],
+    stored_tensor_names: tuple[str, ...],
+) -> tuple[str, ...]:
+    stored = {name for name in stored_tensor_names if name in host_tensor_types}
+    ordered_names: list[str] = []
+
+    for name in arg_types:
+        if name in host_tensor_types and name not in stored:
+            ordered_names.append(name)
+
+    for name in host_tensor_types:
+        if name not in stored and name not in ordered_names:
+            ordered_names.append(name)
+
+    for name in stored_tensor_names:
+        if name in host_tensor_types and name not in ordered_names:
+            ordered_names.append(name)
+
+    return tuple(ordered_names)
+
+
 def build_kernel_analysis(
     bound_kernel: Any,
     *,
@@ -16,6 +81,7 @@ def build_kernel_analysis(
 ) -> KernelAnalysis:
     from helion._compiler.device_ir import IfGraphInfo, ReductionLoopGraphInfo, RootGraphInfo, ForLoopGraphInfo
     import helion.language._tracing_ops as hl_tracing_ops
+    import helion.language.memory_ops as hl_memory_ops
     from helion._compiler.variable_origin import BlockSizeOrigin
 
     device_ir = bound_kernel.host_function.device_ir
@@ -177,6 +243,18 @@ def build_kernel_analysis(
                     shape.append(None)
             host_tensor_types[name] = format_memref_type(shape, dtype_str)
 
+    stored_tensor_names = _collect_stored_tensor_names(
+        device_ir.graphs,
+        rolled_ids,
+        host_tensor_target=hl_tracing_ops._host_tensor,
+        store_target=hl_memory_ops.store,
+    )
+    ordered_tensor_names = _order_host_tensor_names(
+        host_tensor_types,
+        arg_types,
+        stored_tensor_names,
+    )
+
     all_parallel_block_ids: set[int] = set()
     for grp in device_ir.grid_block_ids:
         all_parallel_block_ids.update(grp)
@@ -205,9 +283,10 @@ def build_kernel_analysis(
         host_tensors=HostTensorInfo(
             tensor_types=host_tensor_types,
             arg_types=arg_types,
+            ordered_tensor_names=ordered_tensor_names,
+            stored_tensor_names=stored_tensor_names,
         ),
         module_attributes=module_attributes,
         reduction_block_ids=tuple(reduction_block_ids),
         assume_divisible_tiles=assume_divisible_tiles,
     )
-

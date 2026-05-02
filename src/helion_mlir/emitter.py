@@ -23,8 +23,14 @@ class ModuleEmitter:
             self.builder.emit("module {")
         self.builder.push()
 
+        tensor_names = (
+            self.session.analysis.host_tensors.ordered_tensor_names
+            or tuple(self.session.host_tensor_types.keys())
+        )
+
         func_args = []
-        for tensor_name, tensor_type in self.session.host_tensor_types.items():
+        for tensor_name in tensor_names:
+            tensor_type = self.session.host_tensor_types[tensor_name]
             # Keep function argument names collision-safe for nested region blocks.
             ssa_name = f"%{tensor_name}_arg"
             func_args.append((ssa_name, tensor_type))
@@ -95,7 +101,10 @@ class ModuleEmitter:
 
     def _restore_host_arg_names(self, mlir_text: str) -> str:
         """Restore user-facing host tensor names after mlir-opt canonicalizes args."""
-        host_names = list(self.session.host_tensor_types.keys())
+        host_names = list(
+            self.session.analysis.host_tensors.ordered_tensor_names
+            or tuple(self.session.host_tensor_types.keys())
+        )
         if not host_names:
             return mlir_text
 

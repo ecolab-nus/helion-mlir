@@ -24,6 +24,8 @@ class BlockInfoSummary:
 class HostTensorInfo:
     tensor_types: dict[str, str]
     arg_types: dict[str, str]
+    ordered_tensor_names: tuple[str, ...] = field(default_factory=tuple)
+    stored_tensor_names: tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
@@ -63,4 +65,3 @@ class SubviewSpec:
     sizes: tuple[tuple[str, bool], ...]
     strides: tuple[str, ...]
     retained_dim_positions: tuple[int, ...]
-
