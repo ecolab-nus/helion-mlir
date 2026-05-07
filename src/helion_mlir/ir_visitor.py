@@ -2025,26 +2025,23 @@ class IRVisitor:
                 f"broadcast: dim must be a static integer, got {type(dim_arg)}"
             )
 
-        # Build outs tensor shape independently from result type:
-        # keep full result rank/shape, but force the broadcast axis extent to 32.
-        outs_dim_tokens = list(resolved_dims)
-        outs_dynamic_shape_ssas: list[str] = []
-        rank = len(outs_dim_tokens)
+        # Build outs tensor with the same shape/type as the returned tensor.
+        outs_type = result_type
+        outs_dynamic_shape_ssas: list[str] = [
+            ssa for ssa in resolved_dim_ssas if ssa is not None
+        ]
+        rank = len(resolved_dims)
         if broadcast_dim < 0:
             broadcast_dim += rank
         if not (0 <= broadcast_dim < rank):
             raise RuntimeError(
                 f"broadcast: dim {dim_arg} resolves to {broadcast_dim}, out of range for rank {rank}"
             )
-        outs_dim_tokens[broadcast_dim] = "32"
-        resolved_dim_ssas[broadcast_dim] = None
-
-        if outs_dim_tokens:
-            outs_type = f"tensor<{'x'.join(outs_dim_tokens)}x{src_dtype}>"
-        else:
-            outs_type = f"tensor<{src_dtype}>"
-
-        outs_dynamic_shape_ssas = [ssa for ssa in resolved_dim_ssas if ssa is not None]
+        # Previous temporary optimization forced the broadcast axis in the outs
+        # tensor to 32 regardless of the returned tensor shape. Keep this
+        # disabled so outs_type exactly matches result_type.
+        # outs_dim_tokens[broadcast_dim] = "32"
+        # resolved_dim_ssas[broadcast_dim] = None
 
         empty_ssa = self.mlir_output_helper.fresh("broadcast_out")
         if outs_dynamic_shape_ssas:
