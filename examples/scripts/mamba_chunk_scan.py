@@ -76,6 +76,8 @@ def helion_mamba2_chunk_scan_kernel(
     assert C.shape == (batch, seqlen, ngroups, dstate)
     assert prev_states.shape == (batch, nchunks, nheads, headdim, dstate)
     assert D.shape == (nheads,)
+    x = x.transpose(1, 2)
+    C = C.transpose(1, 2)
 
     dtype = cb.dtype
     accum_dtype = torch.float16
@@ -117,8 +119,8 @@ def helion_mamba2_chunk_scan_kernel(
         # row index = tile_c * chunk_size + tile_m.index
         C_local = C[
             tile_b.begin,
-            tile_m.index + tile_c.begin * chunk_size,
             tile_h.begin // (nheads // ngroups),
+            tile_m.index + tile_c.begin * chunk_size,
             :,
         ]
         # prev_states_local: [dstate, tile_b]
@@ -161,8 +163,8 @@ def helion_mamba2_chunk_scan_kernel(
             # x_local: [tile_k, tile_n]
             x_local = x[
                 tile_b.begin,
-                tile_c.begin * chunk_size + tile_k.index,
                 tile_h.begin,
+                tile_c.begin * chunk_size + tile_k.index,
                 tile_n,
             ]
             # hl.dot([tile_m, tile_k], [tile_k, tile_n]) -> [tile_m, tile_n]
@@ -172,13 +174,13 @@ def helion_mamba2_chunk_scan_kernel(
         D_local = D[tile_h.begin]
         # x_residual: [tile_m, tile_n]
         x_residual = x[
-            tile_b.begin, tile_c.begin * chunk_size + tile_m.index, tile_h.begin, tile_n
+            tile_b.begin, tile_h.begin, tile_c.begin * chunk_size + tile_m.index, tile_n
         ]
         # D_local scalar broadcasts to [tile_m, tile_n]
         acc_o += x_residual * D_local
         # out[...] tile: [tile_m, tile_n]
         out_[
-            tile_b.begin, tile_c.begin * chunk_size + tile_m.index, tile_h.begin, tile_n
+            tile_b.begin, tile_h.begin, tile_c.begin * chunk_size + tile_m.index, tile_n
         ] = acc_o.to(dtype=dtype)
 
     return out_
