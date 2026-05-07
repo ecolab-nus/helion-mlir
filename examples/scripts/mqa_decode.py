@@ -19,14 +19,13 @@ import helion.language as hl
 # ---------------------------------------------------------------------------
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SRC_ROOT = _REPO_ROOT / "src"
-_CUSTOM_OP_ROOT = _REPO_ROOT / "custom_op"
 
 for path in [str(_SRC_ROOT), str(_REPO_ROOT)]:
     if path not in sys.path:
         sys.path.insert(0, path)
 
 from helion_mlir import print_debug_info, generate_mlir, validate_with_mlir_opt
-from custom_op import gather, broadcast # registers the op with Helion's decorator API
+from helion_mlir.custom_op import gather, broadcast  # registers the op with Helion's decorator API
 
 
 # ---------------------------------------------------------------------------

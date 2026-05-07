@@ -104,7 +104,11 @@ def helion_mamba2_chunk_scan_kernel(
         acc_o = hl.zeros([tile_m, tile_n], dtype=accum_dtype)
         # dA_cumsum_local_m: [tile_m]
         dA_cumsum_local_m = dA_cumsum[tile_b.begin, tile_h.begin, tile_c.begin, tile_m]
-        dA_cumsum_local_m_bc_n = broadcast(dA_cumsum_local_m, 1, [dA_cumsum_local_m.size(0), tile_n])
+        dA_cumsum_local_m_bc_n = broadcast(
+            dA_cumsum_local_m,
+            0,
+            [tile_n, dA_cumsum_local_m.size(0)],
+        ).T
 
         # scale_m_local: [tile_m, tile_n]
         scale_m_local = torch.exp(dA_cumsum_local_m_bc_n)
@@ -138,7 +142,11 @@ def helion_mamba2_chunk_scan_kernel(
             dA_cumsum_local_k = dA_cumsum[
                 tile_b.begin, tile_h.begin, tile_c.begin, tile_k
             ]
-            dA_cumsum_local_m_bc_k = broadcast(dA_cumsum_local_m, 1, [dA_cumsum_local_m.size(0), tile_k])
+            dA_cumsum_local_m_bc_k = broadcast(
+                dA_cumsum_local_m,
+                0,
+                [tile_k, dA_cumsum_local_m.size(0)],
+            ).T
             dA_cumsum_local_k = broadcast(dA_cumsum_local_k, 0, [tile_m, dA_cumsum_local_k.size(0)])
             # broadcast to [tile_m, tile_k]
             cb_local *= torch.exp(dA_cumsum_local_m_bc_k - dA_cumsum_local_k)

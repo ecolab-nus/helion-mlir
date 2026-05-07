@@ -29,11 +29,10 @@ def build_handler_registry() -> tuple[dict[object, str], list[tuple[Callable[[ob
 def load_custom_ops() -> dict[str, tuple[object, ...]]:
     """Lazily load supported custom ops.
 
-    Loads package and local-example custom-op namespaces.
+    Loads the packaged helion-mlir custom-op namespace.
     """
     module_candidates = [
         "helion_mlir.custom_op",
-        "custom_op",
     ]
 
     loaded: dict[str, list[object]] = {"gather": [], "broadcast": []}
