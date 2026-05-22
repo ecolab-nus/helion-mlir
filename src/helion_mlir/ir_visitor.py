@@ -939,10 +939,15 @@ class IRVisitor:
 
         c0 = self._emit_index_constant(0)
         c1 = self._emit_index_constant(1)
-        self.mlir_output_helper.emit(
-            f"{result_binding} = scf.for {iv} = {c0} to {trip_count_ssa} step {c1} "
-            f"iter_args({iter_args_str}) -> ({result_types}) {{"
-        )
+        if num_results == 0:
+            self.mlir_output_helper.emit(
+                f"scf.for {iv} = {c0} to {trip_count_ssa} step {c1} {{"
+            )
+        else:
+            self.mlir_output_helper.emit(
+                f"{result_binding} = scf.for {iv} = {c0} to {trip_count_ssa} step {c1} "
+                f"iter_args({iter_args_str}) -> ({result_types}) {{"
+            )
         yield_op = "scf.yield"
         self.mlir_output_helper.push()
 
@@ -983,7 +988,9 @@ class IRVisitor:
         self.loop_iter_args = old_loop_iter_args
         self.loop_bounds = saved_loop_bounds
 
-        if isinstance(self.current_loop_result, list) and len(self.current_loop_result) > 1:
+        if num_results == 0:
+            self.mlir_output_helper.emit(yield_op)
+        elif isinstance(self.current_loop_result, list) and len(self.current_loop_result) > 1:
             yield_values = ", ".join(self.current_loop_result)
             yield_types = ", ".join(iter_args_types)
             self.mlir_output_helper.emit(f"{yield_op} {yield_values} : {yield_types}")
@@ -999,7 +1006,7 @@ class IRVisitor:
         self.mlir_output_helper.pop()
         self.mlir_output_helper.emit("}")
 
-        self.ctx.node_values[node.name] = result
+        self.ctx.node_values[node.name] = result if num_results > 0 else ""
         if isinstance(self.current_loop_result, list) and len(self.current_loop_result) > 1:
             self.ctx.loop_result_values = loop_result_values_snapshot
             self.ctx.record_loop_result(
@@ -1008,7 +1015,7 @@ class IRVisitor:
                 count=len(self.current_loop_result),
             )
 
-        return result
+        return result if num_results > 0 else ""
 
     
     def visit_phi(self, node: fx.Node) -> str:
