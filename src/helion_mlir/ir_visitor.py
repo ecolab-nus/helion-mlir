@@ -314,10 +314,6 @@ class IRVisitor:
         """Return block-size value as (value, is_static_literal)."""
         return self.ctx.symbol_resolver.get_block_size_value(canonical_block_id)
 
-    def _is_singleton_block(self, canonical_block_id: int) -> bool:
-        """Whether block size is known to be exactly 1."""
-        return self.ctx.symbol_resolver.is_singleton_block(canonical_block_id)
-
     def _extract_tile_index_add(self, node: fx.Node) -> tuple[int, Any] | None:
         """Detect aten.add(tile_index(...), base) pattern used for contiguous ranges."""
         if node.target is not aten.add.Tensor or len(node.args) < 2:
@@ -659,12 +655,16 @@ class IRVisitor:
     def _emit_block_offset(
         self,
         canonical_block_id: int,
-        block_size_ssa: str,
+        block_size: str,
         *,
         hint: str = "offset",
     ) -> str:
         iv_ssa = self._get_block_loop_iv(canonical_block_id)
-        offset_ssa = self._emit_index_muli(iv_ssa, block_size_ssa, hint=hint)
+        if block_size == "1":
+            offset_ssa = iv_ssa
+        else:
+            block_size_ssa = self._as_index_ssa(block_size)
+            offset_ssa = self._emit_index_muli(iv_ssa, block_size_ssa, hint=hint)
         bounds = self._get_active_loop_bounds(canonical_block_id)
         if bounds is None:
             return offset_ssa
@@ -674,15 +674,16 @@ class IRVisitor:
     def _emit_block_end(
         self,
         canonical_block_id: int,
-        block_size_ssa: str,
+        block_size: str,
         *,
         hint: str = "tile_end",
     ) -> str:
         start_ssa = self._emit_block_offset(
             canonical_block_id,
-            block_size_ssa,
+            block_size,
             hint=f"{hint}_start",
         )
+        block_size_ssa = self._as_index_ssa(block_size)
         naive_end_ssa = self._emit_index_addi(
             start_ssa,
             block_size_ssa,
@@ -697,26 +698,71 @@ class IRVisitor:
     def _emit_block_extent(
         self,
         canonical_block_id: int,
-        block_size_ssa: str,
+        block_size: str,
         *,
         hint: str = "tile_extent",
     ) -> str:
         if self.ctx.assume_divisible_tiles:
-            return block_size_ssa
+            return block_size
         bounds = self._get_active_loop_bounds(canonical_block_id)
         if bounds is None:
-            return block_size_ssa
+            return block_size
         start_ssa = self._emit_block_offset(
             canonical_block_id,
-            block_size_ssa,
+            block_size,
             hint=f"{hint}_start",
         )
         end_ssa = self._emit_block_end(
             canonical_block_id,
-            block_size_ssa,
+            block_size,
             hint=f"{hint}_end",
         )
         return self._emit_index_subi(end_ssa, start_ssa, hint=hint)
+
+    def _lower_block_index(self, canonical_block_id: int) -> tuple[str, str, int | None]:
+        """Lower a BlockSize-origin index as a rank-preserving tile range."""
+        block_size, size_is_static = self._get_block_size_value(canonical_block_id)
+        offset = self._emit_block_offset(canonical_block_id, block_size)
+        extent = self._emit_block_extent(canonical_block_id, block_size)
+        static_extent = None
+        if size_is_static and not extent.startswith("%"):
+            try:
+                static_extent = int(extent)
+            except ValueError:
+                pass
+        return offset, extent, static_extent
+
+    def _cast_tensor_for_subview(
+        self,
+        value_ssa: str,
+        value_type: str,
+        output_dims: list[str],
+        dtype: str,
+    ) -> tuple[str, str]:
+        """Cast compatible dynamic tensor dimensions to the subview's shape."""
+        target_type = f"tensor<{'x'.join(output_dims)}x{dtype}>" if output_dims else f"tensor<{dtype}>"
+        if value_type == target_type:
+            return value_ssa, value_type
+        if not (value_type.startswith("tensor<") and value_type.endswith(">")):
+            raise RuntimeError(f"store expects a tensor value, got {value_type}")
+        content = value_type[len("tensor<") : -1]
+        if "," in content:
+            raise RuntimeError(f"store does not support encoded tensor types: {value_type}")
+        parts = content.split("x")
+        value_dims, value_dtype = parts[:-1], parts[-1]
+        if value_dtype != dtype or len(value_dims) != len(output_dims):
+            raise RuntimeError(
+                f"store value type {value_type} is incompatible with subview tensor type {target_type}"
+            )
+        if any(lhs != rhs and lhs != "?" and rhs != "?" for lhs, rhs in zip(value_dims, output_dims)):
+            raise RuntimeError(
+                f"store value type {value_type} is incompatible with subview tensor type {target_type}"
+            )
+        cast_ssa = self.mlir_output_helper.fresh("store_cast")
+        self.mlir_output_helper.emit(
+            f"{cast_ssa} = tensor.cast {value_ssa} : {value_type} to {target_type}"
+        )
+        return cast_ssa, target_type
 
     def _as_index_ssa(self, value: Any) -> str:
         """Materialize an index-typed SSA value from literals/SymInt/FX nodes."""
@@ -1262,25 +1308,11 @@ class IRVisitor:
                 block_id = self._try_get_block_id_from_node(idx)
                 
                 if block_id is not None:
-                    if self._is_singleton_block(block_id):
-                        # Scalar indexing for singleton blocks (size == 1): rank-reduce.
-                        offsets.append((idx_ssa, not idx_ssa.startswith("%")))
-                        sizes.append(("1", True))
-                    else:
-                        # Range indexing for regular tile blocks.
-                        offset_ssa = self._emit_block_offset(block_id, idx_ssa, hint="offset")
-                        size_ssa = self._emit_block_extent(block_id, idx_ssa, hint="tile_extent")
-                        offsets.append((offset_ssa, False))
-                        size_is_static = not size_ssa.startswith("%")
-                        sizes.append((size_ssa, size_is_static))
-                        if size_is_static:
-                            try:
-                                output_dim_sizes.append(int(size_ssa))
-                            except ValueError:
-                                output_dim_sizes.append(None)
-                        else:
-                            output_dim_sizes.append(None)
-                        retained_dim_positions.append(i)
+                    offset, extent, static_extent = self._lower_block_index(block_id)
+                    offsets.append((offset, not offset.startswith("%")))
+                    sizes.append((extent, not extent.startswith("%")))
+                    output_dim_sizes.append(static_extent)
+                    retained_dim_positions.append(i)
                 else:
                     # Generic scalar index - rank-reduce this dimension.
                     offsets.append((idx_ssa, False))
@@ -1498,24 +1530,11 @@ class IRVisitor:
                 block_id = self._try_get_block_id_from_node(idx)
                 
                 if block_id is not None:
-                    if self._is_singleton_block(block_id):
-                        # Scalar indexing for singleton blocks (size == 1): rank-reduce.
-                        offsets.append((idx_ssa, not idx_ssa.startswith("%")))
-                        sizes.append(("1", True))
-                    else:
-                        offset_ssa = self._emit_block_offset(block_id, idx_ssa, hint="offset")
-                        size_ssa = self._emit_block_extent(block_id, idx_ssa, hint="tile_extent")
-                        offsets.append((offset_ssa, False))
-                        size_is_static = not size_ssa.startswith("%")
-                        sizes.append((size_ssa, size_is_static))
-                        if size_is_static:
-                            try:
-                                output_dim_sizes.append(int(size_ssa))
-                            except ValueError:
-                                output_dim_sizes.append(None)
-                        else:
-                            output_dim_sizes.append(None)
-                        retained_dim_positions.append(i)
+                    offset, extent, static_extent = self._lower_block_index(block_id)
+                    offsets.append((offset, not offset.startswith("%")))
+                    sizes.append((extent, not extent.startswith("%")))
+                    output_dim_sizes.append(static_extent)
+                    retained_dim_positions.append(i)
                 else:
                     # Generic scalar index - rank-reduce this dimension.
                     offsets.append((idx_ssa, False))
@@ -1594,6 +1613,12 @@ class IRVisitor:
             f'{memref_type} to {subview_type}'
         )
 
+        value_ssa, value_type = self._cast_tensor_for_subview(
+            value_ssa,
+            value_type,
+            output_dims,
+            dtype_str,
+        )
         value_memref_ssa = self.mlir_output_helper.fresh("value_memref")
         self.mlir_output_helper.emit(
             f'{value_memref_ssa} = bufferization.to_buffer {value_ssa} : {value_type} to {subview_type}'
@@ -1695,23 +1720,11 @@ class IRVisitor:
                     continue
                 block_id = self._try_get_block_id_from_node(idx)
                 if block_id is not None:
-                    if self._is_singleton_block(block_id):
-                        offsets.append((idx_ssa, not idx_ssa.startswith("%")))
-                        sizes.append(("1", True))
-                    else:
-                        offset_ssa = self._emit_block_offset(block_id, idx_ssa, hint="offset")
-                        size_ssa = self._emit_block_extent(block_id, idx_ssa, hint="tile_extent")
-                        offsets.append((offset_ssa, False))
-                        size_is_static = not size_ssa.startswith("%")
-                        sizes.append((size_ssa, size_is_static))
-                        if size_is_static:
-                            try:
-                                output_dim_sizes.append(int(size_ssa))
-                            except ValueError:
-                                output_dim_sizes.append(None)
-                        else:
-                            output_dim_sizes.append(None)
-                        retained_dim_positions.append(i)
+                    offset, extent, static_extent = self._lower_block_index(block_id)
+                    offsets.append((offset, not offset.startswith("%")))
+                    sizes.append((extent, not extent.startswith("%")))
+                    output_dim_sizes.append(static_extent)
+                    retained_dim_positions.append(i)
                 else:
                     offsets.append((idx_ssa, False))
                     sizes.append(("1", True))
@@ -2002,9 +2015,19 @@ class IRVisitor:
         resolved_dim_ssas: list[str | None] = []
         for dim_idx, dim_size in enumerate(out_shape_arg):
             if isinstance(dim_size, fx.Node):
-                shape_dim_ssa = self._as_index_ssa(dim_size)
-                resolved_dims.append("?")
-                resolved_dim_ssas.append(shape_dim_ssa)
+                dim_val = dim_size.meta.get("val")
+                value_str = None
+                is_static = False
+                if dim_val is not None and hasattr(dim_val, "_sympy_"):
+                    value_str, is_static = self.resolve_dimension(dim_val, dim_idx)
+                elif isinstance(dim_val, int):
+                    value_str, is_static = str(dim_val), True
+                if value_str is not None and is_static:
+                    resolved_dims.append(value_str)
+                    resolved_dim_ssas.append(None)
+                else:
+                    resolved_dims.append("?")
+                    resolved_dim_ssas.append(self._as_index_ssa(dim_size))
                 continue
             value_str, is_static = self.resolve_dimension(dim_size, dim_idx)
             if value_str is None:
@@ -2652,10 +2675,10 @@ class IRVisitor:
         imported_result_type = self._extract_imported_result_type(mlir_text)
         if "val" in node.meta:
             val = node.meta["val"]
-            if imported_result_type is not None:
-                self.ctx.node_types[node.name] = imported_result_type
-            elif hasattr(val, "shape"):
+            if hasattr(val, "shape"):
                 self.ctx.node_types[node.name] = self.ctx.compute_mlir_type_from_fake_tensor(val)
+            elif imported_result_type is not None:
+                self.ctx.node_types[node.name] = imported_result_type
             elif hasattr(val, "dtype"):
                 self.ctx.node_types[node.name] = torch_dtype_to_mlir_element_type(val.dtype)
             

@@ -1041,6 +1041,11 @@ def inline_torch_mlir_output(
             break
             
     result_ssa = None
+    returned_ssas: set[str] = set()
+    for line in lines[func_start_idx:func_end_idx]:
+        stripped = line.strip()
+        if stripped.startswith("return"):
+            returned_ssas.update(re.findall(r"%[\w.+-]+", stripped.split(":", 1)[0]))
 
     # Track which ^bb0 block arg positions to skip for scalar operands.
     # Populated when processing a linalg.generic ins() line, consumed
@@ -1136,6 +1141,23 @@ def inline_torch_mlir_output(
                 # LHS is SSA definition - handle multiple results
                 # Cases: "%0 = op", "%0, %1 = op", "%0:2 = op"
                 lhs_vars = [x.strip() for x in lhs.split(",")]
+
+                # A terminal tensor.cast only adapts the temporary imported
+                # function's precise result to its dynamic ABI. Once inlined,
+                # retain the source SSA and its more precise shape.
+                terminal_cast = re.match(
+                    r"tensor\.cast\s+(%[\w.+-]+)\s*:\s*"
+                    r"(tensor<[^>]+>)\s+to\s+(tensor<[^>]+>)$",
+                    rhs,
+                )
+                if (
+                    len(lhs_vars) == 1
+                    and lhs_vars[0] in returned_ssas
+                    and terminal_cast is not None
+                ):
+                    source_ssa = terminal_cast.group(1)
+                    ssa_map[lhs_vars[0]] = ssa_map.get(source_ssa, source_ssa)
+                    continue
                 
                 # -----------------------------------------------------------------
                 # Track arith.constant index values for tensor.dim.

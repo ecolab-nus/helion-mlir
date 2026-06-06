@@ -81,19 +81,6 @@ class SymbolResolver:
         extent = self.session.get_loop_extent(canonical_block_id)
         return (str(extent), True) if extent is not None else ("1", True)
 
-    def is_singleton_block(self, canonical_block_id: int) -> bool:
-        info = self.session.env.block_sizes[canonical_block_id]
-        size = info.size
-        if isinstance(size, int):
-            return size == 1
-        if hasattr(size, "_sympy_"):
-            sym = size._sympy_()
-            shape_env = self.session.bound_kernel.env.shape_env
-            if sym in shape_env.var_to_val:
-                return int(shape_env.var_to_val[sym]) == 1
-        return False
-
-
 class TypeResolver:
     def __init__(self, session: LoweringSession, symbols: SymbolResolver):
         self.session = session
@@ -213,4 +200,3 @@ class LoopResolver:
 
     def get_active_loop_bounds(self, canonical_block_id: int) -> tuple[str, str] | None:
         return self.session.active_loop_bounds().get(canonical_block_id)
-
