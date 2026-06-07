@@ -83,6 +83,7 @@ def build_kernel_analysis(
     import helion.language._tracing_ops as hl_tracing_ops
     import helion.language.tile_ops as hl_tile_ops
     import helion.language.memory_ops as hl_memory_ops
+    from helion._compiler.compile_environment import FixedBlockSizeSource
     from helion._compiler.variable_origin import BlockSizeOrigin
 
     device_ir = bound_kernel.host_function.device_ir
@@ -181,6 +182,17 @@ def build_kernel_analysis(
             alias[bid] = canonical_id
     for info in bound_kernel.env.block_sizes:
         alias.setdefault(info.block_id, info.block_id)
+
+    natural_upper_bounds = dict(loop_extents)
+    for info in bound_kernel.env.block_sizes:
+        source = info.block_size_source
+        if not isinstance(source, FixedBlockSizeSource):
+            continue
+        if not isinstance(source.value, int):
+            continue
+        canonical_id = alias.get(info.block_id, info.block_id)
+        natural_upper_bounds[canonical_id] = source.value
+        natural_upper_bounds[info.block_id] = source.value
 
     requested_tiles = set(divisible_tiles)
     divisible_block_ids: set[int] = set()
@@ -294,7 +306,7 @@ def build_kernel_analysis(
         if canonical_id not in used_canonical_ids or canonical_id in seen_canonical:
             continue
         seen_canonical.add(canonical_id)
-        upper_bound = loop_extents.get(info.block_id)
+        upper_bound = natural_upper_bounds.get(info.block_id)
         if upper_bound is None:
             continue
         sym_name = next(iter(info.debug_names), f"block_{canonical_id}")
@@ -374,6 +386,7 @@ def build_kernel_analysis(
         block_info=BlockInfoSummary(
             canonical_aliases=alias,
             loop_extents=loop_extents,
+            natural_upper_bounds=natural_upper_bounds,
             used_block_ids=frozenset(used_block_ids),
             used_canonical_block_ids=frozenset(used_canonical_ids),
         ),

@@ -16,6 +16,7 @@ class GraphInventory:
 class BlockInfoSummary:
     canonical_aliases: dict[int, int]
     loop_extents: dict[int, int]
+    natural_upper_bounds: dict[int, int]
     used_block_ids: frozenset[int]
     used_canonical_block_ids: frozenset[int]
 

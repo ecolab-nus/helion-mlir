@@ -84,6 +84,9 @@ class LoweringSession:
     def get_loop_extent(self, block_id: int) -> int | None:
         return self.analysis.block_info.loop_extents.get(block_id)
 
+    def get_natural_upper_bound(self, block_id: int) -> int | None:
+        return self.analysis.block_info.natural_upper_bounds.get(block_id)
+
     def compute_mlir_type_from_fake_tensor(self, fake_tensor: Any) -> str:
         return self.type_resolver.compute_mlir_type_from_fake_tensor(fake_tensor)
 

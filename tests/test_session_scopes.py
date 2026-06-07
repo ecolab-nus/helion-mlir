@@ -23,6 +23,7 @@ def _make_analysis() -> KernelAnalysis:
         block_info=BlockInfoSummary(
             canonical_aliases={},
             loop_extents={},
+            natural_upper_bounds={},
             used_block_ids=frozenset(),
             used_canonical_block_ids=frozenset(),
         ),

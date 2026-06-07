@@ -56,10 +56,25 @@ def test_expression_bound_uses_scf_for() -> None:
     D = torch.randn([nheads], dtype=torch.float16)
 
     bound_kernel = helion_mamba2_chunk_scan_kernel.bind((cb, x, dt, dA_cumsum, C, prev_states, D))
+    analysis = build_kernel_analysis(bound_kernel)
+    tile_c_info = next(
+        info for info in bound_kernel.env.block_sizes if "tile_c" in info.debug_names
+    )
+    assert analysis.block_info.loop_extents[tile_c_info.block_id] == nchunks
+    assert analysis.block_info.natural_upper_bounds[tile_c_info.block_id] == 1
+    assert analysis.module_attributes["loom.tile_c"][0] == (
+        "{upper_bound = 1 : index, is_reduction = false}"
+    )
+
+    raw_mlir_text = generate_mlir(bound_kernel, cleanup=False)
     mlir_text = generate_mlir(bound_kernel)
 
     assert "scf.for" in mlir_text
     assert "affine.apply" not in mlir_text
+    assert (
+        '"loom.sym"() {symbol_ref = @tile_c, upper_bound = 1 : index, '
+        "is_reduction = false}"
+    ) in raw_mlir_text
     result = validate_with_mlir_opt(mlir_text)
     assert result.returncode == 0, result.stderr
 

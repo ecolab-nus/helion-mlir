@@ -56,7 +56,7 @@ class ModuleEmitter:
             if isinstance(info.size, int):
                 self.builder.emit(f"{ssa} = arith.constant {info.size} : index")
             else:
-                upper_bound = self.session.get_loop_extent(info.block_id)
+                upper_bound = self.session.get_natural_upper_bound(info.block_id)
                 self.builder.emit(
                     f'{ssa} = "loom.sym"() {{symbol_ref = @{sym_name}, '
                     f"upper_bound = {upper_bound} : index, "
