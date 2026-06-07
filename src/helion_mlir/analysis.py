@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import replace
-from typing import Any
+from typing import Any, Collection
 
 import torch
 
@@ -78,6 +77,7 @@ def build_kernel_analysis(
     bound_kernel: Any,
     *,
     assume_divisible_tiles: bool = False,
+    divisible_tiles: Collection[str | int] = (),
 ) -> KernelAnalysis:
     from helion._compiler.device_ir import IfGraphInfo, ReductionLoopGraphInfo, RootGraphInfo, ForLoopGraphInfo
     import helion.language._tracing_ops as hl_tracing_ops
@@ -181,6 +181,38 @@ def build_kernel_analysis(
             alias[bid] = canonical_id
     for info in bound_kernel.env.block_sizes:
         alias.setdefault(info.block_id, info.block_id)
+
+    requested_tiles = set(divisible_tiles)
+    divisible_block_ids: set[int] = set()
+    matched_tiles: set[str | int] = set()
+    for info in bound_kernel.env.block_sizes:
+        canonical_id = alias.get(info.block_id, info.block_id)
+        if info.block_id in requested_tiles or canonical_id in requested_tiles:
+            divisible_block_ids.add(canonical_id)
+            matched_tiles.update(
+                tile
+                for tile in requested_tiles
+                if tile == info.block_id or tile == canonical_id
+            )
+        matching_names = requested_tiles.intersection(info.debug_names)
+        if matching_names:
+            divisible_block_ids.add(canonical_id)
+            matched_tiles.update(matching_names)
+
+    unmatched_tiles = requested_tiles - matched_tiles
+    if unmatched_tiles:
+        available_names = sorted(
+            {
+                name
+                for info in bound_kernel.env.block_sizes
+                for name in info.debug_names
+            }
+        )
+        available_ids = sorted(alias)
+        raise ValueError(
+            f"Unknown divisible tile(s): {sorted(unmatched_tiles, key=str)}. "
+            f"Available tile names: {available_names}; block ids: {available_ids}"
+        )
 
     used_block_ids: set[int] = set()
     for grp in device_ir.grid_block_ids:
@@ -354,4 +386,5 @@ def build_kernel_analysis(
         module_attributes=module_attributes,
         reduction_block_ids=tuple(reduction_block_ids),
         assume_divisible_tiles=assume_divisible_tiles,
+        divisible_block_ids=frozenset(divisible_block_ids),
     )

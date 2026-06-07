@@ -17,6 +17,8 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from helion_mlir import generate_mlir, validate_with_mlir_opt  # noqa: E402
+from helion_mlir.analysis import build_kernel_analysis  # noqa: E402
+from examples.scripts.flash_attention import attention  # noqa: E402
 from examples.scripts.matmul import matmul  # noqa: E402
 from examples.scripts.mamba_chunk_scan import helion_mamba2_chunk_scan_kernel  # noqa: E402
 
@@ -87,3 +89,41 @@ def test_nonzero_lower_bound_block_loop_is_supported() -> None:
     assert "arith.addi" in mlir_text
     result = validate_with_mlir_opt(mlir_text)
     assert result.returncode == 0, result.stderr
+
+
+def test_individual_tiles_can_be_marked_divisible() -> None:
+    q = torch.randn([2, 128, 64], dtype=torch.float16)
+    bound_kernel = attention.bind((q, q, q))
+
+    analysis = build_kernel_analysis(
+        bound_kernel,
+        divisible_tiles={"tile_b", "tile_m"},
+    )
+    assert analysis.divisible_block_ids == frozenset({0, 1})
+
+    mlir_text = generate_mlir(
+        bound_kernel,
+        divisible_tiles={"tile_b", "tile_m"},
+    )
+    all_divisible_mlir = generate_mlir(
+        bound_kernel,
+        divisible_tiles={"tile_b", "tile_m", "tile_n"},
+    )
+
+    # tile_n is not marked divisible, so its final extent remains bounded.
+    assert mlir_text.count("arith.cmpi ult") == 1
+    assert all_divisible_mlir.count("arith.cmpi ult") == 0
+
+
+def test_unknown_divisible_tile_name_is_rejected() -> None:
+    x = torch.randn([128, 64], dtype=torch.float16)
+    y = torch.randn([64, 128], dtype=torch.float16)
+    bound_kernel = matmul.bind((x, y))
+
+    try:
+        generate_mlir(bound_kernel, divisible_tiles={"tile_missing"})
+    except ValueError as exc:
+        assert "Unknown divisible tile(s)" in str(exc)
+        assert "tile_m" in str(exc)
+    else:
+        raise AssertionError("expected an unknown divisible tile to be rejected")

@@ -690,7 +690,7 @@ class IRVisitor:
             hint=f"{hint}_naive",
         )
         bounds = self._get_active_loop_bounds(canonical_block_id)
-        if bounds is None or self.ctx.assume_divisible_tiles:
+        if bounds is None or self.ctx.tile_is_divisible(canonical_block_id):
             return naive_end_ssa
         _, ub_ssa = bounds
         return self._emit_index_minui(naive_end_ssa, ub_ssa, hint=hint)
@@ -702,7 +702,7 @@ class IRVisitor:
         *,
         hint: str = "tile_extent",
     ) -> str:
-        if self.ctx.assume_divisible_tiles:
+        if self.ctx.tile_is_divisible(canonical_block_id):
             return block_size
         bounds = self._get_active_loop_bounds(canonical_block_id)
         if bounds is None:

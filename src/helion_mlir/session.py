@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Iterator
+from typing import Any, Collection, Iterator
 
 from .mlir_utils import MLIROutputHelper
 from .models import KernelAnalysis, LoopScope
@@ -70,6 +70,13 @@ class LoweringSession:
     @property
     def assume_divisible_tiles(self) -> bool:
         return self.analysis.assume_divisible_tiles
+
+    def tile_is_divisible(self, block_id: int) -> bool:
+        canonical_id = self.resolve_block_id(block_id)
+        return (
+            self.analysis.assume_divisible_tiles
+            or canonical_id in self.analysis.divisible_block_ids
+        )
 
     def resolve_block_id(self, block_id: int) -> int:
         return self.analysis.block_info.canonical_aliases.get(block_id, block_id)
@@ -156,13 +163,19 @@ class LoweringSession:
 class LoweringContext(LoweringSession):
     """Compatibility shim for older imports."""
 
-    def __init__(self, bound_kernel: Any, assume_divisible_tiles: bool = False):
+    def __init__(
+        self,
+        bound_kernel: Any,
+        assume_divisible_tiles: bool = False,
+        divisible_tiles: Collection[str | int] = (),
+    ):
         from .analysis import build_kernel_analysis
 
         super().__init__(
             build_kernel_analysis(
                 bound_kernel,
                 assume_divisible_tiles=assume_divisible_tiles,
+                divisible_tiles=divisible_tiles,
             )
         )
 
