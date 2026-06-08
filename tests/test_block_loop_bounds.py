@@ -130,6 +130,45 @@ def test_individual_tiles_can_be_marked_divisible() -> None:
     assert all_divisible_mlir.count("arith.cmpi ult") == 0
 
 
+def test_individual_tile_upper_bounds_can_be_overridden() -> None:
+    x = torch.randn([128, 64], dtype=torch.float16)
+    y = torch.randn([64, 128], dtype=torch.float16)
+    bound_kernel = matmul.bind((x, y))
+
+    tile_n_info = next(
+        info for info in bound_kernel.env.block_sizes if "tile_n" in info.debug_names
+    )
+    analysis = build_kernel_analysis(
+        bound_kernel,
+        tile_upper_bounds={"tile_n": 2048},
+    )
+    assert analysis.block_info.natural_upper_bounds[tile_n_info.block_id] == 2048
+
+    mlir_text = generate_mlir(
+        bound_kernel,
+        cleanup=False,
+        tile_upper_bounds={"tile_n": 2048},
+    )
+    assert (
+        '"loom.sym"() {symbol_ref = @tile_n, upper_bound = 2048 : index, '
+        "is_reduction = false}"
+    ) in mlir_text
+
+
+def test_unknown_tile_upper_bound_name_is_rejected() -> None:
+    x = torch.randn([128, 64], dtype=torch.float16)
+    y = torch.randn([64, 128], dtype=torch.float16)
+    bound_kernel = matmul.bind((x, y))
+
+    try:
+        generate_mlir(bound_kernel, tile_upper_bounds={"tile_missing": 2048})
+    except ValueError as exc:
+        assert "Unknown tile upper bound tile(s)" in str(exc)
+        assert "tile_n" in str(exc)
+    else:
+        raise AssertionError("expected an unknown tile upper bound tile to be rejected")
+
+
 def test_unknown_divisible_tile_name_is_rejected() -> None:
     x = torch.randn([128, 64], dtype=torch.float16)
     y = torch.randn([64, 128], dtype=torch.float16)

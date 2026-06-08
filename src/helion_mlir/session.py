@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Collection, Iterator
+from typing import Any, Collection, Iterator, Mapping
 
 from .mlir_utils import MLIROutputHelper
 from .models import KernelAnalysis, LoopScope
@@ -171,6 +171,7 @@ class LoweringContext(LoweringSession):
         bound_kernel: Any,
         assume_divisible_tiles: bool = False,
         divisible_tiles: Collection[str | int] = (),
+        tile_upper_bounds: Mapping[str | int, int] | None = None,
     ):
         from .analysis import build_kernel_analysis
 
@@ -179,6 +180,7 @@ class LoweringContext(LoweringSession):
                 bound_kernel,
                 assume_divisible_tiles=assume_divisible_tiles,
                 divisible_tiles=divisible_tiles,
+                tile_upper_bounds=tile_upper_bounds,
             )
         )
 

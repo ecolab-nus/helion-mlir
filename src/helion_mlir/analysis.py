@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Collection
+from typing import Any, Collection, Mapping
 
 import torch
 
@@ -78,6 +78,7 @@ def build_kernel_analysis(
     *,
     assume_divisible_tiles: bool = False,
     divisible_tiles: Collection[str | int] = (),
+    tile_upper_bounds: Mapping[str | int, int] | None = None,
 ) -> KernelAnalysis:
     from helion._compiler.device_ir import IfGraphInfo, ReductionLoopGraphInfo, RootGraphInfo, ForLoopGraphInfo
     import helion.language._tracing_ops as hl_tracing_ops
@@ -223,6 +224,46 @@ def build_kernel_analysis(
         available_ids = sorted(alias)
         raise ValueError(
             f"Unknown divisible tile(s): {sorted(unmatched_tiles, key=str)}. "
+            f"Available tile names: {available_names}; block ids: {available_ids}"
+        )
+
+    requested_upper_bounds = dict(tile_upper_bounds or {})
+    matched_upper_bound_tiles: set[str | int] = set()
+    for tile, upper_bound in requested_upper_bounds.items():
+        if not isinstance(upper_bound, int) or isinstance(upper_bound, bool):
+            raise TypeError(
+                f"Upper bound for tile {tile!r} must be an int, got {type(upper_bound).__name__}"
+            )
+        if upper_bound < 1:
+            raise ValueError(
+                f"Upper bound for tile {tile!r} must be positive, got {upper_bound}"
+            )
+
+    for info in bound_kernel.env.block_sizes:
+        canonical_id = alias.get(info.block_id, info.block_id)
+        matching_tiles = [
+            tile
+            for tile in requested_upper_bounds
+            if tile == info.block_id or tile == canonical_id or tile in info.debug_names
+        ]
+        for tile in matching_tiles:
+            upper_bound = requested_upper_bounds[tile]
+            natural_upper_bounds[canonical_id] = upper_bound
+            natural_upper_bounds[info.block_id] = upper_bound
+            matched_upper_bound_tiles.add(tile)
+
+    unmatched_upper_bound_tiles = set(requested_upper_bounds) - matched_upper_bound_tiles
+    if unmatched_upper_bound_tiles:
+        available_names = sorted(
+            {
+                name
+                for info in bound_kernel.env.block_sizes
+                for name in info.debug_names
+            }
+        )
+        available_ids = sorted(alias)
+        raise ValueError(
+            f"Unknown tile upper bound tile(s): {sorted(unmatched_upper_bound_tiles, key=str)}. "
             f"Available tile names: {available_names}; block ids: {available_ids}"
         )
 

@@ -10,7 +10,7 @@ The lowering pipeline is intentionally split into explicit stages:
 from __future__ import annotations
 
 import math
-from typing import Collection, TYPE_CHECKING
+from typing import Collection, Mapping, TYPE_CHECKING
 
 from .analysis import build_kernel_analysis
 from .emitter import ModuleEmitter
@@ -28,16 +28,20 @@ def generate_mlir(
     cleanup: bool = True,
     assume_divisible_tiles: bool = False,
     divisible_tiles: Collection[str | int] = (),
+    tile_upper_bounds: Mapping[str | int, int] | None = None,
 ) -> str:
     """Lower a bound Helion kernel to MLIR.
 
     ``divisible_tiles`` marks individual Helion tiles as having no partial
     final tile. Entries may be tile variable names (preferred) or block ids.
+    ``tile_upper_bounds`` overrides individual Helion tile upper bounds.
+    Entries may be tile variable names (preferred) or block ids.
     """
     analysis = build_kernel_analysis(
         bound_kernel,
         assume_divisible_tiles=assume_divisible_tiles,
         divisible_tiles=divisible_tiles,
+        tile_upper_bounds=tile_upper_bounds,
     )
     session = LoweringSession(analysis)
     emitter = ModuleEmitter(session)
