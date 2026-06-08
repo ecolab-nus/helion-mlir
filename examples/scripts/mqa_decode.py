@@ -129,7 +129,12 @@ def main() -> None:
 
     print_debug_info(bound)
 
-    mlir_text = generate_mlir(bound, cleanup=True, assume_divisible_tiles=True)
+    mlir_text = generate_mlir(
+        bound,
+        cleanup=True,
+        assume_divisible=True,
+        tile_divisible={"tile_b": True, "tile_s": True, "tile_n": False},
+    )
     print("=== MLIR Dump ===")
     print(mlir_text)
 

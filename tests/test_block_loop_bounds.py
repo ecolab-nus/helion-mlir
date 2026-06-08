@@ -63,7 +63,7 @@ def test_expression_bound_uses_scf_for() -> None:
     assert analysis.block_info.loop_extents[tile_c_info.block_id] == nchunks
     assert analysis.block_info.natural_upper_bounds[tile_c_info.block_id] == 1
     assert analysis.module_attributes["loom.tile_c"][0] == (
-        "{upper_bound = 1 : index, is_reduction = false}"
+        "{upper_bound = 1 : index, is_reduction = false, asure_divisible = false}"
     )
 
     raw_mlir_text = generate_mlir(bound_kernel, cleanup=False)
@@ -73,7 +73,7 @@ def test_expression_bound_uses_scf_for() -> None:
     assert "affine.apply" not in mlir_text
     assert (
         '"loom.sym"() {symbol_ref = @tile_c, upper_bound = 1 : index, '
-        "is_reduction = false}"
+        "is_reduction = false, asure_divisible = false}"
     ) in raw_mlir_text
     result = validate_with_mlir_opt(mlir_text)
     assert result.returncode == 0, result.stderr
@@ -130,6 +130,45 @@ def test_individual_tiles_can_be_marked_divisible() -> None:
     assert all_divisible_mlir.count("arith.cmpi ult") == 0
 
 
+def test_assume_divisible_controls_all_tile_boundary_checks() -> None:
+    q = torch.randn([2, 128, 64], dtype=torch.float16)
+    bound_kernel = attention.bind((q, q, q))
+
+    mlir_text = generate_mlir(bound_kernel, assume_divisible=True)
+
+    assert "arith.cmpi ult" not in mlir_text
+
+
+def test_tile_divisible_sets_symbol_attribute_only() -> None:
+    x = torch.randn([128, 64], dtype=torch.float16)
+    y = torch.randn([64, 128], dtype=torch.float16)
+    bound_kernel = matmul.bind((x, y))
+
+    tile_m_info = next(
+        info for info in bound_kernel.env.block_sizes if "tile_m" in info.debug_names
+    )
+    analysis = build_kernel_analysis(
+        bound_kernel,
+        tile_divisible={"tile_m": True, "tile_n": False},
+    )
+    assert analysis.tile_divisible[tile_m_info.block_id] is True
+
+    mlir_text = generate_mlir(
+        bound_kernel,
+        cleanup=False,
+        tile_divisible={"tile_m": True, "tile_n": False},
+    )
+    assert (
+        '"loom.sym"() {symbol_ref = @tile_m, upper_bound = 128 : index, '
+        "is_reduction = false, asure_divisible = true}"
+    ) in mlir_text
+    assert (
+        '"loom.sym"() {symbol_ref = @tile_n, upper_bound = 128 : index, '
+        "is_reduction = false, asure_divisible = false}"
+    ) in mlir_text
+    assert "arith.cmpi ult" in mlir_text
+
+
 def test_individual_tile_upper_bounds_can_be_overridden() -> None:
     x = torch.randn([128, 64], dtype=torch.float16)
     y = torch.randn([64, 128], dtype=torch.float16)
@@ -151,7 +190,7 @@ def test_individual_tile_upper_bounds_can_be_overridden() -> None:
     )
     assert (
         '"loom.sym"() {symbol_ref = @tile_n, upper_bound = 2048 : index, '
-        "is_reduction = false}"
+        "is_reduction = false, asure_divisible = false}"
     ) in mlir_text
 
 

@@ -26,21 +26,29 @@ def generate_mlir(
     bound_kernel: "BoundKernel",
     *,
     cleanup: bool = True,
+    assume_divisible: bool = False,
     assume_divisible_tiles: bool = False,
     divisible_tiles: Collection[str | int] = (),
+    tile_divisible: Mapping[str | int, bool] | None = None,
     tile_upper_bounds: Mapping[str | int, int] | None = None,
 ) -> str:
     """Lower a bound Helion kernel to MLIR.
 
+    ``assume_divisible`` marks all tile loops as having no partial final tile,
+    suppressing generated boundary checks. ``assume_divisible_tiles`` is kept
+    as a compatibility alias.
     ``divisible_tiles`` marks individual Helion tiles as having no partial
     final tile. Entries may be tile variable names (preferred) or block ids.
+    ``tile_divisible`` sets the ``asure_divisible`` bool attribute on emitted
+    tile symbols. Entries may be tile variable names (preferred) or block ids.
     ``tile_upper_bounds`` overrides individual Helion tile upper bounds.
     Entries may be tile variable names (preferred) or block ids.
     """
     analysis = build_kernel_analysis(
         bound_kernel,
-        assume_divisible_tiles=assume_divisible_tiles,
+        assume_divisible=assume_divisible or assume_divisible_tiles,
         divisible_tiles=divisible_tiles,
+        tile_divisible=tile_divisible,
         tile_upper_bounds=tile_upper_bounds,
     )
     session = LoweringSession(analysis)

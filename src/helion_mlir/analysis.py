@@ -76,8 +76,10 @@ def _order_host_tensor_names(
 def build_kernel_analysis(
     bound_kernel: Any,
     *,
+    assume_divisible: bool = False,
     assume_divisible_tiles: bool = False,
     divisible_tiles: Collection[str | int] = (),
+    tile_divisible: Mapping[str | int, bool] | None = None,
     tile_upper_bounds: Mapping[str | int, int] | None = None,
 ) -> KernelAnalysis:
     from helion._compiler.device_ir import IfGraphInfo, ReductionLoopGraphInfo, RootGraphInfo, ForLoopGraphInfo
@@ -227,6 +229,43 @@ def build_kernel_analysis(
             f"Available tile names: {available_names}; block ids: {available_ids}"
         )
 
+    requested_tile_divisible = dict(tile_divisible or {})
+    tile_divisible_by_block: dict[int, bool] = {}
+    matched_tile_divisible: set[str | int] = set()
+    for tile, is_divisible in requested_tile_divisible.items():
+        if not isinstance(is_divisible, bool):
+            raise TypeError(
+                f"Divisible value for tile {tile!r} must be a bool, "
+                f"got {type(is_divisible).__name__}"
+            )
+
+    for info in bound_kernel.env.block_sizes:
+        canonical_id = alias.get(info.block_id, info.block_id)
+        matching_tiles = [
+            tile
+            for tile in requested_tile_divisible
+            if tile == info.block_id or tile == canonical_id or tile in info.debug_names
+        ]
+        for tile in matching_tiles:
+            tile_divisible_by_block[canonical_id] = requested_tile_divisible[tile]
+            tile_divisible_by_block[info.block_id] = requested_tile_divisible[tile]
+            matched_tile_divisible.add(tile)
+
+    unmatched_tile_divisible = set(requested_tile_divisible) - matched_tile_divisible
+    if unmatched_tile_divisible:
+        available_names = sorted(
+            {
+                name
+                for info in bound_kernel.env.block_sizes
+                for name in info.debug_names
+            }
+        )
+        available_ids = sorted(alias)
+        raise ValueError(
+            f"Unknown tile_divisible tile(s): {sorted(unmatched_tile_divisible, key=str)}. "
+            f"Available tile names: {available_names}; block ids: {available_ids}"
+        )
+
     requested_upper_bounds = dict(tile_upper_bounds or {})
     matched_upper_bound_tiles: set[str | int] = set()
     for tile, upper_bound in requested_upper_bounds.items():
@@ -352,7 +391,9 @@ def build_kernel_analysis(
             continue
         sym_name = next(iter(info.debug_names), f"block_{canonical_id}")
         module_attributes[f"loom.{sym_name}"] = (
-            f"{{upper_bound = {upper_bound} : index, is_reduction = {str(info.reduction).lower()}}}",
+            f"{{upper_bound = {upper_bound} : index, "
+            f"is_reduction = {str(info.reduction).lower()}, "
+            f"asure_divisible = {str(tile_divisible_by_block.get(canonical_id, False)).lower()}}}",
             "",
         )
 
@@ -439,6 +480,7 @@ def build_kernel_analysis(
         ),
         module_attributes=module_attributes,
         reduction_block_ids=tuple(reduction_block_ids),
-        assume_divisible_tiles=assume_divisible_tiles,
+        assume_divisible=assume_divisible or assume_divisible_tiles,
         divisible_block_ids=frozenset(divisible_block_ids),
+        tile_divisible=tile_divisible_by_block,
     )

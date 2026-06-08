@@ -57,10 +57,12 @@ class ModuleEmitter:
                 self.builder.emit(f"{ssa} = arith.constant {info.size} : index")
             else:
                 upper_bound = self.session.get_natural_upper_bound(info.block_id)
+                asure_divisible = self.session.tile_symbol_is_divisible(canonical_id)
                 self.builder.emit(
                     f'{ssa} = "loom.sym"() {{symbol_ref = @{sym_name}, '
                     f"upper_bound = {upper_bound} : index, "
-                    f"is_reduction = {str(info.reduction).lower()}}} : () -> index"
+                    f"is_reduction = {str(info.reduction).lower()}, "
+                    f"asure_divisible = {str(asure_divisible).lower()}}} : () -> index"
                 )
             self.session.block_size_ssa[canonical_id] = ssa
             self.session.block_size_ssa[info.block_id] = ssa

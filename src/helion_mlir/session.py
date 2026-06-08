@@ -69,14 +69,18 @@ class LoweringSession:
 
     @property
     def assume_divisible_tiles(self) -> bool:
-        return self.analysis.assume_divisible_tiles
+        return self.analysis.assume_divisible
 
     def tile_is_divisible(self, block_id: int) -> bool:
         canonical_id = self.resolve_block_id(block_id)
         return (
-            self.analysis.assume_divisible_tiles
+            self.analysis.assume_divisible
             or canonical_id in self.analysis.divisible_block_ids
         )
+
+    def tile_symbol_is_divisible(self, block_id: int) -> bool:
+        canonical_id = self.resolve_block_id(block_id)
+        return self.analysis.tile_divisible.get(canonical_id, False)
 
     def resolve_block_id(self, block_id: int) -> int:
         return self.analysis.block_info.canonical_aliases.get(block_id, block_id)
@@ -169,8 +173,10 @@ class LoweringContext(LoweringSession):
     def __init__(
         self,
         bound_kernel: Any,
+        assume_divisible: bool = False,
         assume_divisible_tiles: bool = False,
         divisible_tiles: Collection[str | int] = (),
+        tile_divisible: Mapping[str | int, bool] | None = None,
         tile_upper_bounds: Mapping[str | int, int] | None = None,
     ):
         from .analysis import build_kernel_analysis
@@ -178,8 +184,9 @@ class LoweringContext(LoweringSession):
         super().__init__(
             build_kernel_analysis(
                 bound_kernel,
-                assume_divisible_tiles=assume_divisible_tiles,
+                assume_divisible=assume_divisible or assume_divisible_tiles,
                 divisible_tiles=divisible_tiles,
+                tile_divisible=tile_divisible,
                 tile_upper_bounds=tile_upper_bounds,
             )
         )
