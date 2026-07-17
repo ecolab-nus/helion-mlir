@@ -4,7 +4,6 @@ New internal code should prefer importing from `helion_mlir.torch_mlir.*`.
 This module remains in place to avoid breaking existing callers while the
 adapter surface is being migrated behind narrower modules.
 
-Key Functions:
 - import_aten_node: Import a single FX node using torch-mlir
 - TorchMLIRNodeImporter: Class for importing FX nodes to MLIR text
 """
@@ -16,6 +15,8 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.fx as fx
 from torch._ops import OpOverload
+
+from .input_type_rewrites import rewrite_linalg_input_types, rewrite_tensor_dim_input_type
 
 if TYPE_CHECKING:
     from .lowering_context import LoweringContext
@@ -908,6 +909,7 @@ def inline_torch_mlir_output(
     operands: list[str],
     mlir_output_helper,
     *,
+    operand_types: list[str] | None = None,
     dimension_ssa_map: dict[str, list[str | None]] | None = None,
     scalar_operand_map: dict[int, str] | None = None,
 ) -> str:
@@ -925,6 +927,7 @@ def inline_torch_mlir_output(
     Args:
         mlir_text: The full MLIR module text from torch-mlir.
         operands: SSA values to use as arguments.
+        operand_types: Caller-side MLIR types aligned with ``operands``.
         mlir_output_helper: The MLIR helper to emit to.
         dimension_ssa_map: Optional mapping from operand SSA to list of dimension SSAs.
             If provided, tensor.dim operations are replaced with pre-existing SSAs.
@@ -1258,6 +1261,16 @@ def inline_torch_mlir_output(
                 else:
                     new_lhs = ", ".join(new_lhs_vars)
                 
+                # ---------------------------------------------------------
+                # Restore caller-side tensor encodings that torch-mlir's
+                # temporary FakeTensor graph cannot represent.
+                # ---------------------------------------------------------
+                if operand_types:
+                    if 'linalg.' in rhs and 'ins(' in rhs:
+                        rhs = rewrite_linalg_input_types(rhs, operand_types)
+                    if rhs.startswith('tensor.dim'):
+                        rhs = rewrite_tensor_dim_input_type(rhs, operand_types)
+
                 # ---------------------------------------------------------
                 # Scalar operand rewriting for linalg.generic
                 # Remove scalar operands from ins() and indexing_maps,

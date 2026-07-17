@@ -10,6 +10,8 @@ import helion.language.memory_ops as hl_memory_ops
 import helion.language.tile_ops as hl_tile_ops
 import helion.language.view_ops as hl_view_ops
 
+from helion_mlir.custom_op import set_memory_space
+
 from helion_mlir.handlers import (
     register_compute_handlers,
     register_control_flow_handlers,
@@ -35,6 +37,7 @@ def test_handler_registry_covers_core_targets() -> None:
     assert direct[hl_creation_ops.full] == "visit_full"
     assert direct[hl_tracing_ops._for_loop] == "visit_for_loop"
     assert direct[hl_memory_ops.load] == "visit_load"
+    assert direct[set_memory_space] == "visit_set_memory_space"
     assert direct[hl_tile_ops.tile_begin] == "visit_tile_begin"
     assert direct[hl_view_ops.subscript] == "visit_subscript"
     assert direct[operator.getitem] == "visit_getitem"

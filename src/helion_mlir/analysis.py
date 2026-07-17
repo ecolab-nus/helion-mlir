@@ -446,6 +446,22 @@ def build_kernel_analysis(
         stored_tensor_names,
     )
 
+    # A set_memory_space node is a tracing-only annotation. Associate its
+    # integer payload with the directly wrapped input load so that the load's
+    # tensor result is born with the requested encoding.
+    from .custom_op import set_memory_space
+
+    load_memory_spaces: dict[Any, int] = {}
+    for graph_info in device_ir.graphs:
+        if graph_info.graph_id in rolled_ids:
+            continue
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function" or node.target is not set_memory_space:
+                continue
+            source = node.args[0]
+            if getattr(source, "target", None) is hl_memory_ops.load:
+                load_memory_spaces[source] = int(node.args[1])
+
     all_parallel_block_ids: set[int] = set()
     for grp in device_ir.grid_block_ids:
         all_parallel_block_ids.update(grp)
@@ -480,6 +496,7 @@ def build_kernel_analysis(
         ),
         module_attributes=module_attributes,
         reduction_block_ids=tuple(reduction_block_ids),
+        load_memory_spaces=load_memory_spaces,
         assume_divisible=assume_divisible or assume_divisible_tiles,
         divisible_block_ids=frozenset(divisible_block_ids),
         tile_divisible=tile_divisible_by_block,

@@ -46,6 +46,7 @@ class KernelAnalysis:
     host_tensors: HostTensorInfo
     module_attributes: dict[str, tuple[object, str]]
     reduction_block_ids: tuple[int, ...]
+    load_memory_spaces: dict[Any, int] = field(default_factory=dict)
     assume_divisible: bool = False
     divisible_block_ids: frozenset[int] = field(default_factory=frozenset)
     tile_divisible: dict[int, bool] = field(default_factory=dict)

@@ -36,6 +36,7 @@ from .registry import build_handler_registry, load_custom_ops
 from .errors import UnsupportedTargetError
 
 from .mlir_utils import (
+    add_integer_tensor_encoding,
     format_attr_dict,
     format_string_attr,
     torch_dtype_to_mlir_element_type,
@@ -1386,6 +1387,10 @@ class IRVisitor:
             tensor_type = f"tensor<{'x'.join(output_dims)}x{dtype_str}>"
         else:
             tensor_type = f"tensor<{dtype_str}>"
+
+        mem_space = self.ctx.analysis.load_memory_spaces.get(node)
+        if mem_space is not None:
+            tensor_type = add_integer_tensor_encoding(tensor_type, mem_space)
         
         self.ctx.node_types[node.name] = tensor_type
         
@@ -1409,6 +1414,14 @@ class IRVisitor:
         
         self.ctx.node_values[node.name] = result
         return result
+
+    def visit_set_memory_space(self, node: fx.Node) -> str:
+        """Erase the tracing annotation while preserving its load SSA and type."""
+        source = node.args[0]
+        source_ssa = self.ctx.node_values.get(source.name, f"%{source.name}")
+        source_type = self._get_tensor_type(source)
+        self.ctx.bind_node_value(node.name, source_ssa, node_type=source_type)
+        return source_ssa
     
     def visit_store(self, node: fx.Node) -> str:
         """Generate memref.subview + bufferization.to_memref + memref.copy for tile storing.
@@ -2580,6 +2593,11 @@ class IRVisitor:
         fx.map_arg(node.args, collect_operands)
         fx.map_arg(node.kwargs, collect_operands)
 
+        tensor_operand_types = [
+            self._get_tensor_type(operand_node)
+            for operand_node in tensor_operand_nodes
+        ]
+
         precise_import_inputs: list[object] = []
 
         def collect_precise_import_inputs(arg):
@@ -2667,6 +2685,7 @@ class IRVisitor:
             mlir_text,
             tensor_operands,
             self.mlir_output_helper,
+            operand_types=tensor_operand_types,
             dimension_ssa_map=dimension_ssa_map if dimension_ssa_map else None,
             scalar_operand_map=scalar_operand_map if scalar_operand_map else None,
         )
