@@ -88,11 +88,11 @@ def format_tensor_type(shape: Sequence[int | None], element_type: str) -> str:
     return f"tensor<{dims}x{element_type}>"
 
 
-def add_integer_tensor_encoding(tensor_type: str, encoding: int) -> str:
-    """Add an integer encoding attribute to a ranked tensor type string."""
+def add_memory_space_tensor_encoding(tensor_type: str, mem_space: int) -> str:
+    """Add the structured memory-space encoding to a ranked tensor type."""
     if not tensor_type.startswith("tensor<") or not tensor_type.endswith(">"):
         raise ValueError(f"Expected ranked tensor type, got {tensor_type}")
-    return f"{tensor_type[:-1]}, {encoding} : i64>"
+    return f"{tensor_type[:-1]}, {{mem_space = {mem_space} : i64}}>"
 
 
 def format_memref_type(shape: Sequence[int | None], element_type: str) -> str:
