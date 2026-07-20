@@ -7,62 +7,62 @@ placeholder    arg1_1          arg1_1                                         ()
 placeholder    arg2_1          arg2_1                                         ()                                                                           {}
 placeholder    arg3_1          arg3_1                                         ()                                                                           {}
 placeholder    arg4_1          arg4_1                                         ()                                                                           {}
-call_function  _new_var        <function _new_var at 0x7f062d3228c0>          (arg0_1,)                                                                    {}
-call_function  _new_var_1      <function _new_var at 0x7f062d3228c0>          (arg1_1,)                                                                    {}
-call_function  _new_var_2      <function _new_var at 0x7f062d3228c0>          (arg2_1,)                                                                    {}
-call_function  _new_var_3      <function _new_var at 0x7f062d3228c0>          (arg3_1,)                                                                    {}
-call_function  _new_var_4      <function _new_var at 0x7f062d3228c0>          (arg4_1,)                                                                    {}
-call_function  k_view          <function _host_tensor at 0x7f062d321000>      ('k_view',)                                                                  {}
+call_function  _new_var        <function _new_var at 0x7fa0c8d868c0>          (arg0_1,)                                                                    {}
+call_function  _new_var_1      <function _new_var at 0x7fa0c8d868c0>          (arg1_1,)                                                                    {}
+call_function  _new_var_2      <function _new_var at 0x7fa0c8d868c0>          (arg2_1,)                                                                    {}
+call_function  _new_var_3      <function _new_var at 0x7fa0c8d868c0>          (arg3_1,)                                                                    {}
+call_function  _new_var_4      <function _new_var at 0x7fa0c8d868c0>          (arg4_1,)                                                                    {}
+call_function  k_view          <function _host_tensor at 0x7fa0c8d85000>      ('k_view',)                                                                  {}
 call_function  sym_size_int    aten.sym_size.int                              (arg0_1, 0)                                                                  {}
-call_function  block_size_3    <function _get_symnode at 0x7f062d3203a0>      ('block_size_3',)                                                            {}
-call_function  load            <function load at 0x7f061e7e8b80>              (k_view, [sym_size_int, slice(None, None, None), block_size_3], None, None)  {}
-call_function  k               <function set_memory_space at 0x7f061e584a60>  (load, 1)                                                                    {}
+call_function  block_size_3    <function _get_symnode at 0x7fa0c8d843a0>      ('block_size_3',)                                                            {}
+call_function  load            <function load at 0x7fa0b02f4b80>              (k_view, [sym_size_int, slice(None, None, None), block_size_3], None, None)  {}
+call_function  k               <function set_memory_space at 0x7fa0b00789d0>  (load, 1)                                                                    {}
 call_function  sym_size_int_1  aten.sym_size.int                              (arg0_1, 1)                                                                  {}
-call_function  _mask_to_1      <function _mask_to at 0x7f062d322560>          (k, 0)                                                                       {}
+call_function  _mask_to_1      <function _mask_to at 0x7fa0c8d86560>          (k, 0)                                                                       {}
 call_function  qk              aten.bmm.default                               (_new_var, _mask_to_1)                                                       {}
-call_function  _mask_to_2      <function _mask_to at 0x7f062d322560>          (qk, -inf)                                                                   {}
+call_function  _mask_to_2      <function _mask_to at 0x7fa0c8d86560>          (qk, -inf)                                                                   {}
 call_function  amax            aten.amax.default                              (_mask_to_2, [-1], True)                                                     {}
 call_function  mul             aten.mul.Tensor                                (amax, _new_var_2)                                                           {}
 call_function  m_ij            aten.maximum.default                           (_new_var_1, mul)                                                            {}
-call_function  m_ij_broad      <function broadcast at 0x7f061e5844c0>         (m_ij, 2, [sym_size_int, sym_size_int_1, block_size_3])                      {}
+call_function  m_ij_broad      <function broadcast at 0x7fa0b00784c0>         (m_ij, 2, [sym_size_int, sym_size_int_1, block_size_3])                      {}
 call_function  mul_1           aten.mul.Tensor                                (qk, _new_var_2)                                                             {}
 call_function  qk_1            aten.sub.Tensor                                (mul_1, m_ij_broad)                                                          {}
 call_function  exp             aten.exp.default                               (qk_1,)                                                                      {}
-call_function  _mask_to_3      <function _mask_to at 0x7f062d322560>          (exp, 0)                                                                     {}
+call_function  _mask_to_3      <function _mask_to at 0x7fa0c8d86560>          (exp, 0)                                                                     {}
 call_function  l_ij            aten.sum.dim_IntList                           (_mask_to_3, [-1], True)                                                     {}
 call_function  sub_1           aten.sub.Tensor                                (_new_var_1, m_ij)                                                           {}
 call_function  alpha           aten.exp.default                               (sub_1,)                                                                     {}
 call_function  mul_2           aten.mul.Tensor                                (_new_var_3, alpha)                                                          {}
 call_function  l_i             aten.add.Tensor                                (mul_2, l_ij)                                                                {}
 call_function  acc             aten.mul.Tensor                                (_new_var_4, alpha)                                                          {}
-call_function  v_view          <function _host_tensor at 0x7f062d321000>      ('v_view',)                                                                  {}
-call_function  v               <function load at 0x7f061e7e8b80>              (v_view, [sym_size_int, block_size_3, slice(None, None, None)], None, None)  {}
+call_function  v_view          <function _host_tensor at 0x7fa0c8d85000>      ('v_view',)                                                                  {}
+call_function  v               <function load at 0x7fa0b02f4b80>              (v_view, [sym_size_int, block_size_3, slice(None, None, None)], None, None)  {}
 call_function  acc_1           aten.baddbmm.default                           (acc, _mask_to_3, v)                                                         {}
-call_function  m_i             <function _new_var at 0x7f062d3228c0>          (m_ij,)                                                                      {}
+call_function  m_i             <function _new_var at 0x7fa0c8d868c0>          (m_ij,)                                                                      {}
 output         output          output                                         ([m_i, l_i, acc_1],)                                                         {}
 Graph 1: RootGraphInfo
 opcode         name           target                                     args                                                                         kwargs
 -------------  -------------  -----------------------------------------  ---------------------------------------------------------------------------  ----------------------------------------------------------------------------------------------------
-call_function  qk_scale_dev   <function full at 0x7f061e7c83a0>          ([], 0.08838834764831843, torch.float16, None)                               {}
-call_function  block_size_0   <function _get_symnode at 0x7f062d3203a0>  ('block_size_0',)                                                            {}
-call_function  block_size_1   <function _get_symnode at 0x7f062d3203a0>  ('block_size_1',)                                                            {}
-call_function  m_i            <function full at 0x7f061e7c83a0>          ([block_size_0, block_size_1, 1], -inf, torch.float16, None)                 {}
+call_function  qk_scale_dev   <function full at 0x7fa0b02d43a0>          ([], 0.08838834764831843, torch.float16, None)                               {}
+call_function  block_size_0   <function _get_symnode at 0x7fa0c8d843a0>  ('block_size_0',)                                                            {}
+call_function  block_size_1   <function _get_symnode at 0x7fa0c8d843a0>  ('block_size_1',)                                                            {}
+call_function  m_i            <function full at 0x7fa0b02d43a0>          ([block_size_0, block_size_1, 1], -inf, torch.float16, None)                 {}
 call_function  l_i            aten.full.default                          ([block_size_0, block_size_1, 1], 1.0)                                       {'dtype': torch.float16, 'layout': torch.strided, 'device': device(type='cpu'), 'pin_memory': False}
-call_function  acc            <function full at 0x7f061e7c83a0>          ([block_size_0, block_size_1, 128], 0.0, torch.float16, None)                {}
-call_function  q_view         <function _host_tensor at 0x7f062d321000>  ('q_view',)                                                                  {}
-call_function  q              <function load at 0x7f061e7e8b80>          (q_view, [block_size_0, block_size_1, slice(None, None, None)], None, None)  {}
-call_function  k_in_size1     <function _get_symnode at 0x7f062d3203a0>  ('k_in_size1',)                                                              {}
-call_function  _for_loop      <function _for_loop at 0x7f062d321360>     (0, [0], [k_in_size1], [q, m_i, qk_scale_dev, l_i, acc])                     {}
+call_function  acc            <function full at 0x7fa0b02d43a0>          ([block_size_0, block_size_1, 128], 0.0, torch.float16, None)                {}
+call_function  q_view         <function _host_tensor at 0x7fa0c8d85000>  ('q_view',)                                                                  {}
+call_function  q              <function load at 0x7fa0b02f4b80>          (q_view, [block_size_0, block_size_1, slice(None, None, None)], None, None)  {}
+call_function  k_in_size1     <function _get_symnode at 0x7fa0c8d843a0>  ('k_in_size1',)                                                              {}
+call_function  _for_loop      <function _for_loop at 0x7fa0c8d85360>     (0, [0], [k_in_size1], [q, m_i, qk_scale_dev, l_i, acc])                     {}
 call_function  getitem        <built-in function getitem>                (_for_loop, 0)                                                               {}
 call_function  getitem_1      <built-in function getitem>                (_for_loop, 1)                                                               {}
 call_function  getitem_2      <built-in function getitem>                (_for_loop, 2)                                                               {}
-call_function  _phi           <function _phi at 0x7f062d321870>          (m_i, getitem)                                                               {}
-call_function  _phi_1         <function _phi at 0x7f062d321870>          (l_i, getitem_1)                                                             {}
-call_function  _phi_2         <function _phi at 0x7f062d321870>          (acc, getitem_2)                                                             {}
-call_function  l_i_broadcast  <function broadcast at 0x7f061e5844c0>     (_phi_1, 2, [block_size_0, block_size_1, 128])                               {}
+call_function  _phi           <function _phi at 0x7fa0c8d85870>          (m_i, getitem)                                                               {}
+call_function  _phi_1         <function _phi at 0x7fa0c8d85870>          (l_i, getitem_1)                                                             {}
+call_function  _phi_2         <function _phi at 0x7fa0c8d85870>          (acc, getitem_2)                                                             {}
+call_function  l_i_broadcast  <function broadcast at 0x7fa0b00784c0>     (_phi_1, 2, [block_size_0, block_size_1, 128])                               {}
 call_function  acc_1          aten.div.Tensor                            (_phi_2, l_i_broadcast)                                                      {}
-call_function  out_           <function _host_tensor at 0x7f062d321000>  ('out_',)                                                                    {}
-call_function  store          <function store at 0x7f061e7e8160>         (out_, [block_size_0, block_size_1, slice(None, None, None)], acc_1, None)   {}
+call_function  out_           <function _host_tensor at 0x7fa0c8d85000>  ('out_',)                                                                    {}
+call_function  store          <function store at 0x7fa0b02f4160>         (out_, [block_size_0, block_size_1, slice(None, None, None)], acc_1, None)   {}
 output         output         output                                     (None,)                                                                      {}
 
 
@@ -235,13 +235,13 @@ module attributes {loom.tile_b = {asure_divisible = false, is_reduction = false,
       %14:3 = scf.for %arg6 = %c0 to %13 step %c1 iter_args(%arg7 = %6, %arg8 = %7, %arg9 = %9) -> (tensor<?x?x1xf16>, tensor<?x?x1xf16>, tensor<?x?x128xf16>) {
         %18 = arith.muli %arg6, %2 : index
         %subview_4 = memref.subview %k_view_arg[%10, 0, %18] [%0, 128, %2] [1, 1, 1] : memref<32x128x4096xf16> to memref<?x128x?xf16, strided<[524288, 4096, 1], offset: ?>>
-        %19 = bufferization.to_tensor %subview_4 : memref<?x128x?xf16, strided<[524288, 4096, 1], offset: ?>> to tensor<?x128x?xf16, {mem_space = 1 : i64}>
+        %19 = bufferization.to_tensor %subview_4 : memref<?x128x?xf16, strided<[524288, 4096, 1], offset: ?>> to tensor<?x128x?xf16, {local_mem_kind = 1 : i64}>
         %20 = arith.index_cast %0 : index to i64
         %21 = arith.cmpi eq, %20, %20 : i64
         cf.assert %21, "mismatching contracting dimension"
         %22 = tensor.empty(%0, %1, %2) : tensor<?x?x?xf16>
         %23 = linalg.fill ins(%cst : f16) outs(%22 : tensor<?x?x?xf16>) -> tensor<?x?x?xf16>
-        %24 = linalg.batch_matmul ins(%12, %19 : tensor<?x?x128xf16>, tensor<?x128x?xf16, {mem_space = 1 : i64}>) outs(%23 : tensor<?x?x?xf16>) -> tensor<?x?x?xf16>
+        %24 = linalg.batch_matmul ins(%12, %19 : tensor<?x?x128xf16>, tensor<?x128x?xf16, {local_mem_kind = 1 : i64}>) outs(%23 : tensor<?x?x?xf16>) -> tensor<?x?x?xf16>
         %25 = linalg.generic {indexing_maps = [#map, #map1], iterator_types = ["parallel", "parallel", "reduction"]} ins(%24 : tensor<?x?x?xf16>) outs(%6 : tensor<?x?x1xf16>) {
         ^bb0(%in: f16, %out: f16):
           %44 = arith.maximumf %in, %out : f16

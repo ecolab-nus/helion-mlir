@@ -451,7 +451,7 @@ def build_kernel_analysis(
     # tensor result is born with the requested encoding.
     from .custom_op import set_memory_space
 
-    load_memory_spaces: dict[Any, int] = {}
+    load_local_memory_kinds: dict[Any, int] = {}
     for graph_info in device_ir.graphs:
         if graph_info.graph_id in rolled_ids:
             continue
@@ -460,7 +460,7 @@ def build_kernel_analysis(
                 continue
             source = node.args[0]
             if getattr(source, "target", None) is hl_memory_ops.load:
-                load_memory_spaces[source] = int(node.args[1])
+                load_local_memory_kinds[source] = int(node.args[1])
 
     all_parallel_block_ids: set[int] = set()
     for grp in device_ir.grid_block_ids:
@@ -496,7 +496,7 @@ def build_kernel_analysis(
         ),
         module_attributes=module_attributes,
         reduction_block_ids=tuple(reduction_block_ids),
-        load_memory_spaces=load_memory_spaces,
+        load_local_memory_kinds=load_local_memory_kinds,
         assume_divisible=assume_divisible or assume_divisible_tiles,
         divisible_block_ids=frozenset(divisible_block_ids),
         tile_divisible=tile_divisible_by_block,

@@ -36,7 +36,7 @@ from .registry import build_handler_registry, load_custom_ops
 from .errors import UnsupportedTargetError
 
 from .mlir_utils import (
-    add_memory_space_tensor_encoding,
+    add_local_memory_kind_tensor_encoding,
     format_attr_dict,
     format_string_attr,
     torch_dtype_to_mlir_element_type,
@@ -1388,9 +1388,11 @@ class IRVisitor:
         else:
             tensor_type = f"tensor<{dtype_str}>"
 
-        mem_space = self.ctx.analysis.load_memory_spaces.get(node)
-        if mem_space is not None:
-            tensor_type = add_memory_space_tensor_encoding(tensor_type, mem_space)
+        local_mem_kind = self.ctx.analysis.load_local_memory_kinds.get(node)
+        if local_mem_kind is not None:
+            tensor_type = add_local_memory_kind_tensor_encoding(
+                tensor_type, local_mem_kind
+            )
         
         self.ctx.node_types[node.name] = tensor_type
         

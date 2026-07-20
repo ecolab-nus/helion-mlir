@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from helion_mlir.mlir_utils import add_memory_space_tensor_encoding
+from helion_mlir.mlir_utils import add_local_memory_kind_tensor_encoding
 from helion_mlir.input_type_rewrites import rewrite_linalg_input_types
 
 
-def test_add_memory_space_tensor_encoding() -> None:
+def test_add_local_memory_kind_tensor_encoding() -> None:
     assert (
-        add_memory_space_tensor_encoding("tensor<?x128x?xf16>", 1)
-        == "tensor<?x128x?xf16, {mem_space = 1 : i64}>"
+        add_local_memory_kind_tensor_encoding("tensor<?x128x?xf16>", 1)
+        == "tensor<?x128x?xf16, {local_mem_kind = 1 : i64}>"
     )
 
 
@@ -21,11 +21,11 @@ def test_rewrite_linalg_input_types_is_operand_positional() -> None:
         rhs,
         [
             "tensor<?x128x?xf16>",
-            "tensor<?x128x?xf16, {mem_space = 1 : i64}>",
+            "tensor<?x128x?xf16, {local_mem_kind = 1 : i64}>",
         ],
     )
 
     assert (
         "ins(%arg0, %arg1 : tensor<?x128x?xf16>, "
-        "tensor<?x128x?xf16, {mem_space = 1 : i64}>)"
+        "tensor<?x128x?xf16, {local_mem_kind = 1 : i64}>)"
     ) in rewritten
