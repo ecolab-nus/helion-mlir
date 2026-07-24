@@ -121,20 +121,21 @@ Demonstrates a more complex kernel with 3D tensors, batch matrix operations, and
 
 ## Environment Preparation
 
-This project requires **Python 3.11**.
+This project requires **Python 3.10+**.
 
 1. **Create and activate a virtual environment**:
    ```bash
-   python3.11 -m venv .venv
+   python3.10 -m venv .venv
    source .venv/bin/activate
    ```
 
 2. **Install dependencies**:
    ```bash
-   pip install -r requirements.txt
+   python -m pip install -r requirements.txt
    ```
 
-   **Note**: `torch-mlir` is required for ATen operation lowering and will be installed via `requirements.txt`.
+   **Note**: `requirements.txt` installs this project in editable mode, resolves
+   `torch-mlir` from its dev-wheel source, and selects CPU-only PyTorch wheels.
 
 ## Current Limitations
 
