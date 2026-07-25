@@ -1,5 +1,0 @@
---index-url https://download.pytorch.org/whl/cpu
---extra-index-url https://pypi.org/simple
---find-links https://github.com/llvm/torch-mlir-release/releases/expanded_assets/dev-wheels
-
--e .[dev]

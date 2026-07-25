@@ -106,7 +106,7 @@ The `validate_with_mlir_opt()` function (in `debug_utils.py`) automates this by 
 ### Matrix Multiplication
 
 ```bash
-python examples/matmul.py
+uv run python examples/matmul.py
 ```
 
 Prints Device IR, generated MLIR, and validates with `mlir-opt`.
@@ -114,28 +114,25 @@ Prints Device IR, generated MLIR, and validates with `mlir-opt`.
 ### Flash Attention
 
 ```bash
-python examples/attn.py
+uv run python examples/attn.py
 ```
 
 Demonstrates a more complex kernel with 3D tensors, batch matrix operations, and reduction loops.
 
 ## Environment Preparation
 
-This project requires **Python 3.10+**.
+This project uses the Loom uv workspace and requires **Python 3.10**.
 
-1. **Create and activate a virtual environment**:
-   ```bash
-   python3.10 -m venv .venv
-   source .venv/bin/activate
-   ```
+From the Loom repository root, synchronize this workspace package:
 
-2. **Install dependencies**:
-   ```bash
-   python -m pip install -r requirements.txt
-   ```
+```bash
+uv sync --locked --package helion-mlir
+```
 
-   **Note**: `requirements.txt` installs this project in editable mode, resolves
-   `torch-mlir` from its dev-wheel source, and selects CPU-only PyTorch wheels.
+uv creates the shared `.venv` and installs the Python 3.10 interpreter when it
+is not already available. Runtime dependencies and the torch-mlir wheel source
+are declared in `pyproject.toml`; exact resolved versions are stored in the
+workspace `uv.lock`.
 
 ## Current Limitations
 
