@@ -12,7 +12,7 @@ dependencies = [
     "helion==0.2.10",
     "tabulate==0.9.0",
     "torch-mlir>=20260122.700",
-    "torch==2.10.0+cu130",
+    "torch==2.10.0+cpu",
 ]
 
 [dependency-groups]
@@ -21,12 +21,12 @@ dev = [
 ]
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu130" }
+torch = { index = "pytorch-cpu" }
 torch-mlir = { index = "torch-mlir-dev-wheels" }
 
 [[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [[tool.uv.index]]
