@@ -11,12 +11,12 @@ from helion.language import _decorators
 
 @has_side_effect
 @_decorators.api(allow_host_tensor=False)
-def set_memory_space(tensor: torch.Tensor, local_mem_kind: int) -> torch.Tensor:
-    """Annotate a kernel tensor with an integer MLIR tensor encoding."""
+def set_memory_space(tensor: torch.Tensor, memory: str) -> torch.Tensor:
+    """Pin a directly loaded tile to the platform memory named ``memory``."""
     raise exc.NotInsideKernel
 
 
 @_decorators.register_fake(set_memory_space)
-def _(tensor: torch.Tensor, local_mem_kind: int) -> torch.Tensor:
-    _ = local_mem_kind
+def _(tensor: torch.Tensor, memory: str) -> torch.Tensor:
+    _ = memory
     return tensor.new_empty(tuple(tensor.shape))

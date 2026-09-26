@@ -114,9 +114,7 @@ def main() -> None:
 
 
 
-    mlir_text = generate_mlir(
-        bound_kernel, assume_divisible_tiles=True
-    )
+    mlir_text = generate_mlir(bound_kernel)
     print("=== MLIR Dump ===")
     print(mlir_text)
 

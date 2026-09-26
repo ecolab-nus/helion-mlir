@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Collection, Mapping
+import re
+from typing import Any, Mapping
 
 import torch
 
@@ -17,6 +18,67 @@ def _direct_host_tensor_name(node: Any, host_tensor_target: Any) -> str | None:
         return None
     name = node.args[0]
     return name if isinstance(name, str) else None
+
+
+_MEMORY_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _collect_load_memories(
+    graph_infos: list[Any],
+    rolled_ids: set[int],
+    residency: Mapping[str, str],
+    *,
+    host_tensor_names: set[str],
+    host_tensor_target: Any,
+    load_target: Any,
+) -> dict[Any, str]:
+    """Map each pinned load node to its platform memory name.
+
+    ``residency`` pins every load of a host tensor; ``set_memory_space`` pins
+    one directly wrapped load. Both must agree where they overlap.
+    """
+    from .custom_op import set_memory_space
+
+    for memory in [*residency.values()]:
+        if not isinstance(memory, str) or not _MEMORY_NAME.fullmatch(memory):
+            raise ValueError(f"Residency memory must be a platform memory name, got {memory!r}")
+    unknown = set(residency) - host_tensor_names
+    if unknown:
+        raise ValueError(
+            f"Unknown residency tensor(s): {sorted(unknown)}. "
+            f"Available host tensors: {sorted(host_tensor_names)}"
+        )
+
+    load_memories: dict[Any, str] = {}
+
+    def pin(load: Any, memory: str, origin: str) -> None:
+        previous = load_memories.setdefault(load, memory)
+        if previous != memory:
+            raise ValueError(
+                f"Conflicting residency for load '{load.name}': {previous} vs {memory} ({origin})"
+            )
+
+    for graph_info in graph_infos:
+        if graph_info.graph_id in rolled_ids:
+            continue
+        for node in graph_info.graph.nodes:
+            if node.op != "call_function":
+                continue
+            if node.target is load_target:
+                name = _direct_host_tensor_name(node.args[0], host_tensor_target)
+                if name in residency:
+                    pin(node, residency[name], f"residency[{name!r}]")
+            elif node.target is set_memory_space:
+                source = node.args[0]
+                if getattr(source, "target", None) is not load_target:
+                    raise ValueError(
+                        f"set_memory_space must directly wrap a tensor load; '{node.name}' wraps '{getattr(source, 'name', source)}'"
+                    )
+                memory = node.args[1] if len(node.args) > 1 else node.kwargs["memory"]
+                if not isinstance(memory, str) or not _MEMORY_NAME.fullmatch(memory):
+                    raise ValueError(f"set_memory_space memory must be a platform memory name, got {memory!r}")
+                pin(source, memory, f"set_memory_space '{node.name}'")
+    return load_memories
 
 
 def _collect_stored_tensor_names(
@@ -76,11 +138,8 @@ def _order_host_tensor_names(
 def build_kernel_analysis(
     bound_kernel: Any,
     *,
-    assume_divisible: bool = False,
-    assume_divisible_tiles: bool = False,
-    divisible_tiles: Collection[str | int] = (),
-    tile_divisible: Mapping[str | int, bool] | None = None,
     tile_upper_bounds: Mapping[str | int, int] | None = None,
+    residency: Mapping[str, str] | None = None,
 ) -> KernelAnalysis:
     from helion._compiler.device_ir import IfGraphInfo, ReductionLoopGraphInfo, RootGraphInfo, ForLoopGraphInfo
     import helion.language._tracing_ops as hl_tracing_ops
@@ -196,75 +255,6 @@ def build_kernel_analysis(
         canonical_id = alias.get(info.block_id, info.block_id)
         natural_upper_bounds[canonical_id] = source.value
         natural_upper_bounds[info.block_id] = source.value
-
-    requested_tiles = set(divisible_tiles)
-    divisible_block_ids: set[int] = set()
-    matched_tiles: set[str | int] = set()
-    for info in bound_kernel.env.block_sizes:
-        canonical_id = alias.get(info.block_id, info.block_id)
-        if info.block_id in requested_tiles or canonical_id in requested_tiles:
-            divisible_block_ids.add(canonical_id)
-            matched_tiles.update(
-                tile
-                for tile in requested_tiles
-                if tile == info.block_id or tile == canonical_id
-            )
-        matching_names = requested_tiles.intersection(info.debug_names)
-        if matching_names:
-            divisible_block_ids.add(canonical_id)
-            matched_tiles.update(matching_names)
-
-    unmatched_tiles = requested_tiles - matched_tiles
-    if unmatched_tiles:
-        available_names = sorted(
-            {
-                name
-                for info in bound_kernel.env.block_sizes
-                for name in info.debug_names
-            }
-        )
-        available_ids = sorted(alias)
-        raise ValueError(
-            f"Unknown divisible tile(s): {sorted(unmatched_tiles, key=str)}. "
-            f"Available tile names: {available_names}; block ids: {available_ids}"
-        )
-
-    requested_tile_divisible = dict(tile_divisible or {})
-    tile_divisible_by_block: dict[int, bool] = {}
-    matched_tile_divisible: set[str | int] = set()
-    for tile, is_divisible in requested_tile_divisible.items():
-        if not isinstance(is_divisible, bool):
-            raise TypeError(
-                f"Divisible value for tile {tile!r} must be a bool, "
-                f"got {type(is_divisible).__name__}"
-            )
-
-    for info in bound_kernel.env.block_sizes:
-        canonical_id = alias.get(info.block_id, info.block_id)
-        matching_tiles = [
-            tile
-            for tile in requested_tile_divisible
-            if tile == info.block_id or tile == canonical_id or tile in info.debug_names
-        ]
-        for tile in matching_tiles:
-            tile_divisible_by_block[canonical_id] = requested_tile_divisible[tile]
-            tile_divisible_by_block[info.block_id] = requested_tile_divisible[tile]
-            matched_tile_divisible.add(tile)
-
-    unmatched_tile_divisible = set(requested_tile_divisible) - matched_tile_divisible
-    if unmatched_tile_divisible:
-        available_names = sorted(
-            {
-                name
-                for info in bound_kernel.env.block_sizes
-                for name in info.debug_names
-            }
-        )
-        available_ids = sorted(alias)
-        raise ValueError(
-            f"Unknown tile_divisible tile(s): {sorted(unmatched_tile_divisible, key=str)}. "
-            f"Available tile names: {available_names}; block ids: {available_ids}"
-        )
 
     requested_upper_bounds = dict(tile_upper_bounds or {})
     matched_upper_bound_tiles: set[str | int] = set()
@@ -392,8 +382,7 @@ def build_kernel_analysis(
         sym_name = next(iter(info.debug_names), f"block_{canonical_id}")
         module_attributes[f"loom.{sym_name}"] = (
             f"{{upper_bound = {upper_bound} : index, "
-            f"is_reduction = {str(info.reduction).lower()}, "
-            f"asure_divisible = {str(tile_divisible_by_block.get(canonical_id, False)).lower()}}}",
+            f"is_reduction = {str(info.reduction).lower()}}}",
             "",
         )
 
@@ -446,21 +435,14 @@ def build_kernel_analysis(
         stored_tensor_names,
     )
 
-    # A set_memory_space node is a tracing-only annotation. Associate its
-    # integer payload with the directly wrapped input load so that the load's
-    # tensor result is born with the requested encoding.
-    from .custom_op import set_memory_space
-
-    load_local_memory_kinds: dict[Any, int] = {}
-    for graph_info in device_ir.graphs:
-        if graph_info.graph_id in rolled_ids:
-            continue
-        for node in graph_info.graph.nodes:
-            if node.op != "call_function" or node.target is not set_memory_space:
-                continue
-            source = node.args[0]
-            if getattr(source, "target", None) is hl_memory_ops.load:
-                load_local_memory_kinds[source] = int(node.args[1])
+    load_memories = _collect_load_memories(
+        device_ir.graphs,
+        rolled_ids,
+        residency or {},
+        host_tensor_names=seen_host_tensors,
+        host_tensor_target=hl_tracing_ops._host_tensor,
+        load_target=hl_memory_ops.load,
+    )
 
     all_parallel_block_ids: set[int] = set()
     for grp in device_ir.grid_block_ids:
@@ -496,8 +478,5 @@ def build_kernel_analysis(
         ),
         module_attributes=module_attributes,
         reduction_block_ids=tuple(reduction_block_ids),
-        load_local_memory_kinds=load_local_memory_kinds,
-        assume_divisible=assume_divisible or assume_divisible_tiles,
-        divisible_block_ids=frozenset(divisible_block_ids),
-        tile_divisible=tile_divisible_by_block,
+        load_memories=load_memories,
     )

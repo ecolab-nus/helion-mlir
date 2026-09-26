@@ -77,7 +77,7 @@ def main() -> None:
     print_debug_info(bound_kernel)
 
     try:
-        mlir_text = generate_mlir(bound_kernel, cleanup=False, assume_divisible_tiles=True)
+        mlir_text = generate_mlir(bound_kernel, cleanup=False)
         print("=== MLIR Dump ===")
         print(mlir_text)
 

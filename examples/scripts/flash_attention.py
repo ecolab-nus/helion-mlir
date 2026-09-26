@@ -44,7 +44,7 @@ def attention(
         acc = hl.zeros([tile_b, tile_m, head_dim], dtype=torch.float16)
         q = q_view[tile_b, tile_m, :]
         for tile_n in hl.tile(v_view.size(1)):
-            k = set_memory_space(k_view[tile_b, :, tile_n], local_mem_kind=1)
+            k = set_memory_space(k_view[tile_b, :, tile_n], memory="L1_S")
             qk = torch.bmm(q, k)
             m_ij = torch.maximum(m_i, torch.amax(qk, -1, keepdim=True) * qk_scale_dev)
             m_ij_broad = broadcast(m_ij, 2, [m_ij.size(0), m_ij.size(1), tile_n])
@@ -76,7 +76,6 @@ def main() -> None:
     mlir_text = generate_mlir(
         bound,
         cleanup=True,
-        divisible_tiles={"tile_b", "tile_m", "tile_n"},
     )
     print("=== MLIR Dump ===")
     print(mlir_text)

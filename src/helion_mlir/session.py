@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Collection, Iterator, Mapping
+from typing import Any, Iterator, Mapping
 
 from .mlir_utils import MLIROutputHelper
 from .models import KernelAnalysis, LoopScope
@@ -66,21 +66,6 @@ class LoweringSession:
     @property
     def all_grid_block_ids(self) -> list[list[int]]:
         return [list(g) for g in self.device_ir.grid_block_ids]
-
-    @property
-    def assume_divisible_tiles(self) -> bool:
-        return self.analysis.assume_divisible
-
-    def tile_is_divisible(self, block_id: int) -> bool:
-        canonical_id = self.resolve_block_id(block_id)
-        return (
-            self.analysis.assume_divisible
-            or canonical_id in self.analysis.divisible_block_ids
-        )
-
-    def tile_symbol_is_divisible(self, block_id: int) -> bool:
-        canonical_id = self.resolve_block_id(block_id)
-        return self.analysis.tile_divisible.get(canonical_id, False)
 
     def resolve_block_id(self, block_id: int) -> int:
         return self.analysis.block_info.canonical_aliases.get(block_id, block_id)
@@ -173,21 +158,16 @@ class LoweringContext(LoweringSession):
     def __init__(
         self,
         bound_kernel: Any,
-        assume_divisible: bool = False,
-        assume_divisible_tiles: bool = False,
-        divisible_tiles: Collection[str | int] = (),
-        tile_divisible: Mapping[str | int, bool] | None = None,
         tile_upper_bounds: Mapping[str | int, int] | None = None,
+        residency: Mapping[str, str] | None = None,
     ):
         from .analysis import build_kernel_analysis
 
         super().__init__(
             build_kernel_analysis(
                 bound_kernel,
-                assume_divisible=assume_divisible or assume_divisible_tiles,
-                divisible_tiles=divisible_tiles,
-                tile_divisible=tile_divisible,
                 tile_upper_bounds=tile_upper_bounds,
+                residency=residency,
             )
         )
 

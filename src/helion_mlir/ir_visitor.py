@@ -36,7 +36,7 @@ from .registry import build_handler_registry, load_custom_ops
 from .errors import UnsupportedTargetError
 
 from .mlir_utils import (
-    add_local_memory_kind_tensor_encoding,
+    add_memory_tensor_encoding,
     format_attr_dict,
     format_string_attr,
     torch_dtype_to_mlir_element_type,
@@ -638,13 +638,6 @@ class IRVisitor:
         self.mlir_output_helper.emit(f"{result} = arith.muli {lhs}, {rhs} : index")
         return result
 
-    def _emit_index_minui(self, lhs: str, rhs: str, *, hint: str = "idx_min") -> str:
-        pred = self.mlir_output_helper.fresh("idx_lt")
-        self.mlir_output_helper.emit(f"{pred} = arith.cmpi ult, {lhs}, {rhs} : index")
-        result = self.mlir_output_helper.fresh(hint)
-        self.mlir_output_helper.emit(f"{result} = arith.select {pred}, {lhs}, {rhs} : index")
-        return result
-
     def _get_block_loop_iv(self, canonical_block_id: int) -> str:
         return self.ctx.loop_resolver.get_block_loop_iv(canonical_block_id)
 
@@ -684,47 +677,13 @@ class IRVisitor:
             block_size,
             hint=f"{hint}_start",
         )
-        block_size_ssa = self._as_index_ssa(block_size)
-        naive_end_ssa = self._emit_index_addi(
-            start_ssa,
-            block_size_ssa,
-            hint=f"{hint}_naive",
-        )
-        bounds = self._get_active_loop_bounds(canonical_block_id)
-        if bounds is None or self.ctx.tile_is_divisible(canonical_block_id):
-            return naive_end_ssa
-        _, ub_ssa = bounds
-        return self._emit_index_minui(naive_end_ssa, ub_ssa, hint=hint)
-
-    def _emit_block_extent(
-        self,
-        canonical_block_id: int,
-        block_size: str,
-        *,
-        hint: str = "tile_extent",
-    ) -> str:
-        if self.ctx.tile_is_divisible(canonical_block_id):
-            return block_size
-        bounds = self._get_active_loop_bounds(canonical_block_id)
-        if bounds is None:
-            return block_size
-        start_ssa = self._emit_block_offset(
-            canonical_block_id,
-            block_size,
-            hint=f"{hint}_start",
-        )
-        end_ssa = self._emit_block_end(
-            canonical_block_id,
-            block_size,
-            hint=f"{hint}_end",
-        )
-        return self._emit_index_subi(end_ssa, start_ssa, hint=hint)
+        return self._emit_index_addi(start_ssa, self._as_index_ssa(block_size), hint=hint)
 
     def _lower_block_index(self, canonical_block_id: int) -> tuple[str, str, int | None]:
         """Lower a BlockSize-origin index as a rank-preserving tile range."""
         block_size, size_is_static = self._get_block_size_value(canonical_block_id)
         offset = self._emit_block_offset(canonical_block_id, block_size)
-        extent = self._emit_block_extent(canonical_block_id, block_size)
+        extent = block_size
         static_extent = None
         if size_is_static and not extent.startswith("%"):
             try:
@@ -1388,11 +1347,9 @@ class IRVisitor:
         else:
             tensor_type = f"tensor<{dtype_str}>"
 
-        local_mem_kind = self.ctx.analysis.load_local_memory_kinds.get(node)
-        if local_mem_kind is not None:
-            tensor_type = add_local_memory_kind_tensor_encoding(
-                tensor_type, local_mem_kind
-            )
+        memory = self.ctx.analysis.load_memories.get(node)
+        if memory is not None:
+            tensor_type = add_memory_tensor_encoding(tensor_type, memory)
         
         self.ctx.node_types[node.name] = tensor_type
         
@@ -2199,7 +2156,7 @@ class IRVisitor:
         return result
 
     def visit_tile_end(self, node: fx.Node) -> str:
-        """Map tile_end(block_size_X) to min(lb + (IV + 1) * block_size, ub) when active."""
+        """Map tile_end(block_size_X) to lb + (IV + 1) * block_size."""
         block_size_node = node.args[0]
         block_id = self._try_get_block_id_from_node(block_size_node)
         if block_id is None:
