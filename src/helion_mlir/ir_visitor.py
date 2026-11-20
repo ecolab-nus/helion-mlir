@@ -79,6 +79,8 @@ class IRVisitor:
         self.range_index_block_ids: dict[str, int] = {}
         # Active scf.for bounds keyed by canonical block_id.
         self.loop_bounds: dict[int, tuple[str, str]] = {}
+        # Lower-bound SSA names known to be the constant 0 (literal FX loop bounds).
+        self._zero_lb_ssas: set[str] = set()
         self._direct_handlers, self._predicate_handlers = build_handler_registry()
         self._custom_ops = custom_ops if custom_ops is not None else load_custom_ops()
     
@@ -812,9 +814,12 @@ class IRVisitor:
         return combined_base_ssa
 
     def _derive_loop_trip_info_from_for_loop_args(
-        self, node: fx.Node, canonical_block_id: int
+        self, node: fx.Node, canonical_block_id: int, dim: int = 0
     ) -> tuple[str, str, str] | None:
-        """Primary path: derive [lb, ub) trip count information from FX _for_loop bounds."""
+        """Primary path: derive [lb, ub) trip count information from FX _for_loop bounds.
+
+        `dim` selects one dimension of a multi-dimensional loop (hl.tile over several sizes).
+        """
         if len(node.args) < 3:
             return None
 
@@ -824,16 +829,19 @@ class IRVisitor:
             upper_bounds, (list, tuple)
         ):
             return None
-        if len(lower_bounds) != 1 or len(upper_bounds) != 1:
+        if len(lower_bounds) != len(upper_bounds) or dim >= len(lower_bounds):
             return None
 
-        lb = lower_bounds[0]
-        ub = upper_bounds[0]
+        lb = lower_bounds[dim]
+        ub = upper_bounds[dim]
 
         # Optional explicit step list (if present in FX args) must be unit.
         if len(node.args) > 4:
             steps = node.args[4]
-            step = steps[0] if isinstance(steps, (list, tuple)) and len(steps) == 1 else steps
+            if isinstance(steps, (list, tuple)):
+                step = steps[dim] if dim < len(steps) else None
+            else:
+                step = steps
             if not isinstance(step, int) or step != 1:
                 raise ValueError(
                     f"Only unit-step block loops are supported for now; got step {step!r}"
@@ -841,6 +849,8 @@ class IRVisitor:
 
         lb_ssa = self._as_index_ssa(lb)
         ub_ssa = self._as_index_ssa(ub)
+        if isinstance(lb, int) and lb == 0:
+            self._zero_lb_ssas.add(lb_ssa)
         block_info = self.ctx.env.block_sizes[canonical_block_id]
         if isinstance(block_info.size, int):
             tile_size_ssa = self._emit_index_constant(int(block_info.size))
@@ -871,21 +881,27 @@ class IRVisitor:
         if for_graph is None:
             raise ValueError(f"ForLoopGraphInfo with graph_id={graph_id} not registered")
 
-        # Get block_ids from the graph (resolve through alias map)
+        # Get block_ids from the graph (resolve through alias map). A multi-dimensional
+        # hl.tile has one block id per dimension and becomes a nest of scf.for loops,
+        # outermost first; the body sits in the innermost loop.
         block_ids = getattr(for_graph, "block_ids", [self.loop_depth])
-        block_id = self.ctx.resolve_block_id(block_ids[0] if block_ids else 2)
+        block_ids = [self.ctx.resolve_block_id(b) for b in (block_ids or [2])]
 
-        # Primary path: derive trip count from _for_loop FX bounds.
+        # Primary path: derive trip counts from _for_loop FX bounds.
         # Fallback path: use pre-computed metadata trip count.
-        loop_trip_info = self._derive_loop_trip_info_from_for_loop_args(node, block_id)
-        if loop_trip_info is not None:
-            trip_count_ssa, lb_ssa, ub_ssa = loop_trip_info
-        else:
-            trip_count_ssa = self.ctx.reduction_trip_counts.get(block_id)
-            lb_ssa = None
-            ub_ssa = None
-        if trip_count_ssa is None:
-            raise ValueError("No trip count found for loop")
+        loop_dims = []  # (block_id, trip_count_ssa, lb_ssa, ub_ssa) per dimension
+        for dim, bid in enumerate(block_ids):
+            loop_trip_info = self._derive_loop_trip_info_from_for_loop_args(node, bid, dim)
+            if loop_trip_info is not None:
+                d_trip, d_lb, d_ub = loop_trip_info
+            else:
+                d_trip = self.ctx.reduction_trip_counts.get(bid)
+                d_lb = None
+                d_ub = None
+            if d_trip is None:
+                raise ValueError("No trip count found for loop")
+            loop_dims.append((bid, d_trip, d_lb, d_ub))
+        block_id = block_ids[-1]
 
         # ---------------------------------------------------------------------
         # Collect all arguments and classify them using phi-node analysis:
@@ -933,29 +949,45 @@ class IRVisitor:
                 else:
                     raise RuntimeError(f"Cannot compute MLIR type for node {fx_name}")
 
-        iv = f"%iv_block_{block_id}"
         result = self.mlir_output_helper.fresh(f"for_result_{graph_id}")
-
-        iter_args_parts = [f"%{name} = {ssa}" for name, ssa, _ in iter_args_info]
-        iter_args_str = ", ".join(iter_args_parts)
         result_types = ", ".join(iter_args_types)
-
         num_results = len(iter_args_info)
-        result_binding = f"{result}:{num_results}" if num_results > 1 else result
 
         c0 = self._emit_index_constant(0)
         c1 = self._emit_index_constant(1)
-        if num_results == 0:
-            self.mlir_output_helper.emit(
-                f"scf.for {iv} = {c0} to {trip_count_ssa} step {c1} {{"
-            )
-        else:
-            self.mlir_output_helper.emit(
-                f"{result_binding} = scf.for {iv} = {c0} to {trip_count_ssa} step {c1} "
-                f"iter_args({iter_args_str}) -> ({result_types}) {{"
-            )
+        # Loop-carried values thread through the nest: each outer level's iter_args seed
+        # the next level, and the innermost level binds the names the body uses.
+        level_inits = [ssa for _, ssa, _ in iter_args_info]
+        outer_results = []  # result SSA of each outer level, outermost first
+        for level, (bid, d_trip, _, _) in enumerate(loop_dims):
+            iv = f"%iv_block_{bid}"
+            innermost = level == len(loop_dims) - 1
+            if innermost:
+                level_names = [f"%{name}" for name, _, _ in iter_args_info]
+                level_result = result
+            else:
+                level_names = [
+                    self.mlir_output_helper.fresh(f"{name}_l{level}")
+                    for name, _, _ in iter_args_info
+                ]
+                level_result = self.mlir_output_helper.fresh(f"for_result_{graph_id}_l{level}")
+                outer_results.append(level_result)
+            if num_results == 0:
+                self.mlir_output_helper.emit(
+                    f"scf.for {iv} = {c0} to {d_trip} step {c1} {{"
+                )
+            else:
+                binding = f"{level_result}:{num_results}" if num_results > 1 else level_result
+                iter_args_str = ", ".join(
+                    f"{n} = {init}" for n, init in zip(level_names, level_inits)
+                )
+                self.mlir_output_helper.emit(
+                    f"{binding} = scf.for {iv} = {c0} to {d_trip} step {c1} "
+                    f"iter_args({iter_args_str}) -> ({result_types}) {{"
+                )
+            self.mlir_output_helper.push()
+            level_inits = level_names
         yield_op = "scf.yield"
-        self.mlir_output_helper.push()
 
         old_loop_iter_args = self.loop_iter_args.copy()
 
@@ -974,8 +1006,9 @@ class IRVisitor:
         old_block_id = self.current_block_id
         self.current_block_id = block_id
         saved_loop_bounds = self.loop_bounds.copy()
-        if lb_ssa is not None and ub_ssa is not None:
-            self.loop_bounds[block_id] = (lb_ssa, ub_ssa)
+        for bid, _, d_lb, d_ub in loop_dims:
+            if d_lb is not None and d_ub is not None:
+                self.loop_bounds[bid] = (d_lb, d_ub)
 
         # ForLoopGraphInfo nodes are in a separate FX graph and may reuse node
         # names from the parent graph (e.g. tile_begin, mul_1). Keep a local
@@ -1011,6 +1044,21 @@ class IRVisitor:
 
         self.mlir_output_helper.pop()
         self.mlir_output_helper.emit("}")
+        # Close the outer levels: each yields the result of the level inside it.
+        inner_results = outer_results[1:] + [result] if outer_results else []
+        for inner in reversed(inner_results):
+            if num_results == 0:
+                self.mlir_output_helper.emit(yield_op)
+            else:
+                if num_results > 1:
+                    vals = ", ".join(f"{inner}#{i}" for i in range(num_results))
+                else:
+                    vals = inner
+                self.mlir_output_helper.emit(f"{yield_op} {vals} : {result_types}")
+            self.mlir_output_helper.pop()
+            self.mlir_output_helper.emit("}")
+        if outer_results:
+            result = outer_results[0]
 
         self.ctx.node_values[node.name] = result if num_results > 0 else ""
         if isinstance(self.current_loop_result, list) and len(self.current_loop_result) > 1:
@@ -2133,6 +2181,13 @@ class IRVisitor:
             raise ValueError(f"Cannot determine block_id for tile_id node {node.name}")
         bounds = self._get_active_loop_bounds(block_id)
         if bounds is None:
+            iv_ssa = self._get_block_loop_iv(block_id)
+            self.ctx.node_values[node.name] = iv_ssa
+            return iv_ssa
+
+        # Zero lower bound: id = (0 + iv * bs) / bs = iv. Emitting the IV directly keeps
+        # index expressions (e.g. trip counts that depend on tile.id) division-free.
+        if bounds[0] in self._zero_lb_ssas:
             iv_ssa = self._get_block_loop_iv(block_id)
             self.ctx.node_values[node.name] = iv_ssa
             return iv_ssa
